@@ -1,0 +1,37 @@
+/* 
+ * Archivo de estilos para asegurar la visibilidad de los iconos en botones
+ * Compatible con PyQt5
+ */
+
+/* Configuración base para todos los botones */
+QPushButton {
+    /* Dimensiones y espaciado interno */
+    padding-left: 36px;  /* Espacio para el icono */
+    padding-right: 12px; /* Espacio a la derecha */
+    min-height: 36px;    /* Altura mínima del botón */
+    
+    /* Alineación y visualización */
+    text-align: left;    /* Alineación del texto */
+    color: white;        /* Texto en blanco */
+    
+    /* Propiedades de icono (compatibles con PyQt) */
+    qproperty-flat: false;  /* Asegura que el botón no sea plano */
+    qproperty-autoDefault: false;  /* No usar estilo por defecto */
+}
+
+/* Configuración para botones en diferentes estados */
+QPushButton:hover, QPushButton:pressed {
+    color: white;  /* Mantener texto blanco en todos los estados */
+}
+
+/* Botones primarios (como Ejecutar Simulación) */
+QPushButton[primary="true"] {
+    padding-left: 42px;  /* Más espacio para el icono */
+    min-height: 40px;    /* Botón ligeramente más alto */
+    font-weight: bold;   /* Texto en negrita */
+}
+
+/* Botones destructivos (como Eliminar) */
+QPushButton[destructive="true"] {
+    padding-left: 38px;  /* Espacio para el icono */
+}

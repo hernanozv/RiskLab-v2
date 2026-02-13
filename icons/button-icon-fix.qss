@@ -1,0 +1,39 @@
+/* Estilos adicionales para garantizar que los iconos sean siempre visibles en los botones */
+QPushButton {
+    text-align: left;
+    padding-left: 36px;  /* Espacio amplio para el icono */
+    padding-right: 12px;
+    padding-top: 0px;    /* Eliminar padding vertical */
+    padding-bottom: 0px; /* Eliminar padding vertical */
+    icon-size: 20px;     /* Tamaño de icono más grande */
+    qproperty-iconSize: 20px 20px;  /* Forzar tamaño explícito del icono */
+    height: 40px;        /* Altura fija para todos los botones */
+    min-height: 40px;    /* Altura mínima para todos los botones */
+    max-height: 40px;    /* Altura máxima para todos los botones */
+    position: relative;  /* Para posicionamiento relativo */
+}
+
+/* Forzar el color blanco para los iconos */
+QPushButton::icon {
+    color: white;
+    position: absolute;
+    left: 8px;
+}
+
+/* Estilos específicos para estados del botón */
+QPushButton:hover, QPushButton:pressed, QPushButton:checked, QPushButton:!hover {
+    color: white;         /* Mantener texto en blanco siempre */
+}
+
+/* Ajustes para botones grandes como los de simulación */
+QPushButton[primary="true"] {
+    padding-left: 40px;  /* Más espacio para el icono */
+    min-height: 40px;     /* Botón más alto */
+}
+
+/* Ajustes específicos para botones con menú desplegable */
+QPushButton::menu-indicator {
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 8px;
+}

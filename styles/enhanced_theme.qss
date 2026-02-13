@@ -1,0 +1,263 @@
+/* Estilo general para todos los widgets */
+QWidget {
+    font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13.5pt;  /* Aumentado considerablemente el tamaño de fuente base */
+    color: #333333;
+    background-color: #FFFFFF;
+}
+
+QMainWindow, QDialog {
+    background-color: #FFFFFF;
+}
+
+/* Botones estándar con mejor contraste */
+QPushButton {
+    background-color: #2F5597;  /* Azul corporativo */
+    color: white;
+    border: none;
+    border-radius: 3px;
+    padding: 10px 18px 10px 38px;  /* Espacio para el icono */
+    font-size: 13.5pt;
+    font-weight: 500;
+    text-align: left;
+    min-height: 40px;
+    min-width: 140px;  /* Ancho mínimo para consistencia */
+}
+
+QPushButton:hover {
+    background-color: #1F4287;  /* Azul más oscuro al pasar el mouse */
+}
+
+QPushButton:pressed {
+    background-color: #0F3177;  /* Azul aún más oscuro al presionar */
+}
+
+QPushButton:disabled {
+    background-color: #CCCCCC;
+    color: #707070;  /* Mayor contraste en texto desactivado */
+}
+
+/* Botones de acción principal (ej. Ejecutar Simulación) */
+QPushButton[primary="true"] {
+    background-color: #5C9F35;  /* Verde corporativo */
+    color: white;
+    font-weight: bold;
+    min-height: 40px;  /* Botones principales ligeramente más grandes */
+}
+
+QPushButton[primary="true"]:hover {
+    background-color: #4C8F25;  /* Verde más oscuro al pasar el mouse */
+}
+
+QPushButton[primary="true"]:pressed {
+    background-color: #3C7F15;  /* Verde aún más oscuro al presionar */
+}
+
+/* Botones destructivos (ej. Eliminar) */
+QPushButton[destructive="true"] {
+    background-color: #D9534F;  /* Rojo corporativo */
+    color: white;
+}
+
+QPushButton[destructive="true"]:hover {
+    background-color: #C9433F;  /* Rojo más oscuro al pasar el mouse */
+}
+
+QPushButton[destructive="true"]:pressed {
+    background-color: #B9332F;  /* Rojo aún más oscuro al presionar */
+}
+
+/* Campos de entrada más claros */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    padding: 10px;
+    border: 1px solid #C0C0C0;
+    border-radius: 3px;
+    background-color: white;
+    font-size: 13.5pt;
+    selection-background-color: #2F5597;
+    selection-color: white;
+}
+
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid #2F5597;
+    background-color: #FAFAFA;
+}
+
+/* Combobox con mejor presentación */
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border-left: 1px solid #C0C0C0;
+    background-color: #F5F5F5;
+}
+
+QComboBox QAbstractItemView {
+    border: 1px solid #C0C0C0;
+    selection-background-color: #2F5597;
+    selection-color: white;
+    outline: 0;
+}
+
+/* Encabezados y títulos */
+QLabel[fontSizeHint="title"] {
+    font-size: 22.5pt;
+    font-weight: bold;
+    color: #1F497D;
+    padding: 12px;
+}
+
+/* Scroll bars más discretos */
+QScrollBar:vertical {
+    border: none;
+    background: #F0F0F0;
+    width: 12px;
+    margin: 0px;
+}
+
+QScrollBar::handle:vertical {
+    background: #C0C0C0;
+    min-height: 20px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #A0A0A0;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}
+
+/* Mejoras para tablas de percentiles */
+QTableView, QTableWidget {
+    gridline-color: #E0E0E0;
+    background-color: white;
+    selection-background-color: #E9F2FD;
+    selection-color: #0064c8;
+    border: 1px solid #E0E0E0;
+    border-radius: 2px;
+    alternate-background-color: #F9F9F9;  /* Color alterno para facilitar la lectura de filas */
+    font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+}
+
+QTableView::item, QTableWidget::item {
+    padding: 12px 14px;
+    font-size: 13.5pt;
+}
+
+QHeaderView::section {
+    background-color: #F2F2F2;
+    border: 1px solid #E0E0E0;
+    padding: 12px 14px;
+    font-weight: bold;
+    color: #1F497D;  /* Azul más oscuro para encabezados */
+    font-size: 14pt;
+}
+
+/* Aumentar espacio para mostrar datos completos */
+QTableView QHeaderView {
+    font-size: 14pt;
+}
+
+/* Pestañas con estilo mejorado */
+QTabWidget::pane {
+    border: 1px solid #D0D0D0;
+    background-color: white;
+    border-radius: 3px;
+}
+
+QTabBar::tab {
+    background-color: #F2F2F2;
+    border: 1px solid #D0D0D0;
+    border-bottom: none;
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+    padding: 10px 18px; /* Aumentado el padding horizontal */
+    margin-right: 4px;
+    color: #5B5B5B;
+    min-width: 110px;  /* Ancho mínimo para tabs */
+    max-width: 250px; /* Ancho máximo para tabs */
+    font-size: 13.5pt;
+}
+
+QTabBar::tab:selected {
+    background-color: white;
+    color: #2F5597;
+    font-weight: bold;
+    padding-bottom: 10px; /* Espacio adicional abajo cuando seleccionada */
+    margin-bottom: -1px; /* Ajuste para que se conecte con el panel */
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #E9E9E9;
+}
+
+/* Asegurar que el texto siempre sea visible */
+QTabBar {
+    alignment: left;
+    /* Quitada la propiedad elide que causaba error */
+}
+
+/* Hacer que las pestañas más anchas para textos largos */
+QTabBar QToolButton {
+    background-color: #F2F2F2;
+    border: 1px solid #D0D0D0;
+}
+
+/* Secciones colapsables mejoradas */
+QGroupBox {
+    border: 1px solid #D0D0D0;
+    border-radius: 3px;
+    margin-top: 14px;
+    padding-top: 14px;
+    font-weight: bold;
+    color: #2F5597;  /* Color corporativo azul */
+    background-color: #FDFDFD;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 5px;
+    background-color: white;
+}
+
+/* Tooltips más informativos */
+QToolTip {
+    font-size: 10pt;
+    padding: 8px;
+    border: 1px solid #D0D0D0;
+    background-color: #FFFFEE;  /* Amarillo muy claro */
+    color: #333333;
+    border-radius: 2px;
+    max-width: 300px;  /* Ancho máximo para tooltips largos */
+}
+
+/* Estilos específicos para datos de percentiles */
+QLabel[percentile="true"] {
+    font-family: 'Consolas', 'Courier New', monospace;  /* Fuente monoespaciada para alineación */
+    font-size: 13.5pt;
+    padding: 4px 6px;
+}
+
+QLabel[percentile_header="true"] {
+    font-weight: bold;
+    color: #2F5597;
+    font-size: 15pt;
+    padding-top: 14px;
+    padding-bottom: 8px;
+}
+
+/* Separador visual entre secciones de percentiles */
+QFrame[section_separator="true"] {
+    border: none;
+    border-top: 1px solid #E0E0E0;
+    margin-top: 10px;
+    margin-bottom: 10px;
+}

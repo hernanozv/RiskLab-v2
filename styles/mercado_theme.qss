@@ -1,0 +1,238 @@
+/* 
+ * Tema de colores para Risk Lab inspirado en MercadoLibre
+ * Diseño contemporáneo con paleta armoniosa
+ */
+
+/* Estilos generales para la aplicación */
+QWidget {
+    font-family: 'Proxima Nova', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 12pt;
+    color: #333333;
+    background-color: #FFFFFF;
+}
+
+QMainWindow, QDialog {
+    background-color: #FFFFFF;
+}
+
+/* Headers y títulos */
+QLabel[fontSizeHint="title"] {
+    font-size: 21pt;
+    font-weight: bold;
+    color: #333333;
+    padding: 10px;
+}
+
+/* Pestañas de navegación */
+QTabWidget::pane {
+    border: 1px solid #EDEDED;
+    background-color: #FFFFFF;
+}
+
+QTabBar::tab {
+    background-color: #EDEDED;
+    color: #333333;
+    padding: 10px 20px;
+    border: 1px solid #EDEDED;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background-color: #FFFFFF;
+    color: #3483FA;
+    border-bottom: 2px solid #3483FA;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #F5F5F5;
+}
+
+/* Estilo para botones estándar */
+QPushButton {
+    background-color: #3483FA;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 10px 16px 10px 36px;
+    font-size: 12pt;
+    font-weight: 500;
+    text-align: left;
+    min-height: 18px;
+}
+
+QPushButton:hover {
+    background-color: #2968c8;
+}
+
+QPushButton:pressed {
+    background-color: #1F50A0;
+}
+
+QPushButton:disabled {
+    background-color: #CCCCCC;
+    color: #909090;
+}
+
+/* Botones de acción principal */
+QPushButton[primary="true"] {
+    background-color: #00A650;
+    font-weight: bold;
+}
+
+QPushButton[primary="true"]:hover {
+    background-color: #008C40;
+}
+
+QPushButton[primary="true"]:pressed {
+    background-color: #007535;
+}
+
+/* Botones destructivos */
+QPushButton[destructive="true"] {
+    background-color: #F23D4F;
+}
+
+QPushButton[destructive="true"]:hover {
+    background-color: #D9313E;
+}
+
+QPushButton[destructive="true"]:pressed {
+    background-color: #B92736;
+}
+
+/* Campos de entrada y desplegables */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    padding: 10px;
+    border: 1px solid #EDEDED;
+    border-radius: 4px;
+    background-color: white;
+    font-size: 12pt;
+    selection-background-color: #3483FA;
+}
+
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid #3483FA;
+}
+
+/* Lista desplegable */
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    border-left: none;
+    width: 20px;
+}
+
+/* Tablas */
+QTableWidget {
+    background-color: #FFFFFF;
+    alternate-background-color: #F5F5F5;
+    gridline-color: #EDEDED;
+    border: 1px solid #EDEDED;
+    selection-background-color: #E5F0FF;
+    selection-color: #333333;
+}
+
+QTableWidget::item {
+    padding: 10px;
+}
+
+QTableWidget::item:selected {
+    background-color: #E5F0FF;
+    color: #333333;
+}
+
+QHeaderView::section {
+    background-color: #FFFFFF;
+    color: #333333;
+    font-weight: bold;
+    padding: 10px;
+    border: none;
+    border-bottom: 1px solid #EDEDED;
+}
+
+/* Barra de progreso */
+QProgressBar {
+    border: 1px solid #EDEDED;
+    border-radius: 4px;
+    text-align: center;
+    background-color: #FFFFFF;
+    height: 20px;
+}
+
+QProgressBar::chunk {
+    background-color: #00A650;
+    border-radius: 3px;
+}
+
+/* Group Box */
+QGroupBox {
+    font-weight: bold;
+    border: 1px solid #EDEDED;
+    border-radius: 4px;
+    margin-top: 20px;
+    padding-top: 30px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 8px;
+    color: #333333;
+    font-size: 12pt;
+}
+
+/* Scroll bars */
+QScrollBar:vertical {
+    border: none;
+    background-color: #F5F5F5;
+    width: 10px;
+    margin: 0px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #CCCCCC;
+    min-height: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #B0B0B0;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    border: none;
+    background-color: #F5F5F5;
+    height: 10px;
+    margin: 0px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #CCCCCC;
+    min-width: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #B0B0B0;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+/* Colores del tema de MercadoLibre: 
+ * Amarillo principal: #FFE600
+ * Azul principal: #3483FA
+ * Verde positivo: #00A650
+ * Rojo destructivo: #F23D4F
+ * Gris claro (fondos): #EEEEEE 
+ * Gris (separadores): #EDEDED
+ * Gris oscuro (textos): #333333
+ * Blanco (fondos): #FFFFFF
+ */

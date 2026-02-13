@@ -1,0 +1,57 @@
+/* Estilos para mejorar la visibilidad y el feedback visual de los menús */
+
+/* Estilo para la barra de menú */
+QMenuBar {
+    background-color: #f0f0f0;
+    border-bottom: 1px solid #d0d0d0;
+    min-height: 28px;
+    padding: 2px;
+}
+
+/* Estilo para los elementos de la barra de menú */
+QMenuBar::item {
+    margin: 0px 3px;
+    padding: 4px 10px;
+    background: transparent;
+    border-radius: 3px;
+}
+
+/* Efecto hover para los elementos de la barra de menú */
+QMenuBar::item:selected,
+QMenuBar::item:hover {
+    background-color: #2a82da;
+    color: white;
+}
+
+/* Estilo para los menús desplegables */
+QMenu {
+    background-color: #ffffff;
+    border: 1px solid #d0d0d0;
+    padding: 5px;
+    border-radius: 3px;
+}
+
+/* Estilo para los elementos del menú desplegable */
+QMenu::item {
+    padding: 5px 25px 5px 25px;
+    border-radius: 3px;
+}
+
+/* Efecto hover para los elementos del menú desplegable */
+QMenu::item:selected,
+QMenu::item:hover {
+    background-color: #2a82da;
+    color: white;
+}
+
+/* Estilo para separadores en el menú */
+QMenu::separator {
+    height: 1px;
+    background-color: #d0d0d0;
+    margin: 6px 0px;
+}
+
+/* Estilo para elementos deshabilitados */
+QMenu::item:disabled {
+    color: #a0a0a0;
+}

@@ -1,0 +1,33 @@
+/* 
+ * Archivo final para garantizar la visibilidad de los iconos 
+ * en botones PyQt5
+ */
+
+/* Configuración específica para iconos */
+QPushButton {
+    padding-left: 38px;     /* Margen izquierdo amplio para el icono */
+    text-align: left;       /* Alinear texto a la izquierda */
+    background-origin: content;
+    background-position: left center;
+    background-repeat: no-repeat;
+    background-clip: padding;
+}
+
+/* Asegurar que el texto sea visible */
+QPushButton, QPushButton:hover, QPushButton:pressed {
+    color: white;           /* Texto siempre en blanco */
+}
+
+/* Botones de acción primaria */
+QPushButton[primary="true"] {
+    font-weight: bold;
+    padding: 8px 16px 8px 38px;  /* arriba, derecha, abajo, izquierda */
+}
+
+/* Botones destructivos */
+QPushButton[destructive="true"] {
+    background-color: #ff5555;
+    height: 40px;
+    min-height: 40px;
+    padding: 0px 14px 0px 38px;
+}

@@ -10,7 +10,7 @@ import numpy as np
 from scipy import stats
 from scipy.stats import gaussian_kde
 from scipy.optimize import least_squares, minimize
-from scipy.stats import poisson, binom, bernoulli, lognorm, beta, genpareto, norm, uniform, nbinom
+from scipy.stats import poisson, binom, bernoulli, lognorm, beta, genpareto, norm, uniform, nbinom, truncnorm
 from scipy.special import gamma as gamma_func, factorial
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -703,6 +703,45 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
     alpha, beta = result.x
     return alpha, beta
 
+class TruncatedGPD:
+    """
+    Wrapper sobre genpareto que trunca las muestras al percentil 99.9% teórico.
+    Solo aplica truncamiento cuando xi > 0 (cola infinita).
+    Cuando xi <= 0 la cola ya es finita y se delega directamente.
+    """
+    
+    def __init__(self, c, scale, loc):
+        self._dist = genpareto(c=c, scale=scale, loc=loc)
+        self.c = c
+        self.scale_param = scale
+        self.loc_param = loc
+        # Calcular cap solo si cola infinita (xi > 0)
+        if c > 0:
+            self._cap = self._dist.ppf(0.999)
+        else:
+            self._cap = None
+    
+    def rvs(self, size=1, random_state=None):
+        samples = self._dist.rvs(size=size, random_state=random_state)
+        if self._cap is not None:
+            samples = np.minimum(samples, self._cap)
+        return samples
+    
+    def mean(self):
+        return self._dist.mean()
+    
+    def var(self):
+        return self._dist.var()
+    
+    def ppf(self, q):
+        return self._dist.ppf(q)
+    
+    def cdf(self, x):
+        return self._dist.cdf(x)
+    
+    def pdf(self, x):
+        return self._dist.pdf(x)
+
 class PoissonGammaDistribution:
     """
     Distribución compuesta Poisson-Gamma (también conocida como Binomial Negativa).
@@ -1234,14 +1273,14 @@ def generar_distribucion_severidad(opcion, minimo, mas_probable, maximo,
                         UserWarning
                     )
                 
-                # Podrían necesitarse más validaciones (ej. sobre c y loc)
-                distribucion_severidad = genpareto(c=c, scale=scale, loc=loc)
+                # Usar TruncatedGPD para truncar al P99.9 cuando xi > 0 (cola infinita)
+                distribucion_severidad = TruncatedGPD(c=c, scale=scale, loc=loc)
             elif input_method == 'min_mode_max':
                 # Validar que Min/Mode/Max no sean None si se usa este método
                 if minimo is None or mas_probable is None or maximo is None:
                      raise ValueError("Min/Mode/Max requeridos para GPD con este método.")
                 xi, beta_param, mu = obtener_parametros_gpd(minimo, mas_probable, maximo) # Llama a la función antigua
-                distribucion_severidad = genpareto(c=xi, scale=beta_param, loc=mu)
+                distribucion_severidad = TruncatedGPD(c=xi, scale=beta_param, loc=mu)
             else:
                 raise ValueError(f"Método de entrada '{input_method}' no válido para {dist_nombre}.")
 
@@ -1273,11 +1312,13 @@ def generar_distribucion_severidad(opcion, minimo, mas_probable, maximo,
                      raise ValueError("Para Normal direct: provee ('mean','std') o ('mu','sigma').")
                  if std <= 0:
                      raise ValueError("Desviación estándar (std) debe ser > 0 para Normal.")
-                 distribucion_severidad = norm(loc=mean, scale=std)
+                 a_trunc = (0 - mean) / std
+                 distribucion_severidad = truncnorm(a=a_trunc, b=np.inf, loc=mean, scale=std)
              elif input_method == 'min_mode_max':
                  if minimo is None or mas_probable is None or maximo is None: raise ValueError("Min/Mode/Max requeridos para Normal.")
                  mu, sigma = obtener_parametros_normal(minimo, mas_probable, maximo)
-                 distribucion_severidad = norm(loc=mu, scale=sigma)
+                 a_trunc = (0 - mu) / sigma
+                 distribucion_severidad = truncnorm(a=a_trunc, b=np.inf, loc=mu, scale=sigma)
              else:
                  raise ValueError(f"Método de entrada '{input_method}' no válido para {dist_nombre}.")
         elif opcion == 3: # PERT (Beta)
@@ -1387,6 +1428,493 @@ def ordenar_eventos_por_dependencia(eventos_riesgo):
 
     stack.reverse()
     return stack
+
+def _aplicar_tabla_escalamiento(occurrence_indices, tabla):
+    """Mapea índices ordinales de ocurrencia a multiplicadores según tabla de escalamiento.
+    
+    Args:
+        occurrence_indices: np.array con el número ordinal de cada ocurrencia (1-indexed)
+        tabla: list[dict] con claves 'desde', 'hasta' (None=∞), 'multiplicador'
+    
+    Returns:
+        np.array de multiplicadores, mismo tamaño que occurrence_indices
+    """
+    multiplicadores = np.ones(len(occurrence_indices))
+    for fila in tabla:
+        desde = fila['desde']
+        hasta = fila.get('hasta') or np.inf
+        mask = (occurrence_indices >= desde) & (occurrence_indices <= hasta)
+        multiplicadores[mask] = fila['multiplicador']
+    return multiplicadores
+
+def _crear_seccion_escalamiento_ui(parent_layout, evento_data):
+    """Crea la sección colapsable de escalamiento de severidad por frecuencia.
+    
+    Args:
+        parent_layout: QVBoxLayout donde agregar la sección
+        evento_data: dict del evento (o None para evento nuevo)
+    
+    Returns:
+        tuple: (config_dict, on_freq_changed_callable)
+            - config_dict: dict mutable con campos sev_freq_* (actualizado por UI)
+            - on_freq_changed: función(freq_opcion) para habilitar/deshabilitar según distribución
+    """
+    _s = lambda v, d='': str(v) if v is not None else d
+    # Inicializar configuración desde datos existentes o defaults
+    config = {
+        'sev_freq_activado': False,
+        'sev_freq_modelo': 'reincidencia',
+        'sev_freq_tipo_escalamiento': 'lineal',
+        'sev_freq_tabla': [
+            {'desde': 1, 'hasta': 2, 'multiplicador': 1.0},
+            {'desde': 3, 'hasta': None, 'multiplicador': 2.0}
+        ],
+        'sev_freq_paso': 0.5,
+        'sev_freq_base': 1.5,
+        'sev_freq_factor_max': 5.0,
+        'sev_freq_alpha': 0.5,
+        'sev_freq_solo_aumento': True,
+        'sev_freq_sistemico_factor_max': 3.0,
+    }
+    if evento_data:
+        for key in list(config.keys()):
+            if key in evento_data:
+                val = evento_data[key]
+                if key == 'sev_freq_tabla' and isinstance(val, list):
+                    config[key] = copy.deepcopy(val)
+                else:
+                    config[key] = val
+
+    collapsed = [True]
+    freq_aplica = [True]  # False si Bernoulli/Beta
+
+    # --- Frame contenedor ---
+    esc_frame = QtWidgets.QFrame()
+    esc_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+    esc_frame.setStyleSheet("QFrame { border: 1px solid #aaa; border-radius: 3px; }")
+    esc_frame_layout = QtWidgets.QVBoxLayout(esc_frame)
+    esc_frame_layout.setContentsMargins(0, 0, 0, 0)
+    esc_frame_layout.setSpacing(0)
+
+    # --- Header clickeable ---
+    esc_header_btn = QtWidgets.QPushButton()
+    esc_header_btn.setStyleSheet("""
+        QPushButton {
+            background-color: #e8dff5;
+            color: #333;
+            border: none;
+            border-bottom: 1px solid #aaa;
+            text-align: left;
+            padding: 8px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #d8cfe5;
+        }
+    """)
+    esc_frame_layout.addWidget(esc_header_btn)
+
+    # --- Contenido colapsable ---
+    esc_content = QtWidgets.QWidget()
+    esc_content_layout = QtWidgets.QVBoxLayout(esc_content)
+    esc_content_layout.setContentsMargins(10, 10, 10, 10)
+    esc_content_layout.setSpacing(8)
+
+    # Mensaje de no-aplica (oculto por defecto)
+    no_aplica_label = QtWidgets.QLabel(
+        "⚠ Esta función no aplica para distribuciones con máximo 1 ocurrencia (Bernoulli/Beta). "
+        "Cambie la distribución de frecuencia para activar."
+    )
+    no_aplica_label.setWordWrap(True)
+    no_aplica_label.setStyleSheet("background-color: #fff3cd; padding: 8px; border-radius: 3px; color: #856404;")
+    no_aplica_label.hide()
+    esc_content_layout.addWidget(no_aplica_label)
+
+    # Checkbox activar
+    activar_check = QtWidgets.QCheckBox("Activar escalamiento de severidad por frecuencia")
+    activar_check.setChecked(config['sev_freq_activado'])
+    esc_content_layout.addWidget(activar_check)
+
+    # Info label
+    info_label = QtWidgets.QLabel(
+        "💡 Cuando un evento se materializa múltiples veces en un año simulado, "
+        "las ocurrencias sucesivas pueden tener un impacto económico mayor."
+    )
+    info_label.setWordWrap(True)
+    info_label.setStyleSheet("background-color: #fffacd; padding: 6px; border-radius: 3px;")
+    esc_content_layout.addWidget(info_label)
+
+    # --- Contenedor de parámetros (se habilita/deshabilita) ---
+    params_container = QtWidgets.QWidget()
+    params_layout = QtWidgets.QVBoxLayout(params_container)
+    params_layout.setContentsMargins(0, 0, 0, 0)
+    params_layout.setSpacing(6)
+
+    # Combo tipo de modelo
+    modelo_layout = QtWidgets.QFormLayout()
+    modelo_combo = NoScrollComboBox()
+    modelo_combo.addItems(["Impacto progresivo por ocurrencia", "Escalamiento por volumen"])
+    modelo_combo.setCurrentIndex(0 if config['sev_freq_modelo'] == 'reincidencia' else 1)
+    modelo_layout.addRow("Tipo:", modelo_combo)
+    params_layout.addLayout(modelo_layout)
+
+    # --- QStackedWidget para paneles de modelo ---
+    modelo_stack = QtWidgets.QStackedWidget()
+
+    # ==================== PANEL REINCIDENCIA ====================
+    reincidencia_widget = QtWidgets.QWidget()
+    reincidencia_layout = QtWidgets.QVBoxLayout(reincidencia_widget)
+    reincidencia_layout.setContentsMargins(0, 5, 0, 0)
+    reincidencia_layout.setSpacing(6)
+
+    # Combo modo escalamiento
+    modo_form = QtWidgets.QFormLayout()
+    modo_combo = NoScrollComboBox()
+    modo_combo.addItems(["Lineal: factor = 1 + paso × (n-1)", "Exponencial: factor = base ^ (n-1)", "Tabla personalizada"])
+    modo_idx = {'lineal': 0, 'exponencial': 1, 'tabla': 2}.get(config['sev_freq_tipo_escalamiento'], 0)
+    modo_combo.setCurrentIndex(modo_idx)
+    modo_form.addRow("Modo:", modo_combo)
+    reincidencia_layout.addLayout(modo_form)
+
+    # Stack para modos de reincidencia
+    modo_stack = QtWidgets.QStackedWidget()
+
+    # --- Página Lineal ---
+    lineal_widget = QtWidgets.QWidget()
+    lineal_form = QtWidgets.QFormLayout(lineal_widget)
+    lineal_form.setContentsMargins(0, 5, 0, 0)
+    paso_var = QtWidgets.QLineEdit(_s(config['sev_freq_paso']))
+    paso_var.setToolTip("Incremento del multiplicador por cada ocurrencia adicional (0.1 = suave, 1.0 = se duplica)")
+    factor_max_lineal_var = QtWidgets.QLineEdit(_s(config['sev_freq_factor_max']))
+    factor_max_lineal_var.setToolTip("Multiplicador máximo (cap)")
+    lineal_form.addRow("Incremento por ocurrencia:", paso_var)
+    lineal_form.addRow("Factor máximo:", factor_max_lineal_var)
+    modo_stack.addWidget(lineal_widget)
+
+    # --- Página Exponencial ---
+    exp_widget = QtWidgets.QWidget()
+    exp_form = QtWidgets.QFormLayout(exp_widget)
+    exp_form.setContentsMargins(0, 5, 0, 0)
+    base_var = QtWidgets.QLineEdit(_s(config['sev_freq_base']))
+    base_var.setToolTip("Base multiplicativa (1.1 = suave, 2.0 = se duplica cada vez)")
+    factor_max_exp_var = QtWidgets.QLineEdit(_s(config['sev_freq_factor_max']))
+    factor_max_exp_var.setToolTip("Multiplicador máximo (cap)")
+    exp_form.addRow("Base multiplicativa:", base_var)
+    exp_form.addRow("Factor máximo:", factor_max_exp_var)
+    modo_stack.addWidget(exp_widget)
+
+    # --- Página Tabla ---
+    tabla_widget = QtWidgets.QWidget()
+    tabla_layout_v = QtWidgets.QVBoxLayout(tabla_widget)
+    tabla_layout_v.setContentsMargins(0, 5, 0, 0)
+    tabla_layout_v.setSpacing(4)
+
+    tabla_table = QtWidgets.QTableWidget()
+    tabla_table.setColumnCount(3)
+    tabla_table.setHorizontalHeaderLabels(["Desde ocurr.", "Hasta ocurr.", "Multiplicador"])
+    tabla_table.horizontalHeader().setStretchLastSection(True)
+    tabla_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+    tabla_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+    tabla_table.setMinimumHeight(100)
+    tabla_table.setMaximumHeight(180)
+    tabla_table.verticalHeader().setVisible(False)
+    tabla_layout_v.addWidget(tabla_table)
+
+    # Botones tabla
+    tabla_btn_layout = QtWidgets.QHBoxLayout()
+    btn_add_row = QtWidgets.QPushButton("+ Agregar fila")
+    btn_add_row.setFixedHeight(26)
+    btn_remove_row = QtWidgets.QPushButton("Eliminar última")
+    btn_remove_row.setFixedHeight(26)
+    btn_remove_row.setStyleSheet("QPushButton { color: #dc3545; }")
+    tabla_btn_layout.addWidget(btn_add_row)
+    tabla_btn_layout.addWidget(btn_remove_row)
+    tabla_btn_layout.addStretch()
+    tabla_layout_v.addLayout(tabla_btn_layout)
+    modo_stack.addWidget(tabla_widget)
+
+    reincidencia_layout.addWidget(modo_stack)
+    modelo_stack.addWidget(reincidencia_widget)
+
+    # ==================== PANEL SISTÉMICO ====================
+    sistemico_widget = QtWidgets.QWidget()
+    sistemico_form = QtWidgets.QFormLayout(sistemico_widget)
+    sistemico_form.setContentsMargins(0, 5, 0, 0)
+    alpha_var = QtWidgets.QLineEdit(_s(config['sev_freq_alpha']))
+    alpha_var.setToolTip("Sensibilidad al z-score de frecuencia (0.1 = sutil, 1.0 = fuerte)")
+    solo_aumento_check = QtWidgets.QCheckBox("Solo escalar hacia arriba (recomendado)")
+    solo_aumento_check.setChecked(config['sev_freq_solo_aumento'])
+    factor_max_sist_var = QtWidgets.QLineEdit(_s(config['sev_freq_sistemico_factor_max']))
+    factor_max_sist_var.setToolTip("Multiplicador máximo (cap)")
+    sistemico_form.addRow("Sensibilidad (alpha):", alpha_var)
+    sistemico_form.addRow("", solo_aumento_check)
+    sistemico_form.addRow("Factor máximo:", factor_max_sist_var)
+
+    sist_info = QtWidgets.QLabel(
+        "💡 Si la frecuencia total en una simulación es inusualmente alta, "
+        "todas las pérdidas se escalan proporcionalmente."
+    )
+    sist_info.setWordWrap(True)
+    sist_info.setStyleSheet("background-color: #e8f4f8; padding: 6px; border-radius: 3px;")
+    sistemico_form.addRow(sist_info)
+    modelo_stack.addWidget(sistemico_widget)
+
+    params_layout.addWidget(modelo_stack)
+
+    # --- Vista previa ---
+    preview_label = QtWidgets.QLabel("")
+    preview_label.setWordWrap(True)
+    preview_label.setStyleSheet("background-color: #f0f0f0; padding: 6px; border-radius: 3px; color: #333;")
+    params_layout.addWidget(preview_label)
+
+    esc_content_layout.addWidget(params_container)
+    esc_frame_layout.addWidget(esc_content)
+    esc_content.hide()
+
+    # ==================== FUNCIONES INTERNAS ====================
+
+    def _actualizar_preview():
+        """Actualiza la vista previa del multiplicador."""
+        if not config['sev_freq_activado'] or not freq_aplica[0]:
+            preview_label.setText("")
+            preview_label.hide()
+            return
+        preview_label.show()
+        modelo = 'reincidencia' if modelo_combo.currentIndex() == 0 else 'sistemico'
+        if modelo == 'sistemico':
+            try:
+                a = float(alpha_var.text())
+                preview_label.setText(f"📊 Factor por simulación según z-score de frecuencia (alpha={a})")
+            except ValueError:
+                preview_label.setText("📊 (parámetros inválidos)")
+            return
+        # Reincidencia: mostrar multiplicadores para primeras N ocurrencias
+        modo_idx_val = modo_combo.currentIndex()
+        try:
+            if modo_idx_val == 0:  # Lineal
+                p = float(paso_var.text())
+                fm = float(factor_max_lineal_var.text())
+                mults = [min(1 + p * (n - 1), fm) for n in range(1, 8)]
+            elif modo_idx_val == 1:  # Exponencial
+                b = float(base_var.text())
+                fm = float(factor_max_exp_var.text())
+                mults = [min(b ** (n - 1), fm) for n in range(1, 8)]
+            else:  # Tabla
+                mults = []
+                for n in range(1, 8):
+                    mult = 1.0
+                    for fila in config['sev_freq_tabla']:
+                        desde = fila.get('desde', 1)
+                        hasta = fila.get('hasta') or 999
+                        if desde <= n <= hasta:
+                            mult = fila.get('multiplicador', 1.0)
+                    mults.append(mult)
+            parts = [f"Occ.{i+1}: ×{m:.1f}" for i, m in enumerate(mults)]
+            preview_label.setText("📊 " + " → ".join(parts) + " ...")
+        except (ValueError, ZeroDivisionError):
+            preview_label.setText("📊 (parámetros inválidos)")
+
+    def _actualizar_header():
+        """Actualiza el texto del header colapsable."""
+        arrow = "▷" if collapsed[0] else "▽"
+        if not freq_aplica[0]:
+            esc_header_btn.setText(f"{arrow} Escalamiento de Severidad por Frecuencia (no aplica)")
+            esc_header_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #e0e0e0; color: #999;
+                    border: none; border-bottom: 1px solid #aaa;
+                    text-align: left; padding: 8px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #d5d5d5; }
+            """)
+        elif not config['sev_freq_activado']:
+            esc_header_btn.setText(f"{arrow} Escalamiento de Severidad por Frecuencia (desactivado)")
+            esc_header_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #e8dff5; color: #333;
+                    border: none; border-bottom: 1px solid #aaa;
+                    text-align: left; padding: 8px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #d8cfe5; }
+            """)
+        else:
+            modelo = config['sev_freq_modelo']
+            if modelo == 'reincidencia':
+                tipo = config['sev_freq_tipo_escalamiento']
+                if tipo == 'lineal':
+                    desc = f"Lineal ×{config['sev_freq_paso']}/occ"
+                elif tipo == 'exponencial':
+                    desc = f"Exp. base={config['sev_freq_base']}"
+                else:
+                    desc = "Tabla personalizada"
+                desc += f", máx ×{config['sev_freq_factor_max']}"
+            else:
+                desc = f"Sistémico alpha={config['sev_freq_alpha']}"
+            esc_header_btn.setText(f"{arrow} Escalamiento de Severidad por Frecuencia ({desc})")
+            esc_header_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #d5e0f5; color: #333;
+                    border: none; border-bottom: 1px solid #aaa;
+                    text-align: left; padding: 8px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #c5d0e5; }
+            """)
+
+    def _sync_config():
+        """Sincroniza los valores de la UI al config dict."""
+        config['sev_freq_activado'] = activar_check.isChecked()
+        config['sev_freq_modelo'] = 'reincidencia' if modelo_combo.currentIndex() == 0 else 'sistemico'
+        modo_idx_val = modo_combo.currentIndex()
+        config['sev_freq_tipo_escalamiento'] = ['lineal', 'exponencial', 'tabla'][modo_idx_val]
+        try:
+            config['sev_freq_paso'] = float(paso_var.text())
+        except ValueError:
+            paso_var.setText(str(config.get('sev_freq_paso', 0.5)))
+        try:
+            config['sev_freq_base'] = float(base_var.text())
+        except ValueError:
+            base_var.setText(str(config.get('sev_freq_base', 1.5)))
+        try:
+            if modo_idx_val == 0:
+                config['sev_freq_factor_max'] = float(factor_max_lineal_var.text())
+            elif modo_idx_val == 1:
+                config['sev_freq_factor_max'] = float(factor_max_exp_var.text())
+        except ValueError:
+            val_max = str(config.get('sev_freq_factor_max', 5.0))
+            if modo_idx_val == 0:
+                factor_max_lineal_var.setText(val_max)
+            elif modo_idx_val == 1:
+                factor_max_exp_var.setText(val_max)
+        try:
+            config['sev_freq_alpha'] = float(alpha_var.text())
+        except ValueError:
+            alpha_var.setText(str(config.get('sev_freq_alpha', 0.5)))
+        config['sev_freq_solo_aumento'] = solo_aumento_check.isChecked()
+        try:
+            config['sev_freq_sistemico_factor_max'] = float(factor_max_sist_var.text())
+        except ValueError:
+            factor_max_sist_var.setText(str(config.get('sev_freq_sistemico_factor_max', 3.0)))
+        _sync_tabla_from_ui()
+        _actualizar_header()
+        _actualizar_preview()
+
+    def _sync_tabla_from_ui():
+        """Lee las filas de la tabla UI y actualiza config['sev_freq_tabla']."""
+        tabla_data = []
+        for r in range(tabla_table.rowCount()):
+            try:
+                desde = int(tabla_table.item(r, 0).text()) if tabla_table.item(r, 0) else 1
+                hasta_text = tabla_table.item(r, 1).text() if tabla_table.item(r, 1) else ""
+                hasta = None if hasta_text.strip() in ("", "∞", "inf") else int(hasta_text)
+                mult = float(tabla_table.item(r, 2).text()) if tabla_table.item(r, 2) else 1.0
+                tabla_data.append({'desde': desde, 'hasta': hasta, 'multiplicador': mult})
+            except (ValueError, AttributeError):
+                pass
+        if tabla_data:
+            config['sev_freq_tabla'] = tabla_data
+
+    def _poblar_tabla():
+        """Llena la tabla UI desde config['sev_freq_tabla']."""
+        tabla_table.blockSignals(True)
+        tabla_table.setRowCount(0)
+        for fila in config['sev_freq_tabla']:
+            r = tabla_table.rowCount()
+            tabla_table.insertRow(r)
+            tabla_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(fila.get('desde', 1))))
+            hasta = fila.get('hasta')
+            tabla_table.setItem(r, 1, QtWidgets.QTableWidgetItem("∞" if hasta is None else str(hasta)))
+            tabla_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(fila.get('multiplicador', 1.0))))
+        tabla_table.blockSignals(False)
+
+    def _agregar_fila_tabla():
+        r = tabla_table.rowCount()
+        desde_val = 1
+        if r > 0:
+            try:
+                prev_hasta = tabla_table.item(r - 1, 1).text()
+                if prev_hasta.strip() in ("", "∞", "inf"):
+                    prev_desde = int(tabla_table.item(r - 1, 0).text())
+                    tabla_table.setItem(r - 1, 1, QtWidgets.QTableWidgetItem(str(prev_desde + 2)))
+                    desde_val = prev_desde + 3
+                else:
+                    desde_val = int(prev_hasta) + 1
+            except (ValueError, AttributeError):
+                desde_val = r + 1
+        tabla_table.insertRow(r)
+        tabla_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(desde_val)))
+        tabla_table.setItem(r, 1, QtWidgets.QTableWidgetItem("∞"))
+        tabla_table.setItem(r, 2, QtWidgets.QTableWidgetItem("1.0"))
+        _sync_config()
+
+    def _eliminar_fila_tabla():
+        r = tabla_table.rowCount()
+        if r > 1:
+            tabla_table.removeRow(r - 1)
+            last = tabla_table.rowCount() - 1
+            if last >= 0:
+                tabla_table.setItem(last, 1, QtWidgets.QTableWidgetItem("∞"))
+            _sync_config()
+
+    # --- Conectar señales ---
+    def _on_activar_changed(state):
+        config['sev_freq_activado'] = bool(state)
+        params_container.setEnabled(bool(state) and freq_aplica[0])
+        _actualizar_header()
+        _actualizar_preview()
+
+    def _on_modelo_changed(idx):
+        modelo_stack.setCurrentIndex(idx)
+        _sync_config()
+
+    def _on_modo_changed(idx):
+        modo_stack.setCurrentIndex(idx)
+        _sync_config()
+
+    activar_check.stateChanged.connect(_on_activar_changed)
+    modelo_combo.currentIndexChanged.connect(_on_modelo_changed)
+    modo_combo.currentIndexChanged.connect(_on_modo_changed)
+    btn_add_row.clicked.connect(_agregar_fila_tabla)
+    btn_remove_row.clicked.connect(_eliminar_fila_tabla)
+
+    for widget in [paso_var, factor_max_lineal_var, base_var, factor_max_exp_var, alpha_var, factor_max_sist_var]:
+        widget.textChanged.connect(lambda _: _sync_config())
+    solo_aumento_check.stateChanged.connect(lambda _: _sync_config())
+    tabla_table.cellChanged.connect(lambda r, c: _sync_config())
+
+    def _toggle_collapsed():
+        collapsed[0] = not collapsed[0]
+        esc_content.setVisible(not collapsed[0])
+        _actualizar_header()
+
+    esc_header_btn.clicked.connect(_toggle_collapsed)
+
+    def on_freq_changed(freq_opcion):
+        """Llamar cuando cambia la distribución de frecuencia.
+        freq_opcion: 1=Poisson, 2=Binomial, 3=Bernoulli, 4=Poisson-Gamma, 5=Beta
+        """
+        aplica = freq_opcion not in (3, 5)
+        freq_aplica[0] = aplica
+        no_aplica_label.setVisible(not aplica)
+        activar_check.setEnabled(aplica)
+        params_container.setEnabled(aplica and config['sev_freq_activado'])
+        info_label.setVisible(aplica)
+        if not aplica and config['sev_freq_activado']:
+            activar_check.setChecked(False)
+            config['sev_freq_activado'] = False
+        _actualizar_header()
+        _actualizar_preview()
+
+    # --- Inicialización ---
+    _poblar_tabla()
+    modelo_stack.setCurrentIndex(0 if config['sev_freq_modelo'] == 'reincidencia' else 1)
+    modo_stack.setCurrentIndex(modo_idx)
+    params_container.setEnabled(config['sev_freq_activado'])
+    _actualizar_header()
+    _actualizar_preview()
+
+    parent_layout.addWidget(esc_frame)
+
+    return config, on_freq_changed
 
 # Funciones para generar la LDA y mostrar resultados
 def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden_eventos_ids=None, rng=None):
@@ -1737,44 +2265,94 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         if 'vinculos' in evento and evento['vinculos']:
             vinculos = evento['vinculos']
 
-            # Agrupar vínculos por tipo
-            vinculos_por_tipo = {'AND': [], 'OR': [], 'EXCLUYE': []}
-            for vinculo in vinculos:
-                tipo = vinculo['tipo']
-                id_padre = vinculo['id_padre']
-                vinculos_por_tipo[tipo].append(id_padre)
-
             # Inicializar condiciones para cada tipo
             condicion_and = np.ones(num_simulaciones, dtype=bool)
             condicion_or = np.zeros(num_simulaciones, dtype=bool)
             condicion_excluye = np.ones(num_simulaciones, dtype=bool)
+            tiene_and = False
+            tiene_or = False
+            tiene_excluye = False
 
-            # Procesar vínculos AND (todos deben ocurrir)
-            for padre_id in vinculos_por_tipo['AND']:
-                padre_idx = id_a_index[padre_id]
-                condicion_and = condicion_and & (frecuencias_por_evento[padre_idx] > 0)
+            # Inicializar acumuladores de factor de severidad por tipo
+            factor_sev_and = np.ones(num_simulaciones)   # producto de factores AND
+            factor_sev_or_max = np.zeros(num_simulaciones) # máximo de factores OR activados (init 0 para que max funcione con factores < 1.0)
+            tiene_factor_sev = False
 
-            # Procesar vínculos OR (al menos uno debe ocurrir)
-            for padre_id in vinculos_por_tipo['OR']:
-                padre_idx = id_a_index[padre_id]
-                condicion_or = condicion_or | (frecuencias_por_evento[padre_idx] > 0)
+            # Procesar cada vínculo individualmente con su probabilidad de activación
+            for vinculo in vinculos:
+                tipo = vinculo.get('tipo', 'AND')
+                id_padre = vinculo['id_padre']
+                prob = max(0.01, min(1.0, vinculo.get('probabilidad', 100) / 100.0))
+                fsev = max(0.10, min(5.0, vinculo.get('factor_severidad', 1.0)))
+                umbral = max(0, vinculo.get('umbral_severidad', 0))
 
-            # Procesar vínculos EXCLUYE (ninguno debe ocurrir)
-            for padre_id in vinculos_por_tipo['EXCLUYE']:
-                padre_idx = id_a_index[padre_id]
-                condicion_excluye = condicion_excluye & (frecuencias_por_evento[padre_idx] == 0)
+                if id_padre not in id_a_index:
+                    print(f"[DEBUG] Vínculo ignorado: id_padre {id_padre} no encontrado en id_a_index")
+                    continue
+
+                padre_idx = id_a_index[id_padre]
+                padre_ocurrio = frecuencias_por_evento[padre_idx] > 0
+
+                # Aplicar umbral de severidad del padre si está configurado
+                if umbral > 0:
+                    padre_ocurrio = padre_ocurrio & (perdidas_por_evento[padre_idx] >= umbral)
+
+                # Generar vector de activación probabilística
+                if prob >= 1.0:
+                    activacion = np.ones(num_simulaciones, dtype=bool)
+                else:
+                    activacion = rng.random(num_simulaciones) < prob
+
+                # Máscara de activación efectiva para este vínculo
+                vinculo_activo = padre_ocurrio & activacion
+
+                if tipo == 'AND':
+                    tiene_and = True
+                    condicion_and = condicion_and & vinculo_activo
+                    # Acumular factor de severidad (producto) para simulaciones donde se activa
+                    if fsev != 1.0:
+                        tiene_factor_sev = True
+                        # Solo aplicar factor donde el vínculo se activó
+                        factor_sev_and = np.where(vinculo_activo, factor_sev_and * fsev, factor_sev_and)
+                elif tipo == 'OR':
+                    tiene_or = True
+                    condicion_or = condicion_or | vinculo_activo
+                    # Siempre acumular max factor para vínculos OR activos (incluye fsev=1.0 para no perder neutralización)
+                    factor_sev_or_max = np.where(vinculo_activo, np.maximum(factor_sev_or_max, fsev), factor_sev_or_max)
+                    if fsev != 1.0:
+                        tiene_factor_sev = True
+                elif tipo == 'EXCLUYE':
+                    tiene_excluye = True
+                    condicion_excluye = condicion_excluye & ~vinculo_activo
+                else:
+                    print(f"[DEBUG] Tipo de vínculo no reconocido: '{tipo}', ignorando")
 
             # Combinar condiciones según los tipos presentes
             condicion_final = np.ones(num_simulaciones, dtype=bool)
 
-            if vinculos_por_tipo['AND']:
+            if tiene_and:
                 condicion_final = condicion_final & condicion_and
 
-            if vinculos_por_tipo['OR']:
+            if tiene_or:
                 condicion_final = condicion_final & condicion_or
 
-            if vinculos_por_tipo['EXCLUYE']:
+            if tiene_excluye:
                 condicion_final = condicion_final & condicion_excluye
+
+            # Calcular factor de severidad combinado para simulaciones activas
+            if tiene_factor_sev:
+                factor_severidad_vinculos = np.ones(num_simulaciones)
+                if tiene_and:
+                    factor_severidad_vinculos *= factor_sev_and
+                if tiene_or:
+                    # Usar condicion_or como guardia: donde ningún OR activó, factor = 1.0 (neutral)
+                    factor_sev_or_final = np.where(condicion_or, factor_sev_or_max, 1.0)
+                    factor_severidad_vinculos *= factor_sev_or_final
+                # Solo aplicar donde condicion_final es True; resto queda 1.0
+                factor_severidad_vinculos = np.where(condicion_final, factor_severidad_vinculos, 1.0)
+                evento['_factor_severidad_vinculos'] = factor_severidad_vinculos
+            else:
+                evento['_factor_severidad_vinculos'] = None
 
             # Simular frecuencia solo para las condiciones que se cumplen
             muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
@@ -1785,11 +2363,11 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     # ====================================================================
                     # Generar muestras con factores estocásticos si aplica
                     # ====================================================================
+                    freq_opcion = evento.get('freq_opcion', 3)
                     usa_estocastico = evento.get('_usa_estocastico', False)
                     
                     if usa_estocastico:
                         # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
-                        freq_opcion = evento.get('freq_opcion', 3)
                         factores_vector = evento.get('_factores_vector')
                         
                         if freq_opcion == 1:  # Poisson
@@ -1932,6 +2510,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     
                     # Manejar posibles valores infinitos o NaN
                     muestras_frecuencia_simuladas = np.nan_to_num(muestras_frecuencia_simuladas, nan=0, posinf=0, neginf=0)
+                    # Aplicar límite superior de frecuencia con rejection sampling (solo para distribuciones con conteo > 1)
+                    if freq_opcion in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+                        freq_cap = evento.get('freq_limite_superior')
+                        if freq_cap is not None and freq_cap > 0:
+                            mask = muestras_frecuencia_simuladas > freq_cap
+                            intentos = 0
+                            while np.any(mask) and intentos < 100:
+                                muestras_frecuencia_simuladas[mask] = dist_freq.rvs(size=int(np.sum(mask)), random_state=rng).astype(np.int32)
+                                mask = muestras_frecuencia_simuladas > freq_cap
+                                intentos += 1
+                            if np.any(mask):
+                                muestras_frecuencia_simuladas[mask] = freq_cap
                     
                     # Asegurar que sean valores no negativos y enteros
                     muestras_frecuencia_simuladas = np.clip(muestras_frecuencia_simuladas, 0, np.iinfo(np.int32).max)
@@ -1954,6 +2544,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     muestras_frecuencia[indices_a_simular] = 0
 
         elif 'eventos_padres' in evento and evento['eventos_padres']:
+            evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
             # Formato antiguo: usar tipo_dependencia único para todos los padres
             eventos_padres = evento.get('eventos_padres', [])
             tipo_dependencia = evento.get('tipo_dependencia', 'AND')
@@ -1982,10 +2573,10 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # Generar muestras con factores estocásticos si aplica (formato antiguo)
                         # ====================================================================
                         usa_estocastico = evento.get('_usa_estocastico', False)
+                        freq_opcion = evento.get('freq_opcion', 3)
                         
                         if usa_estocastico:
                             # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
-                            freq_opcion = evento.get('freq_opcion', 3)
                             factores_vector = evento.get('_factores_vector')
                             
                             if freq_opcion == 1:  # Poisson
@@ -2093,6 +2684,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         
                         # Manejar posibles valores infinitos o NaN
                         muestras_frecuencia_simuladas = np.nan_to_num(muestras_frecuencia_simuladas, nan=0, posinf=0, neginf=0)
+                        # Aplicar límite superior de frecuencia con rejection sampling (solo para distribuciones con conteo > 1)
+                        if freq_opcion in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+                            freq_cap = evento.get('freq_limite_superior')
+                            if freq_cap is not None and freq_cap > 0:
+                                mask = muestras_frecuencia_simuladas > freq_cap
+                                intentos = 0
+                                while np.any(mask) and intentos < 100:
+                                    muestras_frecuencia_simuladas[mask] = dist_freq.rvs(size=int(np.sum(mask)), random_state=rng).astype(np.int32)
+                                    mask = muestras_frecuencia_simuladas > freq_cap
+                                    intentos += 1
+                                if np.any(mask):
+                                    muestras_frecuencia_simuladas[mask] = freq_cap
                         
                         # Asegurar que sean valores no negativos y enteros
                         muestras_frecuencia_simuladas = np.clip(muestras_frecuencia_simuladas, 0, np.iinfo(np.int32).max)
@@ -2119,10 +2722,10 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     # Generar muestras con factores estocásticos si aplica (formato antiguo sin padres)
                     # ====================================================================
                     usa_estocastico = evento.get('_usa_estocastico', False)
+                    freq_opcion = evento.get('freq_opcion', 3)
                     
                     if usa_estocastico:
                         # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
-                        freq_opcion = evento.get('freq_opcion', 3)
                         factores_vector = evento.get('_factores_vector')
                         
                         if freq_opcion == 1:  # Poisson
@@ -2230,6 +2833,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     
                     # Manejar posibles valores infinitos o NaN
                     muestras_frecuencia = np.nan_to_num(muestras_frecuencia, nan=0, posinf=0, neginf=0)
+                    # Aplicar límite superior de frecuencia con rejection sampling (solo para distribuciones con conteo > 1)
+                    if freq_opcion in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+                        freq_cap = evento.get('freq_limite_superior')
+                        if freq_cap is not None and freq_cap > 0:
+                            mask = muestras_frecuencia > freq_cap
+                            intentos = 0
+                            while np.any(mask) and intentos < 100:
+                                muestras_frecuencia[mask] = dist_freq.rvs(size=int(np.sum(mask)), random_state=rng).astype(np.int32)
+                                mask = muestras_frecuencia > freq_cap
+                                intentos += 1
+                            if np.any(mask):
+                                muestras_frecuencia[mask] = freq_cap
                     # Asegurar que sean valores no negativos y enteros con límite superior
                     muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
                     muestras_frecuencia = muestras_frecuencia.astype(np.int32)
@@ -2245,15 +2860,16 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
         else:
             # Evento sin dependencias, simular normalmente
+            evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
             try:
                 # ====================================================================
                 # Generar muestras con factores estocásticos si aplica
                 # ====================================================================
                 usa_estocastico = evento.get('_usa_estocastico', False)
+                freq_opcion = evento.get('freq_opcion', 3)
                 
                 if usa_estocastico:
                     # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
-                    freq_opcion = evento.get('freq_opcion', 3)
                     factores_vector = evento.get('_factores_vector')
                     
                     if freq_opcion == 1:  # Poisson
@@ -2404,6 +3020,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 
                 # Manejar posibles valores infinitos o NaN
                 muestras_frecuencia = np.nan_to_num(muestras_frecuencia, nan=0, posinf=0, neginf=0)
+                # Aplicar límite superior de frecuencia con rejection sampling (solo para distribuciones con conteo > 1)
+                if freq_opcion in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+                    freq_cap = evento.get('freq_limite_superior')
+                    if freq_cap is not None and freq_cap > 0:
+                        mask = muestras_frecuencia > freq_cap
+                        intentos = 0
+                        while np.any(mask) and intentos < 100:
+                            muestras_frecuencia[mask] = dist_freq.rvs(size=int(np.sum(mask)), random_state=rng).astype(np.int32)
+                            mask = muestras_frecuencia > freq_cap
+                            intentos += 1
+                        if np.any(mask):
+                            muestras_frecuencia[mask] = freq_cap
                 # Asegurar que sean valores no negativos y enteros con límite superior
                 muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
                 muestras_frecuencia = muestras_frecuencia.astype(np.int32)
@@ -2485,6 +3113,108 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 total_perdidas_del_evento_concatenadas = np.nan_to_num(total_perdidas_del_evento_concatenadas, nan=0, posinf=1e12, neginf=0)
                 total_perdidas_del_evento_concatenadas = np.maximum(total_perdidas_del_evento_concatenadas, 0)
                 
+                # Aplicar límite superior de severidad por ocurrencia con rejection sampling
+                sev_cap = evento.get('sev_limite_superior')
+                if sev_cap is not None and sev_cap > 0:
+                    mask = total_perdidas_del_evento_concatenadas > sev_cap
+                    intentos = 0
+                    while np.any(mask) and intentos < 100:
+                        nuevas = dist_sev.rvs(size=int(np.sum(mask)), random_state=rng)
+                        nuevas = np.nan_to_num(nuevas, nan=0, posinf=1e12, neginf=0)
+                        nuevas = np.maximum(nuevas, 0)
+                        total_perdidas_del_evento_concatenadas[mask] = nuevas
+                        mask = total_perdidas_del_evento_concatenadas > sev_cap
+                        intentos += 1
+                    if np.any(mask):
+                        total_perdidas_del_evento_concatenadas[mask] = sev_cap
+                
+                # =====================================================
+                # ESCALAMIENTO DE SEVERIDAD POR FRECUENCIA
+                # Se aplica ANTES de factores de control y seguros
+                # =====================================================
+                if evento.get('sev_freq_activado', False) and sum_final_event_frequencies > 0:
+                    sev_freq_modelo = evento.get('sev_freq_modelo', 'reincidencia')
+                    
+                    if sev_freq_modelo == 'reincidencia':
+                        # Generar índice ordinal de cada pérdida dentro de su simulación
+                        _indices_pos = np.flatnonzero(final_event_frequencies > 0)
+                        _freqs_pos = final_event_frequencies[_indices_pos]
+                        _occurrence_idx = np.concatenate([np.arange(1, f+1) for f in _freqs_pos])
+                        
+                        tipo_esc = evento.get('sev_freq_tipo_escalamiento', 'lineal')
+                        factor_max = float(evento.get('sev_freq_factor_max', 5.0))
+                        
+                        if tipo_esc == 'tabla':
+                            tabla = evento.get('sev_freq_tabla', [])
+                            if tabla:
+                                _multiplicadores = _aplicar_tabla_escalamiento(_occurrence_idx, tabla)
+                            else:
+                                _multiplicadores = np.ones(len(_occurrence_idx))
+                        elif tipo_esc == 'exponencial':
+                            base = float(evento.get('sev_freq_base', 1.5))
+                            max_exp = np.log(factor_max) / np.log(base) if base > 1 else 100
+                            safe_exponents = np.minimum(_occurrence_idx - 1, max_exp)
+                            _multiplicadores = base ** safe_exponents
+                            _multiplicadores = np.minimum(_multiplicadores, factor_max)
+                        else:  # lineal (default)
+                            paso = float(evento.get('sev_freq_paso', 0.5))
+                            _multiplicadores = np.minimum(1 + paso * (_occurrence_idx - 1), factor_max)
+                        
+                        _media_antes = total_perdidas_del_evento_concatenadas.mean()
+                        total_perdidas_del_evento_concatenadas *= _multiplicadores
+                        _media_despues = total_perdidas_del_evento_concatenadas.mean()
+                        nombre_evento = evento.get('nombre', evento_id)
+                        print(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Reincidencia ({tipo_esc}) aplicado "
+                              f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
+                              f"mult rango: {_multiplicadores.min():.2f}-{_multiplicadores.max():.2f})")
+                    
+                    elif sev_freq_modelo == 'sistemico':
+                        alpha = float(evento.get('sev_freq_alpha', 0.5))
+                        solo_aumento = evento.get('sev_freq_solo_aumento', True)
+                        factor_max = float(evento.get('sev_freq_sistemico_factor_max', 3.0))
+                        freq_mean = final_event_frequencies.mean()
+                        freq_std = final_event_frequencies.std()
+                        
+                        if freq_std > 0.01:
+                            z = (final_event_frequencies - freq_mean) / freq_std
+                            if solo_aumento:
+                                z = np.maximum(z, 0)
+                            sev_freq_factor = np.clip(1 + alpha * z, 1.0 / factor_max, factor_max)
+                        else:
+                            sev_freq_factor = np.ones(num_simulaciones)
+                        
+                        _indices_pos = np.flatnonzero(final_event_frequencies > 0)
+                        _freqs_pos = final_event_frequencies[_indices_pos]
+                        _factores_por_perdida = np.repeat(sev_freq_factor[_indices_pos], _freqs_pos)
+                        
+                        _media_antes = total_perdidas_del_evento_concatenadas.mean()
+                        total_perdidas_del_evento_concatenadas *= _factores_por_perdida
+                        _media_despues = total_perdidas_del_evento_concatenadas.mean()
+                        nombre_evento = evento.get('nombre', evento_id)
+                        print(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Sistémico (alpha={alpha}) aplicado "
+                              f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
+                              f"factor rango: {sev_freq_factor[_indices_pos].min():.3f}-{sev_freq_factor[_indices_pos].max():.3f})")
+                
+                # =====================================================
+                # APLICAR FACTOR DE SEVERIDAD DE VÍNCULOS (cascada)
+                # ANTES de aplicar controles y seguros
+                # =====================================================
+                factor_sev_vinculos = evento.get('_factor_severidad_vinculos')
+                if factor_sev_vinculos is not None and not np.allclose(factor_sev_vinculos, 1.0):
+                    indices_con_ocurrencias_v = np.flatnonzero(final_event_frequencies > 0)
+                    frecuencias_en_esas_simulaciones_v = final_event_frequencies[indices_con_ocurrencias_v]
+                    factores_por_perdida_v = np.repeat(factor_sev_vinculos[indices_con_ocurrencias_v], frecuencias_en_esas_simulaciones_v)
+                    perdidas_antes_vinculos = total_perdidas_del_evento_concatenadas.mean()
+                    total_perdidas_del_evento_concatenadas = total_perdidas_del_evento_concatenadas * factores_por_perdida_v
+                    perdidas_despues_vinculos = total_perdidas_del_evento_concatenadas.mean()
+                    factor_min_v = factores_por_perdida_v.min()
+                    factor_max_v = factores_por_perdida_v.max()
+                    factor_med_v = factores_por_perdida_v.mean()
+                    nombre_evento = evento.get('nombre', evento_id)
+                    print(f"[DEBUG SEVERIDAD VINCULOS] Evento '{nombre_evento}': factor severidad vínculos aplicado "
+                          f"(media: ${perdidas_antes_vinculos:,.0f} → ${perdidas_despues_vinculos:,.0f}, "
+                          f"factor rango: {factor_min_v:.2f}x - {factor_max_v:.2f}x, media: {factor_med_v:.2f}x)")
+
                 # =====================================================
                 # APLICAR FACTOR DE SEVERIDAD A PÉRDIDAS INDIVIDUALES
                 # ANTES de aplicar seguros (los controles mitigan primero)
@@ -2791,10 +3521,17 @@ class Scenario:
         self.eventos_riesgo = []
 
     def to_dict(self):
+        eventos_serializables = []
+        for evento in self.eventos_riesgo:
+            evt = copy.deepcopy(evento)
+            for key in list(evt.keys()):
+                if key in ('dist_severidad', 'dist_frecuencia') or key.startswith('_'):
+                    del evt[key]
+            eventos_serializables.append(evt)
         return {
             'nombre': self.nombre,
             'descripcion': self.descripcion,
-            'eventos_riesgo': [evento.copy() for evento in self.eventos_riesgo]
+            'eventos_riesgo': eventos_serializables
         }
 
     @staticmethod
@@ -2985,6 +3722,30 @@ class EventCard(QtWidgets.QFrame):
             }}
         """)
         vinculos_label.setAlignment(QtCore.Qt.AlignCenter)
+        
+        # Tooltip con detalle de cada vínculo y su probabilidad
+        if vinculos and len(vinculos) > 0:
+            # Resolver nombres de eventos padre desde el parent (main window)
+            eventos_ref = []
+            if self.parent() and hasattr(self.parent(), 'eventos_riesgo'):
+                eventos_ref = self.parent().eventos_riesgo
+            tooltip_lines = []
+            for v in vinculos:
+                nombre_padre = "Desconocido"
+                for e in eventos_ref:
+                    if e.get('id') == v.get('id_padre'):
+                        nombre_padre = e.get('nombre', 'Sin nombre')
+                        break
+                prob = v.get('probabilidad', 100)
+                fsev = v.get('factor_severidad', 1.0)
+                umbral = v.get('umbral_severidad', 0)
+                detalle = f"{v.get('tipo', '?')} → {nombre_padre} ({prob}%, sev:{fsev:.2f}x"
+                if umbral > 0:
+                    detalle += f", umbral:${umbral:,}"
+                detalle += ")"
+                tooltip_lines.append(detalle)
+            vinculos_label.setToolTip("\n".join(tooltip_lines))
+        
         content_layout.addWidget(vinculos_label)
         
         content_layout.addStretch()
@@ -3028,35 +3789,41 @@ class EventCard(QtWidgets.QFrame):
                         info += f"{nombre}<br>Parámetros no disponibles"
                 else:
                     # Parámetros simplificados: min, mode, max (convertidos internamente)
-                    minimo = self.evento_data.get('sev_minimo', 0)
-                    mas_prob = self.evento_data.get('sev_mas_probable', 0)
-                    maximo = self.evento_data.get('sev_maximo', 0)
+                    minimo = self.evento_data.get('sev_minimo') or 0
+                    mas_prob = self.evento_data.get('sev_mas_probable') or 0
+                    maximo = self.evento_data.get('sev_maximo') or 0
                     info += f"{nombre}<br>Min: ${minimo:,.0f}<br>Moda: ${mas_prob:,.0f}<br>Max: ${maximo:,.0f}"
             
             # PERT (opcion 3)
             elif sev_opcion == 3:
-                minimo = self.evento_data.get('sev_minimo', 0)
-                mas_prob = self.evento_data.get('sev_mas_probable', 0)
-                maximo = self.evento_data.get('sev_maximo', 0)
+                minimo = self.evento_data.get('sev_minimo') or 0
+                mas_prob = self.evento_data.get('sev_mas_probable') or 0
+                maximo = self.evento_data.get('sev_maximo') or 0
                 info += f"PERT<br>Min: ${minimo:,.0f}<br>Moda: ${mas_prob:,.0f}<br>Max: ${maximo:,.0f}"
             
             # Pareto/GPD (opcion 4)
             elif sev_opcion == 4:
-                params = self.evento_data.get('sev_params_direct')
-                if params and isinstance(params, dict):
-                    umbral = params.get('umbral', params.get('loc', 0))
-                    xi = params.get('xi', params.get('c', 0))
-                    if isinstance(umbral, (int, float)) and isinstance(xi, (int, float)):
-                        info += f"Pareto/GPD<br>Umbral: ${umbral:,.0f} | ξ: {xi:.3f}"
+                if sev_input_method == 'direct' or sev_input_method == 'params_direct':
+                    params = self.evento_data.get('sev_params_direct')
+                    if params and isinstance(params, dict):
+                        umbral = params.get('umbral', params.get('loc', 0))
+                        xi = params.get('xi', params.get('c', 0))
+                        if isinstance(umbral, (int, float)) and isinstance(xi, (int, float)):
+                            info += f"Pareto/GPD<br>Umbral: ${umbral:,.0f} | ξ: {xi:.3f}"
+                        else:
+                            info += "Pareto/GPD<br>Parámetros configurados"
                     else:
-                        info += "Pareto/GPD<br>Parámetros configurados"
+                        info += "Pareto/GPD<br>Parámetros no disponibles"
                 else:
-                    info += "Pareto/GPD<br>Parámetros no disponibles"
+                    minimo = self.evento_data.get('sev_minimo') or 0
+                    mas_prob = self.evento_data.get('sev_mas_probable') or 0
+                    maximo = self.evento_data.get('sev_maximo') or 0
+                    info += f"Pareto/GPD<br>Min: ${minimo:,.0f}<br>Moda: ${mas_prob:,.0f}<br>Max: ${maximo:,.0f}"
             
             # Uniforme (opcion 5)
             elif sev_opcion == 5:
-                minimo = self.evento_data.get('sev_minimo', 0)
-                maximo = self.evento_data.get('sev_maximo', 0)
+                minimo = self.evento_data.get('sev_minimo') or 0
+                maximo = self.evento_data.get('sev_maximo') or 0
                 info += f"Uniforme<br>Min: ${minimo:,.0f} | Max: ${maximo:,.0f}"
             
             else:
@@ -3075,30 +3842,30 @@ class EventCard(QtWidgets.QFrame):
         
         try:
             if freq_opcion == 1:  # Poisson
-                tasa = self.evento_data.get('tasa', 0)
+                tasa = self.evento_data.get('tasa') or 0
                 info += f"Poisson<br>λ: {tasa:.2f}"
             
             elif freq_opcion == 2:  # Binomial
-                n = self.evento_data.get('num_eventos', 0)
-                p = self.evento_data.get('prob_exito', 0)
+                n = self.evento_data.get('num_eventos') or 0
+                p = self.evento_data.get('prob_exito') or 0
                 info += f"Binomial<br>n: {n} | p: {p:.3f}"
             
             elif freq_opcion == 3:  # Bernoulli
-                p = self.evento_data.get('prob_exito', 0)
+                p = self.evento_data.get('prob_exito') or 0
                 info += f"Bernoulli<br>p: {p:.3f}"
             
             elif freq_opcion == 4:  # Poisson-Gamma
-                pg_min = self.evento_data.get('pg_minimo', 0)
-                pg_mode = self.evento_data.get('pg_mas_probable', 0)
-                pg_max = self.evento_data.get('pg_maximo', 0)
-                pg_conf = self.evento_data.get('pg_confianza', 0)
+                pg_min = self.evento_data.get('pg_minimo') or 0
+                pg_mode = self.evento_data.get('pg_mas_probable') or 0
+                pg_max = self.evento_data.get('pg_maximo') or 0
+                pg_conf = self.evento_data.get('pg_confianza') or 0
                 info += f"Poisson-Gamma<br>Min: {pg_min:.1f} | Moda: {pg_mode:.1f}<br>Max: {pg_max:.1f} | Conf: {pg_conf:.0f}%"
             
             elif freq_opcion == 5:  # Beta
-                beta_min = self.evento_data.get('beta_minimo', 0)
-                beta_mode = self.evento_data.get('beta_mas_probable', 0)
-                beta_max = self.evento_data.get('beta_maximo', 0)
-                beta_conf = self.evento_data.get('beta_confianza', 0)
+                beta_min = self.evento_data.get('beta_minimo') or 0
+                beta_mode = self.evento_data.get('beta_mas_probable') or 0
+                beta_max = self.evento_data.get('beta_maximo') or 0
+                beta_conf = self.evento_data.get('beta_confianza') or 0
                 info += f"Beta<br>Min: {beta_min:.1f} | Moda: {beta_mode:.1f}<br>Max: {beta_max:.1f} | Conf: {beta_conf:.0f}%"
             
             else:
@@ -4074,6 +4841,30 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if hasattr(self, 'eventos_table'):
             self.eventos_table.setColumnWidth(0, 45)
     
+    def limpiar_vinculos_huerfanos(self, ids_eliminados):
+        """Elimina vínculos que apuntan a eventos eliminados.
+        
+        Args:
+            ids_eliminados (set): Conjunto de IDs de eventos que fueron eliminados.
+        """
+        for evento in self.eventos_riesgo:
+            if 'vinculos' in evento and evento['vinculos']:
+                evento['vinculos'] = [
+                    v for v in evento['vinculos']
+                    if v.get('id_padre') not in ids_eliminados
+                ]
+
+    def reconstruir_checkboxes_eventos(self):
+        """Recrea los checkboxes de la columna 'Activo' con índices correctos.
+        
+        Debe llamarse después de eliminar filas para evitar que los lambdas
+        apunten a índices desactualizados.
+        """
+        for row in range(self.eventos_table.rowCount()):
+            activo = self.eventos_riesgo[row].get('activo', True)
+            self.eventos_table.setCellWidget(row, 0, self.crear_checkbox_activo(row, activo=activo))
+        self.forzar_ancho_columna_activo()
+    
     def on_evento_activo_changed(self, row, state):
         """Callback cuando cambia el estado del checkbox de un evento.
         
@@ -4175,7 +4966,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Filtrar filas que coincidan con el texto
             for row in range(self.eventos_table.rowCount()):
-                item = self.eventos_table.item(row, 0)
+                item = self.eventos_table.item(row, 1)
                 if item:
                     nombre_evento = item.text().lower()
                     # Ocultar fila si no coincide con la búsqueda
@@ -4618,7 +5409,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # Actualizar vista
                 self.actualizar_vista_eventos()
                 self.forzar_ancho_columna_activo()  # Mantener ancho compacto
-                self.statusBar().showMessage(f"Evento '{evt['nombre']}' duplicado exitosamente", 3000)
+                n_vinc = len(evento_duplicado.get('vinculos', []))
+                if n_vinc > 0:
+                    self.statusBar().showMessage(
+                        f"Evento '{evt['nombre']}' duplicado ({n_vinc} vínculo(s) heredado(s))", 4000)
+                else:
+                    self.statusBar().showMessage(f"Evento '{evt['nombre']}' duplicado exitosamente", 3000)
                 break
     
     def on_card_active_changed(self, evento_data, activo):
@@ -4676,6 +5472,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                    (not evento_id and evt.get('nombre') == evento_nombre):
                     del self.eventos_riesgo[i]
                     self.eventos_table.removeRow(i)
+                    if evento_id:
+                        self.limpiar_vinculos_huerfanos({evento_id})
+                    self.reconstruir_checkboxes_eventos()
                     self.actualizar_vista_eventos()
                     break
     
@@ -6615,12 +7414,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
         scroll_area.setWidget(content_widget)
         tab_layout.addWidget(scroll_area)
 
-    def editar_evento_desde_tabla(self, row, column):
-        # Deseleccionar todos los eventos actualmente seleccionados
-        self.eventos_table.clearSelection()
-        # NOTA: Esta función estaba incompleta, debería llamar a editar_evento_popup
-        self.editar_evento_popup(False, row)
-    
     def actualizar_estado_botones_eventos(self):
         """Actualiza el estado habilitado/deshabilitado de los botones según la selección en la tabla."""
         hay_seleccion = len(self.eventos_table.selectedItems()) > 0
@@ -7713,6 +8506,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
         else: # new es True, esto no cambia
             evento_data = None # Para un evento nuevo, no hay datos previos
 
+        _s = lambda v, d='': str(v) if v is not None else d
+
         # Crear diálogo con tamaño optimizado y scroll
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Agregar Evento de Riesgo" if new else "Editar Evento de Riesgo")
@@ -7887,9 +8682,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
         min_mode_max_layout = QtWidgets.QFormLayout(min_mode_max_widget)
         min_mode_max_layout.setContentsMargins(0, 5, 0, 5)
 
-        sev_min_var = QtWidgets.QLineEdit(str(evento_data.get('sev_minimo', '')) if evento_data else "")
-        sev_mas_probable_var = QtWidgets.QLineEdit(str(evento_data.get('sev_mas_probable', '')) if evento_data else "")
-        sev_max_var = QtWidgets.QLineEdit(str(evento_data.get('sev_maximo', '')) if evento_data else "")
+        sev_min_var = QtWidgets.QLineEdit(_s(evento_data.get('sev_minimo')) if evento_data else "")
+        sev_mas_probable_var = QtWidgets.QLineEdit(_s(evento_data.get('sev_mas_probable')) if evento_data else "")
+        sev_max_var = QtWidgets.QLineEdit(_s(evento_data.get('sev_maximo')) if evento_data else "")
 
         min_mode_max_layout.addRow("Valor Mínimo:", sev_min_var)
         sev_mas_probable_label = QtWidgets.QLabel("Valor Más Probable:") # Guardamos referencia para ocultar/mostrar
@@ -7920,24 +8715,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Modo 0: s/scale
         ln_mode0_widget = QtWidgets.QWidget()
         ln_mode0_layout = QtWidgets.QFormLayout(ln_mode0_widget)
-        sev_ln_s_var = QtWidgets.QLineEdit(str(ln_params.get('s', '')))
-        sev_ln_scale_var = QtWidgets.QLineEdit(str(ln_params.get('scale', '')))
+        sev_ln_s_var = QtWidgets.QLineEdit(_s(ln_params.get('s')))
+        sev_ln_scale_var = QtWidgets.QLineEdit(_s(ln_params.get('scale')))
         ln_mode0_layout.addRow("Shape (s o sigma):", sev_ln_s_var)
         ln_mode0_layout.addRow("Scale (exp(mu)):", sev_ln_scale_var)
         sev_ln_stack.addWidget(ln_mode0_widget)
         # Modo 1: mean/std
         ln_mode1_widget = QtWidgets.QWidget()
         ln_mode1_layout = QtWidgets.QFormLayout(ln_mode1_widget)
-        sev_ln_mean_var = QtWidgets.QLineEdit(str(ln_params.get('mean', '')))
-        sev_ln_std_var = QtWidgets.QLineEdit(str(ln_params.get('std', '')))
+        sev_ln_mean_var = QtWidgets.QLineEdit(_s(ln_params.get('mean')))
+        sev_ln_std_var = QtWidgets.QLineEdit(_s(ln_params.get('std')))
         ln_mode1_layout.addRow("Media (mean):", sev_ln_mean_var)
         ln_mode1_layout.addRow("Desviación (std):", sev_ln_std_var)
         sev_ln_stack.addWidget(ln_mode1_widget)
         # Modo 2: mu/sigma
         ln_mode2_widget = QtWidgets.QWidget()
         ln_mode2_layout = QtWidgets.QFormLayout(ln_mode2_widget)
-        sev_ln_mu_var = QtWidgets.QLineEdit(str(ln_params.get('mu', '')))
-        sev_ln_sigma_var = QtWidgets.QLineEdit(str(ln_params.get('sigma', '')))
+        sev_ln_mu_var = QtWidgets.QLineEdit(_s(ln_params.get('mu')))
+        sev_ln_sigma_var = QtWidgets.QLineEdit(_s(ln_params.get('sigma')))
         ln_mode2_layout.addRow("mu (ln X):", sev_ln_mu_var)
         ln_mode2_layout.addRow("sigma (ln X):", sev_ln_sigma_var)
         sev_ln_stack.addWidget(ln_mode2_widget)
@@ -7946,7 +8741,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         sev_ln_param_mode_combo.currentIndexChanged.connect(sev_ln_stack.setCurrentIndex)
 
         # Campo común loc
-        sev_ln_loc_var = QtWidgets.QLineEdit(str(ln_params.get('loc', '0')))
+        sev_ln_loc_var = QtWidgets.QLineEdit(_s(ln_params.get('loc'), '0'))
 
         direct_ln_layout.addRow("Tipo de parametrización:", sev_ln_param_mode_combo)
         direct_ln_layout.addRow(sev_ln_stack)
@@ -7957,11 +8752,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
         direct_gpd_widget = QtWidgets.QWidget()
         direct_gpd_layout = QtWidgets.QFormLayout(direct_gpd_widget)
         # Obtener valores guardados si existen
-        gpd_params = evento_data.get('sev_params_direct', {}) if evento_data and evento_data.get('sev_input_method') == 'direct' else {}
+        gpd_params = evento_data.get('sev_params_direct', {}) if evento_data and evento_data.get('sev_input_method') == 'direct' and sev_combobox.currentText() == "Pareto" else {}
 
-        sev_gpd_c_var = QtWidgets.QLineEdit(str(gpd_params.get('c', '')))
-        sev_gpd_scale_var = QtWidgets.QLineEdit(str(gpd_params.get('scale', '')))
-        sev_gpd_loc_var = QtWidgets.QLineEdit(str(gpd_params.get('loc', '')))
+        sev_gpd_c_var = QtWidgets.QLineEdit(_s(gpd_params.get('c')))
+        sev_gpd_scale_var = QtWidgets.QLineEdit(_s(gpd_params.get('scale')))
+        sev_gpd_loc_var = QtWidgets.QLineEdit(_s(gpd_params.get('loc')))
 
         direct_gpd_layout.addRow("Shape (c o xi):", sev_gpd_c_var)
         direct_gpd_layout.addRow("Scale (beta):", sev_gpd_scale_var)
@@ -7972,11 +8767,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         direct_norm_widget = QtWidgets.QWidget()
         direct_norm_layout = QtWidgets.QFormLayout(direct_norm_widget)
         norm_params = evento_data.get('sev_params_direct', {}) if evento_data and evento_data.get('sev_input_method') == 'direct' and sev_combobox.currentText() == "Normal" else {}
-        sev_norm_mean_var = QtWidgets.QLineEdit(str(norm_params.get('mean', norm_params.get('mu', ''))))
-        sev_norm_std_var = QtWidgets.QLineEdit(str(norm_params.get('std', norm_params.get('sigma', ''))))
+        sev_norm_mean_var = QtWidgets.QLineEdit(_s(norm_params.get('mean', norm_params.get('mu'))))
+        sev_norm_std_var = QtWidgets.QLineEdit(_s(norm_params.get('std', norm_params.get('sigma'))))
         direct_norm_layout.addRow("Media (mean):", sev_norm_mean_var)
         direct_norm_layout.addRow("Desviación (std):", sev_norm_std_var)
         sev_params_stack.addWidget(direct_norm_widget) # Índice 3
+
+        # --- Límite superior de severidad (opcional) ---
+        sev_limite_layout = QtWidgets.QHBoxLayout()
+        sev_limite_label = QtWidgets.QLabel("Límite superior por ocurrencia ($):")
+        sev_limite_label.setToolTip("Máximo impacto posible por ocurrencia individual. Dejar vacío = sin límite.")
+        sev_limite_var = QtWidgets.QLineEdit(
+            str(evento_data.get('sev_limite_superior', '')) if evento_data and evento_data.get('sev_limite_superior') is not None else ""
+        )
+        sev_limite_var.setPlaceholderText("Sin límite")
+        sev_limite_var.setToolTip("Dejar vacío = sin límite")
+        sev_limite_layout.addWidget(sev_limite_label)
+        sev_limite_layout.addWidget(sev_limite_var)
+        sev_layout.addLayout(sev_limite_layout)
 
         # Creamos layout vertical para las distribuciones (apiladas)
         distribuciones_layout = QtWidgets.QVBoxLayout()
@@ -8116,7 +8924,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         poisson_widget = QtWidgets.QWidget()
         poisson_layout = QtWidgets.QFormLayout(poisson_widget)
         poisson_layout.setContentsMargins(0, 5, 0, 5)
-        tasa_var = QtWidgets.QLineEdit(str(evento_data['tasa']) if evento_data and 'tasa' in evento_data else "")
+        tasa_var = QtWidgets.QLineEdit(_s(evento_data.get('tasa')) if evento_data else "")
         poisson_layout.addRow("Tasa Media (λ):", tasa_var)
         freq_params_stack.addWidget(poisson_widget)
 
@@ -8124,8 +8932,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
         binomial_widget = QtWidgets.QWidget()
         binomial_layout = QtWidgets.QFormLayout(binomial_widget)
         binomial_layout.setContentsMargins(0, 5, 0, 5)
-        num_eventos_var = QtWidgets.QLineEdit(str(evento_data['num_eventos']) if evento_data and 'num_eventos' in evento_data else "")
-        prob_exito_var = QtWidgets.QLineEdit(str(evento_data['prob_exito']) if evento_data and 'prob_exito' in evento_data else "")
+        num_eventos_var = QtWidgets.QLineEdit(_s(evento_data.get('num_eventos')) if evento_data else "")
+        prob_exito_var = QtWidgets.QLineEdit(_s(evento_data.get('prob_exito')) if evento_data else "")
         binomial_layout.addRow("Número de Eventos Posibles (n):", num_eventos_var)
         binomial_layout.addRow("Probabilidad de Éxito (p):", prob_exito_var)
         freq_params_stack.addWidget(binomial_widget)
@@ -8134,7 +8942,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         bernoulli_widget = QtWidgets.QWidget()
         bernoulli_layout = QtWidgets.QFormLayout(bernoulli_widget)
         bernoulli_layout.setContentsMargins(0, 5, 0, 5)
-        prob_exito_var_bern = QtWidgets.QLineEdit(str(evento_data['prob_exito']) if evento_data and 'prob_exito' in evento_data else "")
+        prob_exito_var_bern = QtWidgets.QLineEdit(_s(evento_data.get('prob_exito')) if evento_data else "")
         bernoulli_layout.addRow("Probabilidad de Éxito (p):", prob_exito_var_bern)
         freq_params_stack.addWidget(bernoulli_widget)
         
@@ -8144,10 +8952,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
         poisson_gamma_layout.setContentsMargins(0, 5, 0, 5)
         
         # Extraer valores previos si existen
-        pg_minimo_var = QtWidgets.QLineEdit(str(evento_data.get('pg_minimo', '')) if evento_data and 'pg_minimo' in evento_data else "")
-        pg_mas_probable_var = QtWidgets.QLineEdit(str(evento_data.get('pg_mas_probable', '')) if evento_data and 'pg_mas_probable' in evento_data else "")
-        pg_maximo_var = QtWidgets.QLineEdit(str(evento_data.get('pg_maximo', '')) if evento_data and 'pg_maximo' in evento_data else "")
-        pg_confianza_var = QtWidgets.QLineEdit(str(evento_data.get('pg_confianza', '80')) if evento_data and 'pg_confianza' in evento_data else "80")
+        pg_minimo_var = QtWidgets.QLineEdit(_s(evento_data.get('pg_minimo')) if evento_data else "")
+        pg_mas_probable_var = QtWidgets.QLineEdit(_s(evento_data.get('pg_mas_probable')) if evento_data else "")
+        pg_maximo_var = QtWidgets.QLineEdit(_s(evento_data.get('pg_maximo')) if evento_data else "")
+        pg_confianza_var = QtWidgets.QLineEdit(_s(evento_data.get('pg_confianza'), '80') if evento_data else "80")
         
         # Campos para Poisson-Gamma
         poisson_gamma_layout.addRow("Valor mínimo de ocurrencia:", pg_minimo_var)
@@ -8163,10 +8971,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
         beta_layout.setContentsMargins(0, 5, 0, 5)
         
         # Extraer valores previos si existen
-        beta_minimo_var = QtWidgets.QLineEdit(str(evento_data.get('beta_minimo', '')) if evento_data and 'beta_minimo' in evento_data else "")
-        beta_mas_probable_var = QtWidgets.QLineEdit(str(evento_data.get('beta_mas_probable', '')) if evento_data and 'beta_mas_probable' in evento_data else "")
-        beta_maximo_var = QtWidgets.QLineEdit(str(evento_data.get('beta_maximo', '')) if evento_data and 'beta_maximo' in evento_data else "")
-        beta_confianza_var = QtWidgets.QLineEdit(str(evento_data.get('beta_confianza', '80')) if evento_data and 'beta_confianza' in evento_data else "80")
+        beta_minimo_var = QtWidgets.QLineEdit(_s(evento_data.get('beta_minimo')) if evento_data else "")
+        beta_mas_probable_var = QtWidgets.QLineEdit(_s(evento_data.get('beta_mas_probable')) if evento_data else "")
+        beta_maximo_var = QtWidgets.QLineEdit(_s(evento_data.get('beta_maximo')) if evento_data else "")
+        beta_confianza_var = QtWidgets.QLineEdit(_s(evento_data.get('beta_confianza'), '80') if evento_data else "80")
         
         # Campos para distribución Beta
         beta_layout.addRow("Probabilidad mínima razonable (%):", beta_minimo_var)
@@ -8177,6 +8985,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
         freq_params_stack.addWidget(beta_widget)
 
         freq_layout.addWidget(freq_params_stack)
+
+        # --- Límite superior de frecuencia (opcional) ---
+        freq_limite_layout = QtWidgets.QHBoxLayout()
+        freq_limite_label = QtWidgets.QLabel("Máximo de ocurrencias por año:")
+        freq_limite_label.setToolTip("Máximo número de ocurrencias posibles por año. Dejar vacío = sin límite.")
+        freq_limite_var = QtWidgets.QLineEdit(
+            str(evento_data.get('freq_limite_superior', '')) if evento_data and evento_data.get('freq_limite_superior') is not None else ""
+        )
+        freq_limite_var.setPlaceholderText("Sin límite")
+        freq_limite_var.setToolTip("Dejar vacío = sin límite")
+        freq_limite_layout.addWidget(freq_limite_label)
+        freq_limite_layout.addWidget(freq_limite_var)
+        freq_layout.addLayout(freq_limite_layout)
+
         distribuciones_layout.addWidget(freq_group)  # Añadimos distribución de frecuencia abajo
         
         # Añadir el layout vertical de distribuciones al layout principal
@@ -8196,20 +9018,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
             elif opcion == 5:
                 freq_params_stack.setCurrentIndex(4)  # Beta
             
+            # Mostrar/ocultar límite de frecuencia según distribución
+            freq_limite_visible = opcion in (1, 2, 4)  # Poisson, Binomial, Poisson-Gamma
+            freq_limite_label.setVisible(freq_limite_visible)
+            freq_limite_var.setVisible(freq_limite_visible)
+            
             # Forzar actualización del widget y ajuste de tamaño
             QtCore.QTimer.singleShot(10, adjust_freq_stack_size)
         freq_combobox.currentIndexChanged.connect(actualizar_parametros_frecuencia)
         actualizar_parametros_frecuencia()
 
+        # ====================================================================
+        # SECCIÓN: ESCALAMIENTO DE SEVERIDAD POR FRECUENCIA
+        # ====================================================================
+        sev_freq_config, _on_freq_dist_changed = _crear_seccion_escalamiento_ui(dialog_layout, evento_data)
+        
+        # Conectar cambio de distribución de frecuencia para habilitar/deshabilitar
+        def _actualizar_escalamiento_por_freq():
+            freq_opcion = freq_combobox.currentIndex() + 1
+            _on_freq_dist_changed(freq_opcion)
+        freq_combobox.currentIndexChanged.connect(_actualizar_escalamiento_por_freq)
+        # Inicializar estado según distribución actual
+        _actualizar_escalamiento_por_freq()
+
         # Guardar los vínculos existentes (movido antes para contar)
         vinculos_existentes = []
         if evento_data and 'vinculos' in evento_data:
-            vinculos_existentes = evento_data['vinculos']
+            vinculos_existentes = copy.deepcopy(evento_data['vinculos'])
         elif evento_data and 'eventos_padres' in evento_data:
             # Convertir formato antiguo al nuevo
             tipo = evento_data.get('tipo_dependencia', 'AND')
             for padre_id in evento_data['eventos_padres']:
-                vinculos_existentes.append({'id_padre': padre_id, 'tipo': tipo})
+                vinculos_existentes.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
         
         # Sección de vínculos colapsable
         vinculos_collapsed = [True]  # Colapsado por defecto
@@ -8249,7 +9089,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         # Explicación compacta con tooltip
         explicacion_vinculos = QtWidgets.QLabel(
-            "💡 <b>AND</b>: requiere el vinculado | <b>OR</b>: al menos uno | <b>EXCLUYE</b>: solo si NO ocurre"
+            "💡 <b>AND</b>: requiere el vinculado | <b>OR</b>: al menos uno | <b>EXCLUYE</b>: solo si NO ocurre. <b>Prob</b>: % activación. <b>Sev</b>: multiplicador severidad. <b>Umbral</b>: pérdida mínima del padre."
         )
         explicacion_vinculos.setWordWrap(True)
         explicacion_vinculos.setStyleSheet("background-color: #fffacd; padding: 5px; border-radius: 3px; font-size: {UI_FONT_BODY}pt;")
@@ -8257,12 +9097,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         # Tabla para gestionar vínculos con tamaño adecuado
         vinculos_table = QtWidgets.QTableWidget()
-        vinculos_table.setColumnCount(3)
-        vinculos_table.setHorizontalHeaderLabels(["Evento", "Tipo de Vínculo", "Eliminar"])
+        vinculos_table.setColumnCount(6)
+        vinculos_table.setHorizontalHeaderLabels(["Evento", "Tipo", "Prob.(%)", "Sev.(x)", "Umbral($)", "Eliminar"])
         vinculos_table.horizontalHeader().setStretchLastSection(False)
         vinculos_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)  # Primera columna elástica
-        vinculos_table.setColumnWidth(1, 230)  # Ancho aún mayor para 'Tipo de Vínculo'
-        vinculos_table.setColumnWidth(2, 150)  # Ancho aún mayor para el botón de eliminar
+        vinculos_table.setColumnWidth(1, 140)  # Ancho para 'Tipo'
+        vinculos_table.setColumnWidth(2, 80)   # Ancho para 'Prob.(%)'
+        vinculos_table.setColumnWidth(3, 80)   # Ancho para 'Sev.(x)'
+        vinculos_table.setColumnWidth(4, 110)  # Ancho para 'Umbral($)'
+        vinculos_table.setColumnWidth(5, 80)   # Ancho para 'Eliminar'
         vinculos_table.setMinimumHeight(180)  # Más altura para ver varios vínculos
         # Configurar altura de filas y otros parámetros
         vinculos_table.verticalHeader().setDefaultSectionSize(36)  # Altura de fila aumentada más
@@ -8333,7 +9176,43 @@ class RiskLabApp(QtWidgets.QMainWindow):
             tipo_combo.addItems(["AND", "OR", "EXCLUYE"])
             sel_layout.addWidget(tipo_combo)
 
-            # Sin explicación de los tipos de vínculo
+            # Función para habilitar/deshabilitar factor severidad según tipo
+            def on_tipo_changed_dialog(texto):
+                es_excluye = (texto == "EXCLUYE")
+                factor_sev_spinbox.setEnabled(not es_excluye)
+                if es_excluye:
+                    factor_sev_spinbox.setValue(1.00)
+            tipo_combo.currentTextChanged.connect(on_tipo_changed_dialog)
+
+            # Probabilidad de activación del vínculo
+            sel_layout.addWidget(QtWidgets.QLabel("Probabilidad de activación (%):"))
+            prob_spinbox = QtWidgets.QSpinBox()
+            prob_spinbox.setRange(1, 100)
+            prob_spinbox.setValue(100)
+            prob_spinbox.setSuffix("%")
+            prob_spinbox.setToolTip("Probabilidad de que este vínculo se active cuando la condición se cumple. 100% = siempre (comportamiento actual)")
+            sel_layout.addWidget(prob_spinbox)
+
+            # Factor de severidad condicional
+            sel_layout.addWidget(QtWidgets.QLabel("Factor de severidad:"))
+            factor_sev_spinbox = QtWidgets.QDoubleSpinBox()
+            factor_sev_spinbox.setRange(0.10, 5.00)
+            factor_sev_spinbox.setValue(1.00)
+            factor_sev_spinbox.setSingleStep(0.01)
+            factor_sev_spinbox.setDecimals(2)
+            factor_sev_spinbox.setSuffix("x")
+            factor_sev_spinbox.setToolTip("Multiplica la severidad del hijo cuando este vínculo se activa. 1.0x = sin cambio.")
+            sel_layout.addWidget(factor_sev_spinbox)
+
+            # Umbral de severidad del padre
+            sel_layout.addWidget(QtWidgets.QLabel("Umbral de severidad del padre ($):"))
+            umbral_sev_spinbox = QtWidgets.QSpinBox()
+            umbral_sev_spinbox.setRange(0, 999999999)
+            umbral_sev_spinbox.setValue(0)
+            umbral_sev_spinbox.setSingleStep(1000)
+            umbral_sev_spinbox.setPrefix("$")
+            umbral_sev_spinbox.setToolTip("El vínculo solo se evalúa si la pérdida NETA del padre (post-controles y seguros) supera este monto. $0 = siempre evaluar.")
+            sel_layout.addWidget(umbral_sev_spinbox)
 
             # Botones de aceptar/cancelar
             buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok |
@@ -8353,7 +9232,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 tipo = tipo_combo.currentText()
 
                 # Agregar a la lista de vínculos existentes
-                vinculos_existentes.append({'id_padre': evento_id, 'tipo': tipo})
+                vinculos_existentes.append({
+                    'id_padre': evento_id,
+                    'tipo': tipo,
+                    'probabilidad': prob_spinbox.value(),
+                    'factor_severidad': factor_sev_spinbox.value(),
+                    'umbral_severidad': umbral_sev_spinbox.value()
+                })
 
                 # Actualizar la tabla
                 actualizar_tabla_vinculos()
@@ -8388,17 +9273,55 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 tipo_combo.currentTextChanged.connect(lambda text, row=idx: actualizar_tipo_vinculo(row, text))
                 vinculos_table.setCellWidget(idx, 1, tipo_combo)
 
+                # Spinbox para probabilidad de activación
+                prob_spin = QtWidgets.QSpinBox()
+                prob_spin.setRange(1, 100)
+                prob_spin.setValue(max(1, min(100, vinculo.get('probabilidad', 100))))
+                prob_spin.setSuffix("%")
+                prob_spin.setFixedHeight(30)
+                prob_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
+                prob_spin.valueChanged.connect(lambda val, row=idx: actualizar_probabilidad_vinculo(row, val))
+                vinculos_table.setCellWidget(idx, 2, prob_spin)
+
+                # DoubleSpinbox para factor de severidad
+                factor_sev_spin = QtWidgets.QDoubleSpinBox()
+                factor_sev_spin.setRange(0.10, 5.00)
+                factor_sev_spin.setValue(max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0))))
+                factor_sev_spin.setSingleStep(0.01)
+                factor_sev_spin.setDecimals(2)
+                factor_sev_spin.setSuffix("x")
+                factor_sev_spin.setFixedHeight(30)
+                factor_sev_spin.setStyleSheet("QDoubleSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
+                factor_sev_spin.valueChanged.connect(lambda val, row=idx: actualizar_factor_severidad_vinculo(row, val))
+                # Deshabilitar factor severidad para EXCLUYE (no tiene efecto en simulación)
+                if vinculo['tipo'] == 'EXCLUYE':
+                    factor_sev_spin.setEnabled(False)
+                    factor_sev_spin.setValue(1.00)
+                vinculos_table.setCellWidget(idx, 3, factor_sev_spin)
+
+                # Spinbox para umbral de severidad del padre
+                umbral_spin = QtWidgets.QSpinBox()
+                umbral_spin.setRange(0, 999999999)
+                umbral_spin.setValue(max(0, vinculo.get('umbral_severidad', 0)))
+                umbral_spin.setSingleStep(1000)
+                umbral_spin.setPrefix("$")
+                umbral_spin.setFixedHeight(30)
+                umbral_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
+                umbral_spin.setToolTip("Pérdida NETA mínima del padre (post-controles y seguros) para activar este vínculo. $0 = siempre evaluar.")
+                umbral_spin.valueChanged.connect(lambda val, row=idx: actualizar_umbral_severidad_vinculo(row, val))
+                vinculos_table.setCellWidget(idx, 4, umbral_spin)
+
                 # Botón para eliminar con icono de cesto de basura y color rojo - sin contenedor
                 delete_btn = QtWidgets.QPushButton()
                 delete_btn.setIcon(self.iconos["delete"])  # Usar el icono de eliminar ya cargado
                 delete_btn.setToolTip("Eliminar vínculo")
-                delete_btn.setFixedSize(130, 30)  # Tamaño fijo para el botón, ampliado para llenar la celda
+                delete_btn.setFixedSize(70, 30)  # Tamaño fijo para el botón
                 delete_btn.setStyleSheet("QPushButton { background-color: #ff5555; color: white; border: none; margin: 0px; padding: 0px; }"
                                      "QPushButton:hover { background-color: #ff3333; }")
                 delete_btn.clicked.connect(lambda _, row=idx: eliminar_vinculo(row))
                 
                 # Colocar directamente el botón sin contenedor
-                vinculos_table.setCellWidget(idx, 2, delete_btn)
+                vinculos_table.setCellWidget(idx, 5, delete_btn)
             
             # Actualizar contador en el header
             num_vinculos = len(vinculos_existentes)
@@ -8410,6 +9333,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Función para actualizar el tipo de un vínculo
         def actualizar_tipo_vinculo(row, nuevo_tipo):
             vinculos_existentes[row]['tipo'] = nuevo_tipo
+            # Habilitar/deshabilitar factor severidad según tipo
+            factor_widget = vinculos_table.cellWidget(row, 3)
+            if factor_widget is not None:
+                es_excluye = (nuevo_tipo == 'EXCLUYE')
+                factor_widget.setEnabled(not es_excluye)
+                if es_excluye:
+                    factor_widget.setValue(1.00)
+                    vinculos_existentes[row]['factor_severidad'] = 1.0
+
+        # Función para actualizar la probabilidad de un vínculo
+        def actualizar_probabilidad_vinculo(row, valor):
+            vinculos_existentes[row]['probabilidad'] = valor
+
+        # Función para actualizar el factor de severidad de un vínculo
+        def actualizar_factor_severidad_vinculo(row, valor):
+            vinculos_existentes[row]['factor_severidad'] = valor
+
+        # Función para actualizar el umbral de severidad de un vínculo
+        def actualizar_umbral_severidad_vinculo(row, valor):
+            vinculos_existentes[row]['umbral_severidad'] = valor
 
         # Función para eliminar un vínculo
         def eliminar_vinculo(row):
@@ -9015,24 +9958,28 @@ class RiskLabApp(QtWidgets.QMainWindow):
             buttons = QtWidgets.QDialogButtonBox(
                 QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
             )
-            buttons.accepted.connect(ajuste_dialog.accept)
+            def validar_y_aceptar_ajuste():
+                nombre = nombre_factor_var.text().strip()
+                if not nombre:
+                    QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", "El nombre no puede estar vacío.")
+                    return
+                if tipo_estatico_radio.isChecked():
+                    if not afecta_frecuencia_check.isChecked() and not afecta_severidad_check.isChecked():
+                        QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", 
+                            "Debe seleccionar al menos una opción: frecuencia o severidad.")
+                        return
+                ajuste_dialog.accept()
+
+            buttons.accepted.connect(validar_y_aceptar_ajuste)
             buttons.rejected.connect(ajuste_dialog.reject)
             main_layout.addWidget(buttons)
             
             # Mostrar diálogo
             if ajuste_dialog.exec_() == QtWidgets.QDialog.Accepted:
                 nombre = nombre_factor_var.text().strip()
-                if not nombre:
-                    QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", "El nombre no puede estar vacío.")
-                    return
                 
                 # Crear factor según el tipo seleccionado
                 if tipo_estatico_radio.isChecked():
-                    # Validar que al menos uno esté seleccionado
-                    if not afecta_frecuencia_check.isChecked() and not afecta_severidad_check.isChecked():
-                        QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", 
-                            "Debe seleccionar al menos una opción: frecuencia o severidad.")
-                        return
                     
                     # NOTA: En UI positivo = reducción, internamente negativo = reducción
                     # Invertimos el signo al guardar para mantener compatibilidad con lógica de simulación
@@ -9519,24 +10466,28 @@ class RiskLabApp(QtWidgets.QMainWindow):
             buttons = QtWidgets.QDialogButtonBox(
                 QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
             )
-            buttons.accepted.connect(ajuste_dialog.accept)
+            def validar_y_aceptar_edicion():
+                nombre = nombre_factor_var.text().strip()
+                if not nombre:
+                    QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", "El nombre no puede estar vacío.")
+                    return
+                if tipo_estatico_radio.isChecked():
+                    if not afecta_frecuencia_check.isChecked() and not afecta_severidad_check.isChecked():
+                        QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", 
+                            "Debe seleccionar al menos una opción: frecuencia o severidad.")
+                        return
+                ajuste_dialog.accept()
+
+            buttons.accepted.connect(validar_y_aceptar_edicion)
             buttons.rejected.connect(ajuste_dialog.reject)
             main_layout_edit.addWidget(buttons)
             
             # Mostrar diálogo
             if ajuste_dialog.exec_() == QtWidgets.QDialog.Accepted:
                 nombre = nombre_factor_var.text().strip()
-                if not nombre:
-                    QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", "El nombre no puede estar vacío.")
-                    return
                 
                 # Actualizar factor según el tipo seleccionado
                 if tipo_estatico_radio.isChecked():
-                    # Validar que al menos uno esté seleccionado
-                    if not afecta_frecuencia_check.isChecked() and not afecta_severidad_check.isChecked():
-                        QtWidgets.QMessageBox.warning(ajuste_dialog, "Advertencia", 
-                            "Debe seleccionar al menos una opción: frecuencia o severidad.")
-                        return
                     
                     # NOTA: En UI positivo = reducción, internamente negativo = reducción
                     # Invertimos el signo al guardar para mantener compatibilidad con lógica de simulación
@@ -9676,7 +10627,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 prob_exito_var, prob_exito_var_bern, 
                 pg_minimo_var, pg_mas_probable_var, pg_maximo_var, pg_confianza_var,
                 beta_minimo_var, beta_mas_probable_var, beta_maximo_var, beta_confianza_var,
-                vinculos_existentes, factores_ajuste_existentes)
+                vinculos_existentes, factores_ajuste_existentes,
+                sev_freq_config,
+                sev_limite_var, freq_limite_var)
         
         button_box.accepted.connect(on_guardar_clicked)
         button_box.rejected.connect(dialog.reject)
@@ -9701,7 +10654,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                      prob_exito_var, prob_exito_var_bern, 
                      pg_minimo_var, pg_mas_probable_var, pg_maximo_var, pg_confianza_var, # <- Añadidos params Poisson-Gamma
                      beta_minimo_var, beta_mas_probable_var, beta_maximo_var, beta_confianza_var, # <- Añadidos params Beta
-                     vinculos_existentes, factores_ajuste_existentes=None):
+                     vinculos_existentes, factores_ajuste_existentes=None,
+                     sev_freq_config=None,
+                     sev_limite_var=None, freq_limite_var=None):
         try:
             nombre_evento = nombre_var.text().strip()
             if not nombre_evento:
@@ -9802,17 +10757,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     sev_params_direct = {'mean': mean, 'std': std}
                     dist_sev = generar_distribucion_severidad(sev_opcion, None, None, None, input_method='direct', params_direct=sev_params_direct)
                 elif dist_nombre_sev == "Pareto": # GPD
+                    if not sev_gpd_c_var.text().strip():
+                        raise ValueError("'c' (shape) no puede estar vacío para GPD.")
+                    if not sev_gpd_scale_var.text().strip():
+                        raise ValueError("'scale' no puede estar vacío para GPD.")
+                    if not sev_gpd_loc_var.text().strip():
+                        raise ValueError("'loc' no puede estar vacío para GPD.")
                     try:
                         c = float(sev_gpd_c_var.text())
                         scale = float(sev_gpd_scale_var.text())
                         loc = float(sev_gpd_loc_var.text())
-                        if scale <= 0: raise ValueError("Scale (beta) debe ser positivo para GPD.")
-                        # Podrían necesitarse más validaciones según el valor de 'c' y 'loc'
-                        sev_params_direct = {'c': c, 'scale': scale, 'loc': loc}
-                         # Intentar crear la distribución para validar parámetros
-                        dist_sev = genpareto(c=c, scale=scale, loc=loc)
-                    except ValueError as e:
-                        raise ValueError(f"Error en parámetros GPD directos: {e}")
+                    except (ValueError, TypeError):
+                        raise ValueError("Los parámetros de GPD deben ser numéricos.")
+                    if scale <= 0: raise ValueError("Scale (beta) debe ser positivo para GPD.")
+                    sev_params_direct = {'c': c, 'scale': scale, 'loc': loc}
+                    dist_sev = genpareto(c=c, scale=scale, loc=loc)
 
             else: # sev_input_method == 'min_mode_max'
                 # --- Leer y Validar Parámetros Min/Mode/Max (como antes) ---
@@ -9859,7 +10818,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             elif freq_opcion == 2: # Binomial
                 if not num_eventos_var.text(): raise ValueError("El número de eventos posibles (n) no puede estar vacío.")
                 if not prob_exito_var.text(): raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
-                num_eventos = int(num_eventos_var.text())
+                num_eventos = int(float(num_eventos_var.text()))
                 prob_exito = float(prob_exito_var.text())
                 if num_eventos <= 0: raise ValueError("El número de eventos posibles (n) debe ser mayor que cero.")
                 if not 0 <= prob_exito <= 1: raise ValueError("La probabilidad de éxito (p) debe estar entre 0 y 1.")
@@ -9921,10 +10880,32 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if dist_freq is None:
                  raise ValueError("No se pudo crear la distribución de frecuencia.")
 
-            vinculos = [] # Inicializar vinculos
-            if vinculos_existentes is not None: # Solo copiar si no es None
-                vinculos = copy.deepcopy(vinculos_existentes)
+            # Parsear límites superiores opcionales
+            sev_limite_superior = None
+            if sev_limite_var is not None:
+                sev_limite_text = sev_limite_var.text().strip()
+                if sev_limite_text:
+                    try:
+                        sev_limite_superior = float(sev_limite_text)
+                        if sev_limite_superior <= 0:
+                            raise ValueError("El límite superior de severidad debe ser mayor que cero.")
+                    except ValueError as e:
+                        if "mayor que cero" in str(e):
+                            raise
+                        raise ValueError(f"El límite superior de severidad debe ser un número válido: {sev_limite_text}")
             
+            freq_limite_superior = None
+            freq_limite_text = freq_limite_var.text().strip() if freq_limite_var is not None else ""
+            if freq_limite_text:
+                try:
+                    freq_limite_superior = int(float(freq_limite_text))
+                    if freq_limite_superior <= 0:
+                        raise ValueError("El máximo de ocurrencias por año debe ser mayor que cero.")
+                except ValueError as e:
+                    if "mayor que cero" in str(e):
+                        raise
+                    raise ValueError(f"El máximo de ocurrencias por año debe ser un número entero válido: {freq_limite_text}")
+
             evento_temp = {
                 'nombre': nombre_evento,
                 'id': str(uuid.uuid4()) if new else self.eventos_riesgo[row]['id'],
@@ -9935,7 +10916,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 'sev_mas_probable': sev_mas_probable,
                 'sev_maximo': sev_maximo,
                 'sev_params_direct': sev_params_direct,
+                'sev_limite_superior': sev_limite_superior,
                 'freq_opcion': freq_opcion,
+                'freq_limite_superior': freq_limite_superior,
                 'tasa': tasa,
                 'num_eventos': num_eventos,
                 'prob_exito': prob_exito,
@@ -9953,20 +10936,32 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 'beta_beta': calculated_beta if freq_opcion == 5 else None,
                 
                 'dist_severidad': dist_sev, # Objeto distribución creado
-
-                # Campos de Frecuencia (sin cambios en estructura)
-                'freq_opcion': freq_opcion,
-                'tasa': tasa,
-                'num_eventos': num_eventos,
-                'prob_exito': prob_exito,
                 'dist_frecuencia': dist_freq, # Objeto distribución creado
 
                 # Vínculos
-                'vinculos': vinculos_existentes.copy(), # Asegúrate que esto funcione como antes
+                'vinculos': copy.deepcopy(vinculos_existentes) if vinculos_existentes else [],
                 
                 # Factores de ajuste de probabilidad (log-odds)
-                'factores_ajuste': copy.deepcopy(factores_ajuste_existentes) if factores_ajuste_existentes else []
+                'factores_ajuste': copy.deepcopy(factores_ajuste_existentes) if factores_ajuste_existentes else [],
+                
+                # Escalamiento de severidad por frecuencia
+                'sev_freq_activado': False,
+                'sev_freq_modelo': 'reincidencia',
+                'sev_freq_tipo_escalamiento': 'lineal',
+                'sev_freq_tabla': [{'desde': 1, 'hasta': 2, 'multiplicador': 1.0}, {'desde': 3, 'hasta': None, 'multiplicador': 2.0}],
+                'sev_freq_paso': 0.5,
+                'sev_freq_base': 1.5,
+                'sev_freq_factor_max': 5.0,
+                'sev_freq_alpha': 0.5,
+                'sev_freq_solo_aumento': True,
+                'sev_freq_sistemico_factor_max': 3.0,
             }
+            
+            # Override sev_freq_* fields from UI config if provided
+            if sev_freq_config and isinstance(sev_freq_config, dict):
+                for key, value in sev_freq_config.items():
+                    if key.startswith('sev_freq_'):
+                        evento_temp[key] = value
             
             # DEBUG: Verificar que los factores se guardaron
             if factores_ajuste_existentes:
@@ -10075,9 +11070,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if respuesta == QtWidgets.QMessageBox.Yes:
             # Ordenar los índices de fila en orden descendente para evitar problemas al eliminar filas
             rows = sorted([index.row() for index in selected_items], reverse=True)
+            ids_eliminados = {self.eventos_riesgo[row].get('id') for row in rows}
             for row in rows:
                 del self.eventos_riesgo[row]
                 self.eventos_table.removeRow(row)
+            self.limpiar_vinculos_huerfanos(ids_eliminados)
+            self.reconstruir_checkboxes_eventos()
             self.actualizar_vista_eventos()  # Actualizar vista
 
     def duplicar_eventos(self):
@@ -10099,7 +11097,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         # Primero asignamos nuevos IDs
         for evento_original in eventos_a_duplicar:
-            evento_nuevo = evento_original.copy()
+            evento_nuevo = copy.deepcopy(evento_original)
             nuevo_id = str(uuid.uuid4())
             id_original_a_nuevo[evento_original['id']] = nuevo_id
             evento_nuevo['id'] = nuevo_id
@@ -10115,17 +11113,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 for vinculo in evento_nuevo.get('vinculos', []):
                     padre_id = vinculo['id_padre']
                     tipo = vinculo['tipo']
+                    prob = vinculo.get('probabilidad', 100)
+                    fsev = vinculo.get('factor_severidad', 1.0)
+                    umbral = vinculo.get('umbral_severidad', 0)
                     # Si el evento padre fue duplicado, usamos el nuevo ID
                     if padre_id in id_original_a_nuevo:
                         vinculos_actualizados.append({
                             'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo
+                            'tipo': tipo,
+                            'probabilidad': prob,
+                            'factor_severidad': fsev,
+                            'umbral_severidad': umbral
                         })
                     else:
                         # Si no, mantenemos el ID original
                         vinculos_actualizados.append({
                             'id_padre': padre_id,
-                            'tipo': tipo
+                            'tipo': tipo,
+                            'probabilidad': prob,
+                            'factor_severidad': fsev,
+                            'umbral_severidad': umbral
                         })
                 evento_nuevo['vinculos'] = vinculos_actualizados
 
@@ -10522,11 +11529,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if not self.eventos_riesgo:
                 raise ValueError("Debe agregar al menos un evento de riesgo.")
 
-            # Se determina qué eventos usar, dependiendo si hay un escenario seleccionado
-            if hasattr(self, 'current_scenario') and self.current_scenario:
-                eventos = self.current_scenario.eventos_riesgo
-            else:
-                eventos = self.eventos_riesgo
+            # Siempre usar los eventos de la pestaña Simulación
+            # (la pestaña Escenarios tiene su propio flujo via ejecutar_simulacion_escenario)
+            eventos = self.eventos_riesgo
 
             # FILTRAR SOLO EVENTOS ACTIVOS
             # IMPORTANTE: Hacer copia profunda para no modificar los datos originales
@@ -10633,6 +11638,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     evento['beta_maximo'] = evento_data['beta_maximo']
                 if 'beta_confianza' in evento_data:
                     evento['beta_confianza'] = evento_data['beta_confianza']
+
+                # Copiar configuración de escalamiento severidad-frecuencia
+                for key in evento_data:
+                    if key.startswith('sev_freq_'):
+                        evento[key] = evento_data[key]
+
+                # Copiar límites superiores opcionales
+                if 'sev_limite_superior' in evento_data:
+                    evento['sev_limite_superior'] = evento_data['sev_limite_superior']
+                if 'freq_limite_superior' in evento_data:
+                    evento['freq_limite_superior'] = evento_data['freq_limite_superior']
 
                 eventos_simulacion.append(evento)
 
@@ -11165,13 +12181,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Evitamos la duplicación de la señal que causaba dos confirmaciones
 
     def ejecutar_simulacion_desde_escenarios(self):
-        if self.current_scenario is None:
-            QtWidgets.QMessageBox.warning(self, "Advertencia", "Seleccione un escenario para simular.")
-            return
-        # Actualizar el número de simulaciones con el valor ingresado en la pestaña "Escenarios"
-        self.num_simulaciones_var.setText(self.num_simulaciones_var_escenarios.text())
-        # Llamar al método existente de ejecutar_simulacion
-        self.ejecutar_simulacion()
+        # Redirigir al método que hace el swap temporal de eventos
+        self.ejecutar_simulacion_escenario()
     
     def actualizar_estado_botones_escenarios(self):
         """Actualiza el estado habilitado/deshabilitado de los botones según la selección en la tabla."""
@@ -11376,6 +12387,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Función para editar parámetros del evento
         def editar_parametros_evento(row, column):
             evento = self.eventos_scenario[row]
+            _s = lambda v, d='': str(v) if v is not None else d
             # Crear diálogo para editar parámetros del evento
             evento_dialog = QtWidgets.QDialog(dialog)
             evento_dialog.setWindowTitle(f"Editar Parámetros del Evento '{evento['nombre']}'")
@@ -11401,36 +12413,45 @@ class RiskLabApp(QtWidgets.QMainWindow):
             freq_layout = QtWidgets.QFormLayout(freq_group)
 
             if evento['freq_opcion'] == 1:  # Poisson
-                tasa_var = QtWidgets.QLineEdit(str(evento['tasa']))
+                tasa_var = QtWidgets.QLineEdit(_s(evento.get('tasa')))
                 freq_layout.addRow("Tasa Media (λ):", tasa_var)
             elif evento['freq_opcion'] == 2:  # Binomial
-                n_var = QtWidgets.QLineEdit(str(evento['num_eventos']))
-                p_var = QtWidgets.QLineEdit(str(evento['prob_exito']))
+                n_var = QtWidgets.QLineEdit(_s(evento.get('num_eventos')))
+                p_var = QtWidgets.QLineEdit(_s(evento.get('prob_exito')))
                 freq_layout.addRow("Número de Eventos (n):", n_var)
                 freq_layout.addRow("Probabilidad de Éxito (p):", p_var)
             elif evento['freq_opcion'] == 3:  # Bernoulli
-                p_var = QtWidgets.QLineEdit(str(evento['prob_exito']))
+                p_var = QtWidgets.QLineEdit(_s(evento.get('prob_exito')))
                 freq_layout.addRow("Probabilidad de Éxito (p):", p_var)
             elif evento['freq_opcion'] == 4:  # Poisson-Gamma
-                pg_minimo_var = QtWidgets.QLineEdit(str(evento.get('pg_minimo', '')))
-                pg_mas_probable_var = QtWidgets.QLineEdit(str(evento.get('pg_mas_probable', '')))
-                pg_maximo_var = QtWidgets.QLineEdit(str(evento.get('pg_maximo', '')))
-                pg_confianza_var = QtWidgets.QLineEdit(str(evento.get('pg_confianza', '80')))
+                pg_minimo_var = QtWidgets.QLineEdit(_s(evento.get('pg_minimo')))
+                pg_mas_probable_var = QtWidgets.QLineEdit(_s(evento.get('pg_mas_probable')))
+                pg_maximo_var = QtWidgets.QLineEdit(_s(evento.get('pg_maximo')))
+                pg_confianza_var = QtWidgets.QLineEdit(_s(evento.get('pg_confianza'), '80'))
                 
                 freq_layout.addRow("Valor mínimo de ocurrencia:", pg_minimo_var)
                 freq_layout.addRow("Valor más probable de ocurrencia:", pg_mas_probable_var)
                 freq_layout.addRow("Valor máximo de ocurrencia:", pg_maximo_var)
                 freq_layout.addRow("Confianza asociada al rango (%):", pg_confianza_var)
             elif evento['freq_opcion'] == 5:  # Beta
-                beta_minimo_var = QtWidgets.QLineEdit(str(evento.get('beta_minimo', '')))
-                beta_mas_probable_var = QtWidgets.QLineEdit(str(evento.get('beta_mas_probable', '')))
-                beta_maximo_var = QtWidgets.QLineEdit(str(evento.get('beta_maximo', '')))
-                beta_confianza_var = QtWidgets.QLineEdit(str(evento.get('beta_confianza', '80')))
+                beta_minimo_var = QtWidgets.QLineEdit(_s(evento.get('beta_minimo')))
+                beta_mas_probable_var = QtWidgets.QLineEdit(_s(evento.get('beta_mas_probable')))
+                beta_maximo_var = QtWidgets.QLineEdit(_s(evento.get('beta_maximo')))
+                beta_confianza_var = QtWidgets.QLineEdit(_s(evento.get('beta_confianza'), '80'))
                 
                 freq_layout.addRow("Probabilidad mínima razonable (%):", beta_minimo_var)
                 freq_layout.addRow("Probabilidad más probable (%):", beta_mas_probable_var)
                 freq_layout.addRow("Probabilidad máxima razonable (%):", beta_maximo_var)
                 freq_layout.addRow("Confianza asociada al rango (%):", beta_confianza_var)
+
+            # --- Límite superior de frecuencia (opcional, solo para distribuciones con conteo > 1) ---
+            freq_limite_esc_var = QtWidgets.QLineEdit(
+                str(evento.get('freq_limite_superior', '')) if evento.get('freq_limite_superior') is not None else ""
+            )
+            freq_limite_esc_var.setPlaceholderText("Sin límite")
+            freq_limite_esc_var.setToolTip("Máximo número de ocurrencias posibles por año. Dejar vacío = sin límite.")
+            if evento['freq_opcion'] in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+                freq_layout.addRow("Máximo ocurrencias/año:", freq_limite_esc_var)
 
             evento_layout.addWidget(freq_group)
 
@@ -11530,8 +12551,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if evento.get('sev_input_method') == 'direct' and isinstance(evento.get('sev_params_direct'), dict):
                 pd = evento['sev_params_direct']
                 if sev_op == 1:
-                    sev_norm_mean_var.setText(str(pd.get('mean', pd.get('mu', ''))))
-                    sev_norm_std_var.setText(str(pd.get('std', pd.get('sigma', ''))))
+                    sev_norm_mean_var.setText(_s(pd.get('mean', pd.get('mu'))))
+                    sev_norm_std_var.setText(_s(pd.get('std', pd.get('sigma'))))
                 elif sev_op == 2:
                     if 'mean' in pd and 'std' in pd:
                         sev_ln_param_mode_combo.setCurrentIndex(1)
@@ -11539,17 +12560,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         sev_ln_param_mode_combo.setCurrentIndex(2)
                     else:
                         sev_ln_param_mode_combo.setCurrentIndex(0)
-                    sev_ln_s_var.setText(str(pd.get('s', '')))
-                    sev_ln_scale_var.setText(str(pd.get('scale', '')))
-                    sev_ln_mean_var.setText(str(pd.get('mean', '')))
-                    sev_ln_std_var.setText(str(pd.get('std', '')))
-                    sev_ln_mu_var.setText(str(pd.get('mu', '')))
-                    sev_ln_sigma_var.setText(str(pd.get('sigma', '')))
-                    sev_ln_loc_var.setText(str(pd.get('loc', '0')))
+                    sev_ln_s_var.setText(_s(pd.get('s')))
+                    sev_ln_scale_var.setText(_s(pd.get('scale')))
+                    sev_ln_mean_var.setText(_s(pd.get('mean')))
+                    sev_ln_std_var.setText(_s(pd.get('std')))
+                    sev_ln_mu_var.setText(_s(pd.get('mu')))
+                    sev_ln_sigma_var.setText(_s(pd.get('sigma')))
+                    sev_ln_loc_var.setText(_s(pd.get('loc'), '0'))
                 elif sev_op == 4:
-                    sev_gpd_c_var.setText(str(pd.get('c', '')))
-                    sev_gpd_scale_var.setText(str(pd.get('scale', '')))
-                    sev_gpd_loc_var.setText(str(pd.get('loc', '')))
+                    sev_gpd_c_var.setText(_s(pd.get('c')))
+                    sev_gpd_scale_var.setText(_s(pd.get('scale')))
+                    sev_gpd_loc_var.setText(_s(pd.get('loc')))
 
             # --- Páginas del stack para direct params ---
             sev_direct_stack = QtWidgets.QStackedWidget()
@@ -11629,7 +12650,22 @@ class RiskLabApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+            # --- Límite superior de severidad (opcional) ---
+            sev_limite_esc_var = QtWidgets.QLineEdit(
+                str(evento.get('sev_limite_superior', '')) if evento.get('sev_limite_superior') is not None else ""
+            )
+            sev_limite_esc_var.setPlaceholderText("Sin límite")
+            sev_limite_esc_var.setToolTip("Máximo impacto posible por ocurrencia individual. Dejar vacío = sin límite.")
+            sev_layout.addRow("Límite superior ($):", sev_limite_esc_var)
+
             evento_layout.addWidget(sev_group)
+
+            # ====================================================================
+            # SECCIÓN: ESCALAMIENTO DE SEVERIDAD POR FRECUENCIA (ESCENARIO)
+            # ====================================================================
+            sev_freq_config_esc, _on_freq_dist_changed_esc = _crear_seccion_escalamiento_ui(evento_layout, evento)
+            # Inicializar estado según distribución del evento (fija en escenario)
+            _on_freq_dist_changed_esc(evento.get('freq_opcion', 1))
 
             # ====================================================================
             # SECCIÓN DE FACTORES/CONTROLES DE RIESGO (NUEVA)
@@ -11977,21 +13013,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 buttons_f = QtWidgets.QDialogButtonBox(
                     QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
                 )
-                buttons_f.accepted.connect(factor_dialog.accept)
-                buttons_f.rejected.connect(factor_dialog.reject)
-                main_factor_layout.addWidget(buttons_f)
-                
-                if factor_dialog.exec_() == QtWidgets.QDialog.Accepted:
+                def validar_y_aceptar_factor():
                     nombre = nombre_factor_var.text().strip()
                     if not nombre:
                         QtWidgets.QMessageBox.warning(factor_dialog, "Advertencia", "El nombre no puede estar vacío.")
                         return
-                    
                     if tipo_estatico_radio.isChecked():
                         if not afecta_freq_check.isChecked() and not afecta_sev_check.isChecked():
                             QtWidgets.QMessageBox.warning(factor_dialog, "Advertencia", 
                                 "Debe seleccionar al menos frecuencia o severidad.")
                             return
+                    factor_dialog.accept()
+
+                buttons_f.accepted.connect(validar_y_aceptar_factor)
+                buttons_f.rejected.connect(factor_dialog.reject)
+                main_factor_layout.addWidget(buttons_f)
+                
+                if factor_dialog.exec_() == QtWidgets.QDialog.Accepted:
+                    nombre = nombre_factor_var.text().strip()
+                    
+                    if tipo_estatico_radio.isChecked():
                         
                         # Determinar tipo de severidad
                         es_seguro_esc = afecta_sev_check.isChecked() and tipo_sev_seguro_esc.isChecked()
@@ -12274,24 +13315,29 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 buttons_f = QtWidgets.QDialogButtonBox(
                     QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
                 )
-                buttons_f.accepted.connect(factor_dialog.accept)
-                buttons_f.rejected.connect(factor_dialog.reject)
-                main_factor_edit_layout.addWidget(buttons_f)
-                
-                if factor_dialog.exec_() == QtWidgets.QDialog.Accepted:
+                def validar_y_aceptar_edicion_factor():
                     nombre = nombre_factor_var.text().strip()
                     if not nombre:
                         QtWidgets.QMessageBox.warning(factor_dialog, "Advertencia", "El nombre no puede estar vacío.")
                         return
-                    
-                    # Preservar estado activo
-                    activo_actual = factor_actual.get('activo', True)
-                    
                     if tipo_estatico_radio.isChecked():
                         if not afecta_freq_check.isChecked() and not afecta_sev_check.isChecked():
                             QtWidgets.QMessageBox.warning(factor_dialog, "Advertencia", 
                                 "Debe seleccionar al menos frecuencia o severidad.")
                             return
+                    factor_dialog.accept()
+
+                buttons_f.accepted.connect(validar_y_aceptar_edicion_factor)
+                buttons_f.rejected.connect(factor_dialog.reject)
+                main_factor_edit_layout.addWidget(buttons_f)
+                
+                if factor_dialog.exec_() == QtWidgets.QDialog.Accepted:
+                    nombre = nombre_factor_var.text().strip()
+                    
+                    # Preservar estado activo
+                    activo_actual = factor_actual.get('activo', True)
+                    
+                    if tipo_estatico_radio.isChecked():
                         
                         # Determinar tipo de severidad
                         es_seguro_edit_esc = afecta_sev_check.isChecked() and tipo_sev_seguro_edit_esc.isChecked()
@@ -12378,27 +13424,47 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             def guardar_cambios():
                 try:
-                    # Actualizar los parámetros de frecuencia
+                    # Acumular cambios en dict temporal para no mutar evento hasta que todo valide
+                    cambios = {}
+
+                    # Validar y preparar parámetros de frecuencia
                     if evento['freq_opcion'] == 1:  # Poisson
+                        if not tasa_var.text().strip():
+                            raise ValueError("La tasa media (λ) no puede estar vacía.")
                         tasa = float(tasa_var.text())
                         if tasa <= 0:
                             raise ValueError("La tasa media (λ) debe ser mayor que cero.")
-                        evento['tasa'] = tasa
+                        cambios['tasa'] = tasa
                     elif evento['freq_opcion'] == 2:  # Binomial
+                        if not n_var.text().strip():
+                            raise ValueError("El número de eventos (n) no puede estar vacío.")
+                        if not p_var.text().strip():
+                            raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
                         n = int(n_var.text())
                         p = float(p_var.text())
                         if n <= 0:
                             raise ValueError("El número de eventos (n) debe ser mayor que cero.")
                         if not 0 <= p <= 1:
                             raise ValueError("La probabilidad de éxito (p) debe estar entre 0 y 1.")
-                        evento['num_eventos'] = n
-                        evento['prob_exito'] = p
+                        cambios['num_eventos'] = n
+                        cambios['prob_exito'] = p
                     elif evento['freq_opcion'] == 3:  # Bernoulli
+                        if not p_var.text().strip():
+                            raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
                         p = float(p_var.text())
                         if not 0 <= p <= 1:
                             raise ValueError("La probabilidad de éxito (p) debe estar entre 0 y 1.")
-                        evento['prob_exito'] = p
+                        cambios['prob_exito'] = p
                     elif evento['freq_opcion'] == 4:  # Poisson-Gamma
+                        # Verificar campos vacíos
+                        if not pg_minimo_var.text().strip():
+                            raise ValueError("El valor mínimo de ocurrencia no puede estar vacío.")
+                        if not pg_mas_probable_var.text().strip():
+                            raise ValueError("El valor más probable de ocurrencia no puede estar vacío.")
+                        if not pg_maximo_var.text().strip():
+                            raise ValueError("El valor máximo de ocurrencia no puede estar vacío.")
+                        if not pg_confianza_var.text().strip():
+                            raise ValueError("La confianza asociada al rango no puede estar vacía.")
                         # Obtener los valores de min/mode/max para Poisson-Gamma
                         pg_minimo = float(pg_minimo_var.text())
                         pg_mas_probable = float(pg_mas_probable_var.text())
@@ -12406,23 +13472,33 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         pg_confianza = float(pg_confianza_var.text()) / 100  # Convertir de porcentaje a proporción
                         
                         # Validaciones
-                        if not (0 <= pg_minimo < pg_mas_probable < pg_maximo):
-                            raise ValueError("Debe cumplirse: 0 ≤ mínimo < más probable < máximo para Poisson-Gamma")
+                        if pg_minimo <= 0:
+                            raise ValueError("El valor mínimo para Poisson-Gamma debe ser mayor que cero.")
+                        if not (pg_minimo < pg_mas_probable < pg_maximo):
+                            raise ValueError("Debe cumplirse: mínimo < más probable < máximo para Poisson-Gamma")
                         if not (0 < pg_confianza < 1):
                             raise ValueError("La confianza debe estar entre 0 y 100%")
                         
                         # Calcular alpha y beta para Poisson-Gamma
                         alpha, beta = obtener_parametros_gamma_para_poisson(pg_minimo, pg_mas_probable, pg_maximo, pg_confianza)
                         
-                        # Guardar tanto los valores de entrada como los parámetros calculados
-                        evento['pg_minimo'] = pg_minimo
-                        evento['pg_mas_probable'] = pg_mas_probable
-                        evento['pg_maximo'] = pg_maximo
-                        evento['pg_confianza'] = pg_confianza * 100  # Guardar como porcentaje
-                        evento['poisson_gamma_alpha'] = alpha
-                        evento['poisson_gamma_beta'] = beta
+                        cambios['pg_minimo'] = pg_minimo
+                        cambios['pg_mas_probable'] = pg_mas_probable
+                        cambios['pg_maximo'] = pg_maximo
+                        cambios['pg_confianza'] = pg_confianza * 100  # Guardar como porcentaje
+                        cambios['pg_alpha'] = alpha
+                        cambios['pg_beta'] = beta
                         
                     elif evento['freq_opcion'] == 5:  # Beta
+                        # Verificar campos vacíos
+                        if not beta_minimo_var.text().strip():
+                            raise ValueError("La probabilidad mínima no puede estar vacía.")
+                        if not beta_mas_probable_var.text().strip():
+                            raise ValueError("La probabilidad más probable no puede estar vacía.")
+                        if not beta_maximo_var.text().strip():
+                            raise ValueError("La probabilidad máxima no puede estar vacía.")
+                        if not beta_confianza_var.text().strip():
+                            raise ValueError("La confianza asociada al rango no puede estar vacía.")
                         # Obtener los valores de min/mode/max para Beta
                         beta_minimo = float(beta_minimo_var.text()) / 100  # Convertir de porcentaje a proporción
                         beta_mas_probable = float(beta_mas_probable_var.text()) / 100
@@ -12438,104 +13514,186 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         # Calcular alpha y beta para la distribución Beta
                         alpha, beta = obtener_parametros_beta_frecuencia(beta_minimo, beta_mas_probable, beta_maximo, beta_confianza)
                         
-                        # Guardar tanto los valores de entrada como los parámetros calculados
-                        evento['beta_minimo'] = beta_minimo * 100  # Guardar como porcentaje
-                        evento['beta_mas_probable'] = beta_mas_probable * 100
-                        evento['beta_maximo'] = beta_maximo * 100
-                        evento['beta_confianza'] = beta_confianza * 100
-                        evento['beta_alpha'] = alpha
-                        evento['beta_beta'] = beta
+                        cambios['beta_minimo'] = beta_minimo * 100  # Guardar como porcentaje
+                        cambios['beta_mas_probable'] = beta_mas_probable * 100
+                        cambios['beta_maximo'] = beta_maximo * 100
+                        cambios['beta_confianza'] = beta_confianza * 100
+                        cambios['beta_alpha'] = alpha
+                        cambios['beta_beta'] = beta
 
-                    # Actualizar la distribución de frecuencia
-                    evento['dist_frecuencia'] = generar_distribucion_frecuencia(
+                    # Helper para leer de cambios con fallback a evento
+                    def _get(key, default=None):
+                        return cambios.get(key, evento.get(key, default))
+
+                    # Generar distribución de frecuencia con los valores validados
+                    cambios['dist_frecuencia'] = generar_distribucion_frecuencia(
                         evento['freq_opcion'],
-                        tasa=evento.get('tasa'),
-                        num_eventos_posibles=evento.get('num_eventos'),
-                        probabilidad_exito=evento.get('prob_exito'),
-                        poisson_gamma_params=(evento.get('poisson_gamma_alpha'), evento.get('poisson_gamma_beta')) if evento['freq_opcion'] == 4 else None,
-                        beta_params=(evento.get('beta_alpha'), evento.get('beta_beta')) if evento['freq_opcion'] == 5 else None
+                        tasa=_get('tasa'),
+                        num_eventos_posibles=_get('num_eventos'),
+                        probabilidad_exito=_get('prob_exito'),
+                        poisson_gamma_params=(_get('pg_alpha'), _get('pg_beta')) if evento['freq_opcion'] == 4 else None,
+                        beta_params=(_get('beta_alpha'), _get('beta_beta')) if evento['freq_opcion'] == 5 else None
                     )
 
-                    # Actualizar los parámetros de severidad solo si el método es Min/Mode/Max
+                    # Validar y preparar parámetros de severidad
                     is_direct_sev_method = (sev_input_method_combo.currentIndex() == 1)
                     if not is_direct_sev_method:
                         txt_min = (sev_min_var.text() or "").strip()
                         txt_max = (sev_max_var.text() or "").strip()
+                        if not txt_min:
+                            raise ValueError("El valor mínimo de severidad no puede estar vacío.")
+                        if not txt_max:
+                            raise ValueError("El valor máximo de severidad no puede estar vacío.")
                         sev_minimo = float(txt_min)
                         sev_maximo = float(txt_max)
                         if evento['sev_opcion'] != 5:  # Si no es Uniforme
                             txt_mode = (sev_mas_probable_var.text() or "").strip()
+                            if not txt_mode:
+                                raise ValueError("El valor más probable de severidad no puede estar vacío.")
                             sev_mas_probable = float(txt_mode)
                         else:
                             sev_mas_probable = None
 
-                        evento['sev_minimo'] = sev_minimo
-                        evento['sev_mas_probable'] = sev_mas_probable
-                        evento['sev_maximo'] = sev_maximo
+                        cambios['sev_minimo'] = sev_minimo
+                        cambios['sev_mas_probable'] = sev_mas_probable
+                        cambios['sev_maximo'] = sev_maximo
 
                     # Persistir método y parámetros directos de severidad si corresponde
                     if 'sev_opcion' in evento and evento['sev_opcion'] in (1, 2, 4) and sev_input_method_combo.currentIndex() == 1:
-                        evento['sev_input_method'] = 'direct'
+                        cambios['sev_input_method'] = 'direct'
                         params_direct = {}
                         if evento['sev_opcion'] == 1:
                             # Normal: mean/std
-                            mean = float(sev_norm_mean_var.text())
-                            std = float(sev_norm_std_var.text())
+                            if not sev_norm_mean_var.text().strip():
+                                raise ValueError("'mean' no puede estar vacío para Normal.")
+                            if not sev_norm_std_var.text().strip():
+                                raise ValueError("'std' no puede estar vacío para Normal.")
+                            try:
+                                mean = float(sev_norm_mean_var.text())
+                                std = float(sev_norm_std_var.text())
+                            except (ValueError, TypeError):
+                                raise ValueError("'mean' y 'std' deben ser numéricos para Normal.")
                             if std <= 0:
                                 raise ValueError("Desviación estándar (std) debe ser > 0 para Normal.")
                             params_direct = {'mean': mean, 'std': std}
                         elif evento['sev_opcion'] == 2:
                             # LogNormal: tres modos
                             mode = sev_ln_param_mode_combo.currentIndex()
-                            loc = float(sev_ln_loc_var.text() or 0)
+                            try:
+                                loc = float(sev_ln_loc_var.text() if sev_ln_loc_var.text() else '0')
+                            except (ValueError, TypeError):
+                                raise ValueError("loc debe ser numérico para LogNormal.")
                             if mode == 0:
-                                s = float(sev_ln_s_var.text())
-                                scale = float(sev_ln_scale_var.text())
+                                if not sev_ln_s_var.text().strip():
+                                    raise ValueError("'s' no puede estar vacío para LogNormal.")
+                                if not sev_ln_scale_var.text().strip():
+                                    raise ValueError("'scale' no puede estar vacío para LogNormal.")
+                                try:
+                                    s = float(sev_ln_s_var.text())
+                                    scale = float(sev_ln_scale_var.text())
+                                except (ValueError, TypeError):
+                                    raise ValueError("'s' y 'scale' deben ser numéricos para LogNormal.")
                                 if s <= 0:
                                     raise ValueError("Shape (s) debe ser > 0 para LogNormal.")
                                 if scale <= 0:
                                     raise ValueError("Scale debe ser > 0 para LogNormal.")
                                 params_direct = {'s': s, 'scale': scale, 'loc': loc}
                             elif mode == 1:
-                                mean = float(sev_ln_mean_var.text())
-                                std = float(sev_ln_std_var.text())
+                                if not sev_ln_mean_var.text().strip():
+                                    raise ValueError("'mean' no puede estar vacío para LogNormal.")
+                                if not sev_ln_std_var.text().strip():
+                                    raise ValueError("'std' no puede estar vacío para LogNormal.")
+                                try:
+                                    mean = float(sev_ln_mean_var.text())
+                                    std = float(sev_ln_std_var.text())
+                                except (ValueError, TypeError):
+                                    raise ValueError("'mean' y 'std' deben ser numéricos para LogNormal.")
                                 if mean <= 0:
                                     raise ValueError("mean debe ser > 0 para LogNormal.")
                                 if std <= 0:
                                     raise ValueError("std debe ser > 0 para LogNormal.")
                                 params_direct = {'mean': mean, 'std': std, 'loc': loc}
                             else:
-                                mu = float(sev_ln_mu_var.text())
-                                sigma = float(sev_ln_sigma_var.text())
+                                if not sev_ln_mu_var.text().strip():
+                                    raise ValueError("'mu' no puede estar vacío para LogNormal.")
+                                if not sev_ln_sigma_var.text().strip():
+                                    raise ValueError("'sigma' no puede estar vacío para LogNormal.")
+                                try:
+                                    mu = float(sev_ln_mu_var.text())
+                                    sigma = float(sev_ln_sigma_var.text())
+                                except (ValueError, TypeError):
+                                    raise ValueError("'mu' y 'sigma' deben ser numéricos para LogNormal.")
                                 if sigma <= 0:
                                     raise ValueError("sigma debe ser > 0 para LogNormal.")
                                 params_direct = {'mu': mu, 'sigma': sigma, 'loc': loc}
                         elif evento['sev_opcion'] == 4:
                             # GPD: c, scale, loc
-                            c = float(sev_gpd_c_var.text())
-                            scale = float(sev_gpd_scale_var.text())
-                            loc = float(sev_gpd_loc_var.text())
+                            if not sev_gpd_c_var.text().strip():
+                                raise ValueError("'c' (shape) no puede estar vacío para GPD.")
+                            if not sev_gpd_scale_var.text().strip():
+                                raise ValueError("'scale' no puede estar vacío para GPD.")
+                            if not sev_gpd_loc_var.text().strip():
+                                raise ValueError("'loc' no puede estar vacío para GPD.")
+                            try:
+                                c = float(sev_gpd_c_var.text())
+                                scale = float(sev_gpd_scale_var.text())
+                                loc = float(sev_gpd_loc_var.text())
+                            except (ValueError, TypeError):
+                                raise ValueError("Los parámetros de GPD deben ser numéricos.")
                             if scale <= 0:
                                 raise ValueError("Scale (beta) debe ser positivo para GPD.")
                             params_direct = {'c': c, 'scale': scale, 'loc': loc}
-                        evento['sev_params_direct'] = params_direct
+                        cambios['sev_params_direct'] = params_direct
                     else:
-                        evento['sev_input_method'] = 'min_mode_max'
-                        evento['sev_params_direct'] = {}
+                        cambios['sev_input_method'] = 'min_mode_max'
+                        cambios['sev_params_direct'] = {}
 
-                    # Actualizar la distribución de severidad con el método adecuado
-                    evento['dist_severidad'] = generar_distribucion_severidad(
+                    # Generar distribución de severidad con los valores validados
+                    cambios['dist_severidad'] = generar_distribucion_severidad(
                         evento['sev_opcion'],
-                        evento.get('sev_minimo'),
-                        evento.get('sev_mas_probable'),
-                        evento.get('sev_maximo'),
-                        input_method=evento.get('sev_input_method', 'min_mode_max'),
-                        params_direct=evento.get('sev_params_direct')
+                        _get('sev_minimo'),
+                        _get('sev_mas_probable'),
+                        _get('sev_maximo'),
+                        input_method=_get('sev_input_method', 'min_mode_max'),
+                        params_direct=_get('sev_params_direct')
                     )
 
-                    # Guardar los factores/controles editados
-                    evento['factores_ajuste'] = copy.deepcopy(factores_escenario)
+                    # Preparar factores/controles editados
+                    cambios['factores_ajuste'] = copy.deepcopy(factores_escenario)
 
+                    # Preparar configuración de escalamiento severidad-frecuencia
+                    if sev_freq_config_esc and isinstance(sev_freq_config_esc, dict):
+                        for key, value in sev_freq_config_esc.items():
+                            if key.startswith('sev_freq_'):
+                                cambios[key] = value
+
+                    # Validar límites superiores opcionales
+                    sev_lim_text = sev_limite_esc_var.text().strip()
+                    if sev_lim_text:
+                        try:
+                            val = float(sev_lim_text)
+                        except (ValueError, TypeError):
+                            raise ValueError("El límite superior de severidad debe ser un número válido.")
+                        if val <= 0:
+                            raise ValueError("El límite superior de severidad debe ser mayor que cero.")
+                        cambios['sev_limite_superior'] = val
+                    else:
+                        cambios['sev_limite_superior'] = None
+                    
+                    freq_lim_text = freq_limite_esc_var.text().strip()
+                    if freq_lim_text:
+                        try:
+                            val = int(float(freq_lim_text))
+                        except (ValueError, TypeError):
+                            raise ValueError("El máximo de ocurrencias por año debe ser un número válido.")
+                        if val <= 0:
+                            raise ValueError("El máximo de ocurrencias por año debe ser mayor que cero.")
+                        cambios['freq_limite_superior'] = val
+                    else:
+                        cambios['freq_limite_superior'] = None
+
+                    # Todas las validaciones pasaron: aplicar cambios al evento
+                    evento.update(cambios)
                     evento_dialog.accept()
                 except ValueError as ve:
                     QtWidgets.QMessageBox.critical(evento_dialog, "Error", str(ve))
@@ -12707,17 +13865,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 for vinculo in evento.get('vinculos', []):
                     padre_id = vinculo['id_padre']
                     tipo = vinculo['tipo']
+                    prob = vinculo.get('probabilidad', 100)
+                    fsev = vinculo.get('factor_severidad', 1.0)
+                    umbral = vinculo.get('umbral_severidad', 0)
                     # Si el evento padre fue duplicado, usamos el nuevo ID
                     if padre_id in id_original_a_nuevo:
                         vinculos_actualizados.append({
                             'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo
+                            'tipo': tipo,
+                            'probabilidad': prob,
+                            'factor_severidad': fsev,
+                            'umbral_severidad': umbral
                         })
                     else:
                         # Si no, mantenemos el ID original
                         vinculos_actualizados.append({
                             'id_padre': padre_id,
-                            'tipo': tipo
+                            'tipo': tipo,
+                            'probabilidad': prob,
+                            'factor_severidad': fsev,
+                            'umbral_severidad': umbral
                         })
                 evento['vinculos'] = vinculos_actualizados
 
@@ -12788,9 +13955,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
     def ejecutar_simulacion_escenario(self):
         """Ejecuta la simulación con el escenario seleccionado.
         
-        NOTA: NO sobrescribimos self.eventos_riesgo porque ejecutar_simulacion()
-        ya detecta current_scenario y usa sus eventos automáticamente (líneas 9816-9819).
-        Esto evita perder los eventos originales de la pestaña Simulación.
+        Sustituye temporalmente self.eventos_riesgo con los eventos del escenario,
+        ejecuta la simulación y luego restaura los eventos originales.
         """
         if self.current_scenario is None:
             QtWidgets.QMessageBox.warning(self, "Advertencia", "Seleccione un escenario para simular.")
@@ -12799,9 +13965,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Actualizar el número de simulaciones con el valor ingresado en la pestaña "Escenarios"
         self.num_simulaciones_var.setText(self.num_simulaciones_var_escenarios.text())
         
-        # Llamar al método existente de ejecutar_simulacion
-        # La selección de eventos del escenario se hace DENTRO de ejecutar_simulacion()
-        self.ejecutar_simulacion()
+        # Sustituir temporalmente los eventos con los del escenario
+        eventos_originales = self.eventos_riesgo
+        try:
+            self.eventos_riesgo = self.current_scenario.eventos_riesgo
+            self.ejecutar_simulacion()
+        finally:
+            # Restaurar siempre los eventos originales de la pestaña Simulación
+            self.eventos_riesgo = eventos_originales
 
     def generar_figuras(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos_riesgo):
         """Genera las figuras de los gráficos para el reporte PDF."""
@@ -13979,22 +15150,25 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     tooltip_points = [p25, p50, p75, p90, p95]
                     
                     # Obtener la densidad de KDE para cada valor (usando la curva que ya existe)
-                    x_vals = np.linspace(min(perdidas_evento), max(perdidas_evento), 1000)
-                    kde = stats.gaussian_kde(perdidas_evento, bw_method='silverman')
-                    y_vals = kde(x_vals)
-                    
-                    # Interpolar para obtener las alturas KDE en los puntos de interés
-                    y_points = np.interp(tooltip_points, x_vals, y_vals)
-                    
-                    # Crear los tooltips para los percentiles
-                    for i, (x, y, p) in enumerate(zip(tooltip_points, y_points, [25, 50, 75, 90, 95])):
-                        label = f"{nombre_evento}\nP{p}: {currency_format(x)}"
-                        canvas6.add_tooltip_data(ax6, [x], [y], labels=[label])
-                    
-                    # Tooltip especial para la media
-                    y_mean = np.interp(mean_val, x_vals, y_vals)
-                    label_mean = f"{nombre_evento}\nMedia: {currency_format(mean_val)}"
-                    canvas6.add_tooltip_data(ax6, [mean_val], [y_mean], labels=[label_mean])
+                    try:
+                        x_vals = np.linspace(min(perdidas_evento), max(perdidas_evento), 1000)
+                        kde = stats.gaussian_kde(perdidas_evento, bw_method='silverman')
+                        y_vals = kde(x_vals)
+                        
+                        # Interpolar para obtener las alturas KDE en los puntos de interés
+                        y_points = np.interp(tooltip_points, x_vals, y_vals)
+                        
+                        # Crear los tooltips para los percentiles
+                        for i, (x, y, p) in enumerate(zip(tooltip_points, y_points, [25, 50, 75, 90, 95])):
+                            label = f"{nombre_evento}\nP{p}: {currency_format(x)}"
+                            canvas6.add_tooltip_data(ax6, [x], [y], labels=[label])
+                        
+                        # Tooltip especial para la media
+                        y_mean = np.interp(mean_val, x_vals, y_vals)
+                        label_mean = f"{nombre_evento}\nMedia: {currency_format(mean_val)}"
+                        canvas6.add_tooltip_data(ax6, [mean_val], [y_mean], labels=[label_mean])
+                    except Exception:
+                        pass
             tab9 = QtWidgets.QWidget()
             layout6 = QtWidgets.QVBoxLayout(tab9)
             layout6.addWidget(canvas6)
@@ -14395,10 +15569,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                       labels=[tooltip_text])
         
         # Añadir tooltips para los percentiles clave
+        try:
+            kde_cola = gaussian_kde(perdidas_cola)
+        except Exception:
+            kde_cola = None
         for p, color, label in zip(percentiles_cola, colores_percentiles, labels_percentiles):
             # Estimar la altura del punto para el tooltip
-            kde = gaussian_kde(perdidas_cola)
-            altura_kde = kde(p)[0] * len(perdidas_cola) * (bin_edges[-1] - bin_edges[0]) / n_bins
+            if kde_cola is not None:
+                altura_kde = kde_cola(p)[0] * len(perdidas_cola) * (bin_edges[-1] - bin_edges[0]) / n_bins
+            else:
+                altura_kde = 0
             
             # Añadir tooltip para este percentil
             percentile_text = f"{label}: {currency_format(p)}\n"
@@ -15452,8 +16632,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                                             "JSON Files (*.json);;All Files (*)", options=options)
         if filepath:
             try:
+                try:
+                    num_sim_guardar = int(self.num_simulaciones_var.text())
+                except (ValueError, TypeError):
+                    num_sim_guardar = 10000
                 configuracion = {
-                    'num_simulaciones': int(self.num_simulaciones_var.text()),
+                    'num_simulaciones': num_sim_guardar,
                     'eventos_riesgo': [],
                     'scenarios': [],
                     'current_scenario_name': getattr(getattr(self, 'current_scenario', None), 'nombre', None)
@@ -15479,6 +16663,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         del evento_data['_factor_severidad_estatico']
                     if '_seguros_aplicables' in evento_data:
                         del evento_data['_seguros_aplicables']
+                    if '_factor_severidad_vinculos' in evento_data:
+                        del evento_data['_factor_severidad_vinculos']
                     
                     # DEBUG: Verificar que factores_ajuste se está guardando
                     if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
@@ -15513,6 +16699,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             del evento_data['_factor_severidad_estatico']
                         if '_seguros_aplicables' in evento_data:
                             del evento_data['_seguros_aplicables']
+                        if '_factor_severidad_vinculos' in evento_data:
+                            del evento_data['_factor_severidad_vinculos']
                         
                         escenario_data['eventos_riesgo'].append(evento_data)
                     configuracion['scenarios'].append(escenario_data)
@@ -15623,7 +16811,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         vinculos = []
                         tipo = evento_data.get('tipo_dependencia', 'AND')
                         for padre_id in evento_data['eventos_padres']:
-                            vinculos.append({'id_padre': padre_id, 'tipo': tipo})
+                            vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
                         evento_data['vinculos'] = vinculos
 
                     pg_params = None
@@ -15693,7 +16881,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         for vinculo in evento_data['vinculos']:
                             id_padre_antiguo = vinculo['id_padre']
                             id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
-                            vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo']})
+                            prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                            fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                            umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                            vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'], 'probabilidad': prob, 'factor_severidad': fsev, 'umbral_severidad': umbral})
                         evento_data['vinculos'] = vinculos_actualizados
 
                 # Cargar escenarios
@@ -15724,7 +16915,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             nombre_escenario = escenario_data['nombre']
                             error_traducido = traducir_error(e)
                             eventos_con_error.append(f"• {nombre_evento} (Escenario: {nombre_escenario}): {error_traducido}")
-                            dist_sev_esc = None # Marcar como None para omitir después
+                            continue  # Omitir evento con distribución de severidad inválida
 
                         freq_opcion = evento_data['freq_opcion']
                         tasa = evento_data.get('tasa', None)
@@ -15740,7 +16931,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             vinculos = []
                             tipo = evento_data.get('tipo_dependencia', 'AND')
                             for padre_id in evento_data['eventos_padres']:
-                                vinculos.append({'id_padre': padre_id, 'tipo': tipo})
+                                vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
                             evento_data['vinculos'] = vinculos
 
                         # Reconstruir distribución de frecuencia para eventos del escenario
@@ -15817,7 +17008,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                     id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
                                 else:
                                     id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)
-                                vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo']})
+                                prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                                fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                                umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                                vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'], 'probabilidad': prob, 'factor_severidad': fsev, 'umbral_severidad': umbral})
                             evento_data['vinculos'] = vinculos_actualizados
 
                 # === COMMIT DE TRANSACCIÓN: Todo procesado exitosamente, ahora actualizar la UI ===
@@ -16383,6 +17577,29 @@ class ResultReport:
                 nombre_evento_display = nombre_evento
             
             elements.append(Paragraph(f"<b>{i+1}. {nombre_evento_display}</b>", event_title_style))
+            
+            # Info de vínculos si existen
+            vinculos_evt = evento.get('vinculos', [])
+            if vinculos_evt:
+                deps = []
+                for v in vinculos_evt:
+                    nombre_padre = "?"
+                    for e in self.eventos_riesgo:
+                        if e['id'] == v.get('id_padre'):
+                            nombre_padre = e['nombre'][:25]
+                            break
+                    desc = f"{v.get('tipo', '?')} → {nombre_padre} ({v.get('probabilidad', 100)}%"
+                    fsev = v.get('factor_severidad', 1.0)
+                    umbral = v.get('umbral_severidad', 0)
+                    if fsev != 1.0:
+                        desc += f", sev:{fsev:.2f}x"
+                    if umbral > 0:
+                        desc += f", umbral:${umbral:,}"
+                    desc += ")"
+                    deps.append(desc)
+                dep_text = " | ".join(deps)
+                elements.append(Paragraph(f"<i>Vínculos: {dep_text}</i>", styles['Normal']))
+                elements.append(Spacer(1, 3))
             
             # Tabla de estadísticas del evento
             event_data = [

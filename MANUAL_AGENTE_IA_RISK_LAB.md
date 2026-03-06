@@ -1,8 +1,42 @@
 # Manual para Agentes de IA - Risk Lab
 
+<!--
+╔══════════════════════════════════════════════════════════════════╗
+║  MAPA DEL DOCUMENTO — Manual del Agente IA                      ║
+║                                                                  ║
+║  ROL: Manual de referencia para agentes de IA. Explica QUÉ      ║
+║  configurar y CÓMO interpretar los requerimientos del usuario.  ║
+║                                                                  ║
+║  SECCIONES (en orden de lectura):                               ║
+║  1. Propósito y cross-references                                ║
+║  2. Workflow recomendado (resumen)                              ║
+║  3. Guía de selección: Distribuciones Frecuencia y Severidad    ║
+║  4. ⭐ Plantilla JSON Completa (referencia rápida)              ║
+║  5. Modo Avanzado: Parámetros Directos (Fase 2+)               ║
+║     ⚠️ Contiene reglas CRÍTICAS de pg_alpha/pg_beta y Beta     ║
+║  6. Preguntas Guía para el Agente                               ║
+║  7. Modelo de Dependencias (Vínculos)                           ║
+║  8. Factores de Ajuste (estático, estocástico, seguro)          ║
+║  9. Escalamiento de Severidad por Frecuencia                    ║
+║  10. Rangos, Validaciones, Conversión lenguaje natural          ║
+║  11. Escenarios, Errores comunes, Checklist final               ║
+║                                                                  ║
+║  DOCUMENTOS COMPLEMENTARIOS:                                    ║
+║  • Asistente GPT Risk Lab — System prompt con metodología       ║
+║    conversacional, flujo de trabajo y guía anti-duplicación     ║
+║  • ESPECIFICACION_JSON_RISK_LAB — Estructura JSON exacta,      ║
+║    campos, tipos, validaciones y plantillas por distribución    ║
+║  • MANUAL_INTERPRETACION_RESULTADOS — Cómo leer resultados     ║
+╚══════════════════════════════════════════════════════════════════╝
+-->
+
 ## Propósito de este Manual
 
 Este manual está diseñado para que un agente de IA pueda asistir a usuarios en la preparación de análisis de riesgo cuantitativo utilizando simulación Monte Carlo. El objetivo es generar un archivo JSON válido que pueda importarse directamente en Risk Lab.
+
+> **📌 IMPORTANTE**: Este manual explica **QUÉ configurar** y **CÓMO interpretar** los requerimientos del usuario. Para la **estructura JSON exacta** (campos obligatorios, tipos de datos, reglas de validación y plantillas), consultar siempre **`ESPECIFICACION_JSON_RISK_LAB.md`**. Ambos archivos son complementarios y necesarios para generar un JSON válido.
+>
+> Para **interpretar los resultados** de la simulación una vez ejecutada en Risk Lab, consultar **`MANUAL_INTERPRETACION_RESULTADOS_RISK_LAB.md`**.
 
 ---
 
@@ -26,6 +60,8 @@ Preguntar al usuario:
   - ¿Cuál sería el impacto económico? (severidad)
   - ¿Existe relación con otros riesgos?
   - ¿Hay controles o factores que modifiquen este riesgo?
+
+> **Nota sobre `activo`**: Cada evento y cada factor tiene un campo `activo` (boolean). Usar `false` para desactivar un evento o factor sin eliminarlo — útil para comparar escenarios "con control" vs "sin control", o para excluir temporalmente un evento. Los eventos inactivos no se simulan; los vínculos que apuntan a eventos inactivos se ignoran automáticamente.
 
 ---
 
@@ -61,12 +97,14 @@ Preguntar al usuario:
 **Poisson-Gamma (freq_opcion: 4)**
 - Usuario dice: "Entre 2 y 8 incidentes, probablemente unos 4"
 - Usuario expresa incertidumbre sobre la tasa
-- **Parámetros**: `pg_minimo`, `pg_mas_probable`, `pg_maximo`, `pg_confianza`
+- **Parámetros obligatorios**: `pg_alpha` (> 1) y `pg_beta` (> 0) — **SIEMPRE requeridos, nunca null**. Calcularlos con la fórmula PERT si el usuario da min/mode/max.
+- **Parámetros opcionales** (para documentación): `pg_minimo`, `pg_mas_probable`, `pg_maximo`, `pg_confianza`
 
 **Beta (freq_opcion: 5)**
 - Usuario dice: "Probabilidad entre 10% y 40%, probablemente 20%"
 - Para eventos tipo Bernoulli con incertidumbre en la probabilidad
-- **Parámetros**: `beta_minimo`, `beta_mas_probable`, `beta_maximo` (en %)
+- **Parámetros**: `beta_minimo`, `beta_mas_probable`, `beta_maximo` (en %), `beta_confianza`
+- **⚠️ OBLIGATORIO**: Además se deben incluir `beta_alpha` y `beta_beta` calculados (> 0). Sin ellos, la importación falla. Ver el snippet de cálculo en `ESPECIFICACION_JSON_RISK_LAB.md` sección Beta Frecuencia.
 
 ---
 
@@ -79,6 +117,8 @@ Preguntar al usuario:
 | Estimación por expertos (min/probable/max) | **PERT** | 3 |
 | Eventos catastróficos con cola muy pesada | **Pareto/GPD** | 4 |
 | Cualquier valor igualmente probable en un rango | **Uniforme** | 5 |
+
+> **🚨 POLÍTICA OBLIGATORIA PARA IA**: Para `sev_opcion = 2` (LogNormal) y `sev_opcion = 4` (Pareto/GPD), el agente **DEBE** usar `sev_input_method: "direct"` con parámetros directos. No usar `min_mode_max` para estas distribuciones — puede causar errores de parametrización en la importación. Ver detalles en `ESPECIFICACION_JSON_RISK_LAB.md`.
 
 #### Cuándo usar cada una:
 
@@ -111,7 +151,73 @@ Preguntar al usuario:
 
 ---
 
+## Plantilla JSON Completa (Referencia Rápida)
+
+> ⚠️ **Esta plantilla es la referencia principal** para la estructura de un evento. Copiar y completar con los valores del usuario. Para un modelo básico PERT+Poisson, solo cambiar `id`, `nombre`, `sev_minimo/mas_probable/maximo` y `tasa`. Para distribuciones avanzadas, ver la sección "Modo Avanzado: Parámetros Directos de Distribuciones" más adelante.
+
+```json
+{
+    "num_simulaciones": 10000,
+    "eventos_riesgo": [
+        {
+            "id": "GENERAR-UUID-UNICO",
+            "nombre": "Nombre descriptivo del evento",
+            "activo": true,
+            
+            "sev_opcion": 3,
+            "sev_input_method": "min_mode_max",
+            "sev_minimo": 10000,
+            "sev_mas_probable": 50000,
+            "sev_maximo": 200000,
+            "sev_params_direct": {},
+            "sev_limite_superior": null,
+            
+            "freq_opcion": 1,
+            "freq_limite_superior": null,
+            "tasa": 2.0,
+            "num_eventos": null,
+            "prob_exito": null,
+            "pg_minimo": null,
+            "pg_mas_probable": null,
+            "pg_maximo": null,
+            "pg_confianza": null,
+            "pg_alpha": null,
+            "pg_beta": null,
+            "beta_minimo": null,
+            "beta_mas_probable": null,
+            "beta_maximo": null,
+            "beta_confianza": null,
+            "beta_alpha": null,
+            "beta_beta": null,
+            
+            "sev_freq_activado": false,
+            "sev_freq_modelo": "reincidencia",
+            "sev_freq_tipo_escalamiento": "lineal",
+            "sev_freq_paso": 0.5,
+            "sev_freq_base": 1.5,
+            "sev_freq_factor_max": 5.0,
+            "sev_freq_tabla": [],
+            "sev_freq_alpha": 0.5,
+            "sev_freq_solo_aumento": true,
+            "sev_freq_sistemico_factor_max": 3.0,
+            
+            "vinculos": [],
+            "factores_ajuste": []
+        }
+    ],
+    "scenarios": [],
+    "current_scenario_name": null
+}
+```
+
+> **Nota:** en este ejemplo PERT+Poisson (`freq_opcion: 1`), los campos `pg_alpha/pg_beta` están en `null` porque Poisson no los usa. **Para `freq_opcion=4` (Poisson-Gamma), `pg_alpha` y `pg_beta` son OBLIGATORIOS y nunca `null`.** Para `freq_opcion=5` (Beta), `beta_alpha`, `beta_beta` y `beta_minimo/mas_probable/maximo/confianza` son todos obligatorios y nunca `null`.
+
+---
+
 ## Modo Avanzado: Parámetros Directos de Distribuciones
+
+> 💡 **¿Modelo básico PERT+Poisson?** Esta sección es para Fase 2+ (distribuciones avanzadas). Para un modelo básico, usar la Plantilla JSON de arriba y saltar directamente a "Preguntas Guía para el Agente".
+> ⚠️ **Excepción:** si se usa `freq_opcion=4` (Poisson-Gamma) o `freq_opcion=5` (Beta), **leer obligatoriamente** las subsecciones "Poisson-Gamma" y "Beta Frecuencia" de esta sección para las reglas de `pg_alpha`/`pg_beta` y `beta_alpha`/`beta_beta`.
 
 Risk Lab permite ingresar parámetros estadísticos directos en lugar de usar min/mode/max. Esto es útil cuando el usuario tiene datos históricos o conoce los parámetros exactos de la distribución.
 
@@ -221,6 +327,34 @@ Si conoces μ y σ:
   std = mean × √(exp(σ²) - 1)
 ```
 
+**⭐ Guía práctica: Convertir min/mode/max del usuario a parámetros directos LogNormal**
+
+Cuando el usuario da estimaciones tipo "entre $50K y $500K, más probable $100K", seguir estos pasos:
+
+```
+Paso 1: Estimar media y std con fórmula PERT
+  mean_aprox = (min + 4 × mode + max) / 6
+  std_aprox  = (max - min) / 6
+
+Paso 2: Convertir a parámetros de ln(X)
+  σ² = ln(1 + (std_aprox / mean_aprox)²)
+  μ  = ln(mean_aprox) - σ²/2
+
+Paso 3: Usar Opción B (mu/sigma) o convertir a Opción C (s/scale)
+  s = √σ²
+  scale = exp(μ)
+```
+
+**Ejemplo**: Usuario dice "mínimo $20K, más probable $50K, máximo $200K"
+```
+  mean ≈ (20000 + 4×50000 + 200000) / 6 ≈ 70000
+  std  ≈ (200000 - 20000) / 6 ≈ 30000
+  σ²   = ln(1 + (30000/70000)²) = ln(1.184) ≈ 0.169
+  μ    = ln(70000) - 0.169/2 ≈ 11.07
+  → Usar: {"mu": 11.07, "sigma": 0.41, "loc": 0}
+  → O equivalente: {"s": 0.41, "scale": 64500, "loc": 0}
+```
+
 ---
 
 #### Pareto/GPD (sev_opcion: 4)
@@ -254,14 +388,63 @@ Si conoces μ y σ:
 **Ejemplo práctico:**
 - `c=0.3, scale=200000, loc=100000` → Pérdidas desde $100K, típicamente $200K-$500K, posibles extremos de varios millones
 
+**⭐ Guía práctica: Estimar parámetros GPD desde descripción del usuario**
+
+| Pregunta al usuario | Parámetro |
+|---------------------|-----------|
+| "¿Cuál es la pérdida mínima si ocurre?" | `loc` = ese valor |
+| "¿Cuál es la pérdida típica sobre el mínimo?" | `scale` ≈ (pérdida típica - loc) |
+| "¿Qué tan extremos pueden ser los eventos?" | `c` según tabla abajo |
+
+**Estimación de `c` (shape):**
+
+| Descripción del usuario | `c` sugerido |
+|-------------------------|--------------|
+| "Pérdidas acotadas, no pueden superar X" | -0.2 a -0.1 |
+| "Decaimiento rápido, extremos muy raros" | 0.0 a 0.1 |
+| "Posibles extremos significativos" | 0.1 a 0.3 |
+| "Cola pesada, ciberseguridad/fraude" | 0.3 a 0.5 |
+| "Catastrófico, sin límite práctico" | 0.5 a 1.0 |
+
+**Ejemplo**: Usuario dice "pérdida mínima $100K, típicamente $200K-$400K, pero podría llegar a varios millones"
+```
+  loc = 100000 (umbral mínimo)
+  scale = 200000 (típico sobre el mínimo ≈ $300K - $100K)
+  c = 0.3 (cola pesada, posibles extremos altos)
+  → Usar: {"c": 0.3, "scale": 200000, "loc": 100000}
+```
+
 ---
 
 ### FRECUENCIA - Parámetros Directos
 
 #### Poisson-Gamma (freq_opcion: 4)
 
-En lugar de usar min/mode/max, se pueden especificar α y β directamente:
+> ⚠️ **REGLA CRÍTICA**: `pg_alpha` y `pg_beta` son **SIEMPRE OBLIGATORIOS** para `freq_opcion=4`. **Nunca dejarlos en `null`** — si están null, la importación falla con CRASH TOTAL. El camino min/mode/max como fallback interno es frágil (usa optimización scipy que puede fallar silenciosamente). Siempre calcular y proveer `pg_alpha` y `pg_beta` explícitamente.
 
+**Con min/mode/max del usuario (calcular alpha/beta con fórmula PERT)**:
+```json
+{
+    "freq_opcion": 4,
+    "pg_minimo": 1,
+    "pg_mas_probable": 3,
+    "pg_maximo": 8,
+    "pg_confianza": 90,
+    "pg_alpha": 9.01,
+    "pg_beta": 2.57
+}
+```
+
+**Fórmula para calcular `pg_alpha` y `pg_beta`:**
+```
+mean = (mínimo + 4 × más_probable + máximo) / 6
+var  = ((máximo - mínimo) / 6)²
+pg_alpha = mean² / var      (si resulta ≤ 1, usar 1.5 como mínimo)
+pg_beta  = mean / var
+```
+Los campos min/mode/max/confianza son opcionales (para documentación/UI). Lo que importa es que `pg_alpha` y `pg_beta` estén siempre presentes con valores numéricos válidos.
+
+**Con parámetros directos α y β (sin min/mode/max)**:
 ```json
 {
     "freq_opcion": 4,
@@ -292,17 +475,20 @@ Varianza = α / β²
 
 #### Beta Frecuencia (freq_opcion: 5)
 
+> ⚠️ **REGLA CRÍTICA**: `beta_alpha` y `beta_beta` son **SIEMPRE OBLIGATORIOS** (ambos > 0). Además, `beta_minimo`, `beta_mas_probable`, `beta_maximo` y `beta_confianza` **NO pueden ser `null`** cuando `freq_opcion=5` — deben ser numéricos. Sin estos campos la importación falla con CRASH TOTAL.
+
 ```json
 {
     "freq_opcion": 5,
-    "beta_minimo": null,
-    "beta_mas_probable": null,
-    "beta_maximo": null,
-    "beta_confianza": null,
+    "beta_minimo": 5,
+    "beta_mas_probable": 15,
+    "beta_maximo": 40,
+    "beta_confianza": 90,
     "beta_alpha": 2.0,
     "beta_beta": 8.0
 }
 ```
+**Nota:** los valores de `beta_minimo/beta_mas_probable/beta_maximo` son **PORCENTAJES (0-100)**, no decimales (0-1).
 
 | Parámetro | Descripción | Restricción |
 |-----------|-------------|-------------|
@@ -363,8 +549,10 @@ Varianza = αβ / [(α + β)²(α + β + 1)]
         "sigma": 1.2,
         "loc": 0
     },
+    "sev_limite_superior": null,
     
     "freq_opcion": 4,
+    "freq_limite_superior": null,
     "tasa": null,
     "num_eventos": null,
     "prob_exito": null,
@@ -440,23 +628,73 @@ Este evento modela:
 ### Cuándo crear vínculos:
 
 | Situación | Tipo de Vínculo |
-|-----------|-----------------|
+|-----------|------------------|
 | "B solo puede ocurrir si A ocurrió" | B depende de A (AND) |
 | "B puede ocurrir si A o C ocurrieron" | B depende de A y C (OR) |
+| "B no puede ocurrir si A ocurrió" | B excluido por A (EXCLUYE) |
 | "Son eventos en cadena" | Crear cadena de dependencias |
+
+### Campos de cada vínculo:
+
+| Campo | Tipo | Default | Descripción |
+|-------|------|---------|-------------|
+| `id_padre` | string | (requerido) | UUID del evento padre |
+| `tipo` | string | (requerido) | `"AND"`, `"OR"` o `"EXCLUYE"` |
+| `probabilidad` | integer | 100 | Probabilidad de activación del vínculo (1-100%) |
+| `factor_severidad` | float | 1.0 | Multiplicador de severidad condicional (0.10-5.00) |
+| `umbral_severidad` | integer | 0 | Pérdida neta mínima del padre para activar ($, ≥0) |
+
+### Cuándo usar cada campo avanzado:
+
+**`probabilidad` (<100)**
+- "Si ocurre phishing, hay un 60% de que se comprometan credenciales"
+- Modela la probabilidad condicional de que un evento derive en otro
+
+**`factor_severidad` (≠1.0)**
+- "Si ocurre un terremoto, los daños por incendio son 2x peores" → factor = 2.0
+- "Si hay backup, la pérdida de datos es menor" → factor = 0.5
+- **AND**: los factores de todos los vínculos AND activos se **multiplican**
+- **OR**: se toma el **máximo** de los factores OR activos
+- **EXCLUYE**: no aporta factor de severidad (siempre 1.0)
+
+**`umbral_severidad` (>0)**
+- "La brecha de datos solo se activa si el ataque causó más de $50K" → umbral = 50000
+- Compara contra la pérdida **neta** del padre (post-controles y seguros)
+- $0 = sin umbral, basta con que el padre haya ocurrido
+
+### Ejemplo JSON de vínculos avanzados:
+
+```json
+"vinculos": [
+    {
+        "id_padre": "uuid-evento-phishing",
+        "tipo": "AND",
+        "probabilidad": 60,
+        "factor_severidad": 1.5,
+        "umbral_severidad": 10000
+    },
+    {
+        "id_padre": "uuid-evento-vulnerabilidad",
+        "tipo": "OR",
+        "probabilidad": 80,
+        "factor_severidad": 2.0,
+        "umbral_severidad": 0
+    }
+]
+```
 
 ### Ejemplos de cadenas de riesgo:
 
 **Ciberataque en cadena:**
 1. Phishing exitoso (evento raíz)
-2. Compromiso de credenciales (depende AND de 1)
-3. Movimiento lateral (depende AND de 2)
-4. Exfiltración de datos (depende AND de 3)
-5. Ransomware (depende AND de 2 o 3)
+2. Compromiso de credenciales (depende AND de 1, prob: 60%)
+3. Movimiento lateral (depende AND de 2, factor_sev: 1.3)
+4. Exfiltración de datos (depende AND de 3, umbral: $50K)
+5. Ransomware (depende AND de 2 o 3, factor_sev: 2.0)
 
 **Desastre natural:**
 1. Terremoto (evento raíz)
-2. Daño a infraestructura (depende AND de 1)
+2. Daño a infraestructura (depende AND de 1, factor_sev: 1.5)
 3. Interrupción de operaciones (depende AND de 2)
 4. Pérdida de datos (depende OR de 1 y otro evento)
 
@@ -464,6 +702,8 @@ Este evento modela:
 - **NO crear ciclos** (A→B→C→A es inválido)
 - Los eventos raíz no tienen vínculos
 - Un hijo puede tener múltiples padres
+- `factor_severidad` para EXCLUYE siempre debe ser 1.0 (se ignora en simulación)
+- Campos `probabilidad`, `factor_severidad` y `umbral_severidad` son opcionales (backward compatible)
 
 ---
 
@@ -478,6 +718,8 @@ Este evento modela:
 | Control técnico automatizado | **Estático** o **Estocástico** |
 | Control humano (puede fallar) | **Estocástico** |
 | Seguro o cobertura fija | **Estático** |
+
+> **⚠️ CAMPO CRÍTICO**: El campo `nombre` es **obligatorio** en todos los factores y es el **único campo que Risk Lab NO auto-genera**. Si falta, la UI mostrará celdas vacías. Siempre incluir un nombre descriptivo.
 
 ### Modelo Estático:
 ```
@@ -539,9 +781,9 @@ Preguntar:
 | `activo` | boolean | Si el factor está habilitado |
 | `tipo_modelo` | string | **"estatico"** |
 | `afecta_frecuencia` | boolean | Si modifica la frecuencia |
-| `impacto_porcentual` | integer | % impacto en frecuencia (-99 a +200) |
+| `impacto_porcentual` | integer | % impacto en frecuencia (mínimo -99, sin límite superior) |
 | `afecta_severidad` | boolean | Si modifica la severidad |
-| `impacto_severidad_pct` | integer | % impacto en severidad (-99 a +200) |
+| `impacto_severidad_pct` | integer | % impacto en severidad (mínimo -99, sin límite superior) |
 
 **⚠️ CONVENCIÓN DE SIGNOS - ESTÁTICO:**
 - **Valor NEGATIVO = REDUCE** (ej: -30 reduce 30%)
@@ -584,6 +826,8 @@ Preguntar:
 - **Valor NEGATIVO = AUMENTA** (ej: -20 aumenta 20%)
 - Fórmula: `factor = 1 - (reduccion/100)`
 
+**⚠️ COMPORTAMIENTO**: En cada iteración, el sistema genera **un único** número aleatorio por factor. Si "funciona", aplica `reduccion_efectiva` (frecuencia) y `reduccion_severidad_efectiva` (severidad) simultáneamente. Si "falla", aplica `reduccion_fallo` y `reduccion_severidad_fallo`. Es decir, **el mismo sorteo** determina ambos efectos.
+
 ---
 
 ### Diferencia Crítica de Convenciones
@@ -599,9 +843,9 @@ Preguntar:
 
 ---
 
----
-
 ## Controles de Tipo Seguro/Transferencia de Riesgo
+
+> ⚠️ **REGLA CRÍTICA**: Los seguros se modelan **EXCLUSIVAMENTE** como `factores_ajuste` con `tipo_severidad: "seguro"` dentro de los eventos que cubren. **NUNCA crear un evento de riesgo independiente para representar un seguro** — un evento con severidad 0 o `sev_params_direct: {"mean": 0, "std": 0}` es matemáticamente inválido y causa crash.
 
 Risk Lab permite modelar pólizas de seguro como un tipo especial de control que afecta la severidad de las pérdidas. A diferencia de los controles estáticos/estocásticos que reducen porcentualmente, los seguros modelan la mecánica real de una póliza: deducible, cobertura porcentual y límites.
 
@@ -625,13 +869,19 @@ Risk Lab permite modelar pólizas de seguro como un tipo especial de control que
 
 ```
 1. Generar pérdidas individuales (severidad bruta)
-2. Aplicar factor de severidad de controles (mitigación)
-3. Aplicar seguros POR OCURRENCIA a cada pérdida mitigada
-4. Agregar pérdidas por simulación (suma anual)
-5. Aplicar seguros AGREGADOS al total anual
+2. Aplicar escalamiento de severidad por frecuencia (si sev_freq_activado = true)
+3. Aplicar factor de severidad de vínculos (si factor_severidad ≠ 1.0)
+4. Aplicar factor de severidad de controles (mitigación)
+5. Aplicar seguros POR OCURRENCIA a cada pérdida mitigada
+6. Agregar pérdidas por simulación (suma anual)
+7. Aplicar seguros AGREGADOS al total anual
 ```
 
-**Importante:** Los controles de mitigación (estáticos/estocásticos) reducen la pérdida ANTES de que se aplique el seguro. Esto significa que el seguro cubre la pérdida residual después de la mitigación.
+**Importante:**
+- El escalamiento de severidad por frecuencia se aplica PRIMERO, antes de vínculos, controles y seguros
+- El factor de severidad de vínculos se aplica después del escalamiento, antes de controles y seguros
+- Los controles de mitigación (estáticos/estocásticos) reducen la pérdida después del factor de vínculos
+- Los seguros cubren la pérdida residual después de la mitigación de controles
 
 ---
 
@@ -652,7 +902,7 @@ Risk Lab permite modelar pólizas de seguro como un tipo especial de control que
     
     "afecta_frecuencia": false,
     "impacto_porcentual": 0,
-    "afecta_severidad": false,
+    "afecta_severidad": true,
     "impacto_severidad_pct": 0
 }
 ```
@@ -668,6 +918,12 @@ Risk Lab permite modelar pólizas de seguro como un tipo especial de control que
 | `seguro_cobertura_pct` | integer | % de cobertura sobre el exceso (1-100) |
 | `seguro_limite_ocurrencia` | integer | Límite por siniestro (0 = sin límite) |
 | `seguro_limite` | integer | Límite agregado anual (0 = sin límite) |
+| `afecta_frecuencia` | boolean | **DEBE ser `false`** para seguros |
+| `impacto_porcentual` | integer | **DEBE ser `0`** para seguros |
+| `afecta_severidad` | boolean | **DEBE ser `true`** — si es `false`, el seguro se ignora completamente en simulación |
+| `impacto_severidad_pct` | integer | **DEBE ser `0`** para seguros |
+
+> ⚠️ **`afecta_severidad: true` es OBLIGATORIO** para que el seguro tenga efecto en la simulación. Si se omite o se pone `false`, el seguro se ignora silenciosamente y no reduce ninguna pérdida.
 
 ---
 
@@ -711,7 +967,11 @@ pago_efectivo = min(pago_total_año, limite_anual)  // si limite > 0
     "seguro_deducible": 25000,
     "seguro_cobertura_pct": 80,
     "seguro_limite_ocurrencia": 500000,
-    "seguro_limite": 2000000
+    "seguro_limite": 2000000,
+    "afecta_frecuencia": false,
+    "impacto_porcentual": 0,
+    "afecta_severidad": true,
+    "impacto_severidad_pct": 0
 }
 ```
 
@@ -739,7 +999,11 @@ pago_efectivo = min(pago_total_año, limite_anual)  // si limite > 0
     "seguro_deducible": 100000,
     "seguro_cobertura_pct": 90,
     "seguro_limite_ocurrencia": 0,
-    "seguro_limite": 5000000
+    "seguro_limite": 5000000,
+    "afecta_frecuencia": false,
+    "impacto_porcentual": 0,
+    "afecta_severidad": true,
+    "impacto_severidad_pct": 0
 }
 ```
 
@@ -769,7 +1033,11 @@ pago_efectivo = min(pago_total_año, limite_anual)  // si limite > 0
     "seguro_deducible": 1000000,
     "seguro_cobertura_pct": 100,
     "seguro_limite_ocurrencia": 0,
-    "seguro_limite": 0
+    "seguro_limite": 0,
+    "afecta_frecuencia": false,
+    "impacto_porcentual": 0,
+    "afecta_severidad": true,
+    "impacto_severidad_pct": 0
 }
 ```
 
@@ -810,6 +1078,15 @@ pago_efectivo = min(pago_total_año, limite_anual)  // si limite > 0
 
 ---
 
+### Múltiples Factores por Evento
+
+Un evento puede tener varios factores (estáticos, estocásticos y seguros combinados). Los factores de frecuencia y severidad se combinan **multiplicativamente**:
+
+- **2 controles de -30% cada uno** → factor total = 0.70 × 0.70 = 0.49 (reduce 51%, no 60%)
+- **Estocásticos**: cada uno tiene un sorteo **independiente** (pueden funcionar o fallar de forma separada)
+- **Recomendación**: usar 2-5 factores por evento. Con muchos factores (5+), el efecto combinado puede tender a 0 rápidamente
+- **Evitar reducción 100%** salvo barreras absolutas (preferir 90-95%), ya que un factor con 100% que "funciona" anula todos los demás
+
 ### Combinando Seguros con Otros Controles:
 
 Es común tener controles de mitigación Y seguro para el mismo evento:
@@ -835,7 +1112,11 @@ Es común tener controles de mitigación Y seguro para el mismo evento:
             "seguro_deducible": 50000,
             "seguro_cobertura_pct": 80,
             "seguro_limite_ocurrencia": 500000,
-            "seguro_limite": 2000000
+            "seguro_limite": 2000000,
+            "afecta_frecuencia": false,
+            "impacto_porcentual": 0,
+            "afecta_severidad": true,
+            "impacto_severidad_pct": 0
         }
     ]
 }
@@ -860,29 +1141,150 @@ Es común tener controles de mitigación Y seguro para el mismo evento:
 
 ---
 
-### Campos Opcionales de Compatibilidad
+### Nota sobre campos estáticos en factores estocásticos
 
-Los factores estocásticos también pueden incluir campos del modelo estático para compatibilidad:
+> Si `tipo_modelo` es `"estocastico"`, los campos estáticos (`afecta_frecuencia`, `impacto_porcentual`, `afecta_severidad`, `impacto_severidad_pct`) son **ignorados en simulación**. Risk Lab los agrega automáticamente con valores neutros si no están presentes. **No es necesario incluirlos** al generar un factor estocástico.
 
+---
+
+## Escalamiento de Severidad por Frecuencia
+
+Risk Lab permite modelar la relación entre la frecuencia de ocurrencia de un evento y la severidad de sus pérdidas. Esta funcionalidad es útil cuando eventos repetidos tienden a ser progresivamente más costosos, o cuando años con frecuencia anormalmente alta correlacionan con pérdidas más severas.
+
+### Cuándo usar Escalamiento de Severidad por Frecuencia:
+
+| Situación | Modelo | Configuración sugerida |
+|-----------|--------|------------------------|
+| "Cada incidente adicional es más costoso que el anterior" | **Reincidencia Lineal** | paso=0.3-0.5, factor_max=3.0-5.0 |
+| "Los incidentes se agravan exponencialmente" | **Reincidencia Exponencial** | base=1.3-2.0, factor_max=5.0 |
+| "Los primeros 2 son normales, después se triplican" | **Reincidencia Tabla** | tabla con rangos personalizados |
+| "Años con muchos incidentes tienen incidentes más graves" | **Sistémico** | alpha=0.3-0.8, solo_aumento=true |
+| "La severidad no depende de cuántas veces ocurra" | **No usar** | sev_freq_activado=false |
+
+### Cuándo usar cada modelo:
+
+**Reincidencia** — Impacto progresivo por ocurrencia individual
+- El tercer ataque de ransomware en el año es peor que el primero (agotamiento de backups, fatiga del equipo)
+- Cada falla de un proveedor acumula más impacto operativo
+- Cada reclamo regulatorio adicional genera sanciones crecientes
+
+**Sistémico** — Correlación frecuencia-severidad a nivel anual
+- Años con muchos ciberataques tienden a tener ataques más sofisticados (indicador de campaña coordinada)
+- Alta frecuencia de fraude indica debilidad sistémica → pérdidas individuales más altas
+- Condiciones macroeconómicas que aumentan tanto frecuencia como severidad
+
+### Preguntas Guía para el Agente:
+
+```
+1. "¿Cada incidente adicional tiende a ser más costoso que el anterior?"
+   
+   - Sí, progresivamente → Reincidencia Lineal
+   - Sí, se agrava rápido → Reincidencia Exponencial
+   - Sí, pero con escalones definidos → Reincidencia Tabla
+   - No, son independientes → No usar escalamiento
+
+2. "¿Existe una correlación entre años con muchos incidentes y la gravedad de cada uno?"
+   
+   - Sí, más frecuencia = peores incidentes → Sistémico (solo_aumento=true)
+   - Sí, bidireccional → Sistémico (solo_aumento=false)
+   - No → No usar modelo sistémico
+
+3. "¿Hay un tope máximo de amplificación razonable?"
+   
+   - "Máximo el doble" → factor_max=2.0
+   - "Hasta 3-5 veces peor" → factor_max=3.0-5.0
+   - "Sin límite práctico" → factor_max=10.0
+```
+
+### Configuración JSON:
+
+**Reincidencia Lineal** (caso más común):
 ```json
 {
-    "nombre": "Control Híbrido",
-    "activo": true,
-    "tipo_modelo": "estocastico",
-    "confiabilidad": 80,
-    "reduccion_efectiva": 60,
-    "reduccion_fallo": 10,
-    "reduccion_severidad_efectiva": 40,
-    "reduccion_severidad_fallo": 0,
-    
-    "afecta_frecuencia": true,
-    "impacto_porcentual": 0,
-    "afecta_severidad": true,
-    "impacto_severidad_pct": 0
+    "sev_freq_activado": true,
+    "sev_freq_modelo": "reincidencia",
+    "sev_freq_tipo_escalamiento": "lineal",
+    "sev_freq_paso": 0.5,
+    "sev_freq_factor_max": 5.0
 }
 ```
 
-> **Nota:** Si `tipo_modelo` es "estocastico", los campos estocásticos tienen prioridad. Los campos estáticos se ignoran pero pueden incluirse para compatibilidad.
+**Sistémico** (correlación frecuencia-severidad):
+```json
+{
+    "sev_freq_activado": true,
+    "sev_freq_modelo": "sistemico",
+    "sev_freq_alpha": 0.5,
+    "sev_freq_solo_aumento": true,
+    "sev_freq_sistemico_factor_max": 3.0
+}
+```
+
+**Reincidencia Tabla** (escalones definidos):
+```json
+{
+    "sev_freq_activado": true,
+    "sev_freq_modelo": "reincidencia",
+    "sev_freq_tipo_escalamiento": "tabla",
+    "sev_freq_tabla": [
+        {"desde": 1, "hasta": 2, "multiplicador": 1.0},
+        {"desde": 3, "hasta": 5, "multiplicador": 1.5},
+        {"desde": 6, "hasta": null, "multiplicador": 3.0}
+    ]
+}
+```
+
+### Notas importantes:
+
+- **Distribución Bernoulli** (`freq_opcion=3`): el modelo reincidencia no produce efecto (frecuencia máxima = 1, la primera ocurrencia siempre tiene multiplicador 1.0). Usar modelo sistémico si se necesita correlación frecuencia-severidad
+- **Desactivado por defecto**: si no se incluyen campos `sev_freq_*` en el JSON, la funcionalidad queda inactiva (backward compatible)
+- Para detalles técnicos completos (fórmulas, validaciones, estructura de tabla), ver sección "Escalamiento de Severidad por Frecuencia" en `ESPECIFICACION_JSON_RISK_LAB.md`
+
+---
+
+## Límites Superiores (Caps de Frecuencia y Severidad)
+
+Risk Lab permite definir un **límite superior** para la frecuencia y/o la severidad de cada evento, truncando la distribución mediante **rejection sampling** (re-muestrea valores que exceden el límite en lugar de recortarlos, preservando la forma natural de la distribución).
+
+### Cuándo usar:
+
+| Situación | Campo | Ejemplo |
+|-----------|-------|---------|
+| "La multa máxima es $500K por infracción" | `sev_limite_superior` | `500000` |
+| "Máximo 12 incidentes al año" | `freq_limite_superior` | `12` |
+| "La pérdida no puede superar el valor del activo" | `sev_limite_superior` | valor del activo |
+| Sin restricción | ambos | `null` |
+
+### Preguntas Guía:
+
+```
+1. "¿Existe un tope físico, contractual o regulatorio para el impacto de este evento?"
+   
+   - Sí → sev_limite_superior = ese monto
+   - No → null
+
+2. "¿Hay un máximo de veces que podría ocurrir por año?"
+   
+   - Sí (tope físico) → freq_limite_superior = ese número
+   - No → null
+```
+
+### Reglas:
+- `freq_limite_superior` solo tiene efecto con Poisson, Binomial y Poisson-Gamma (Bernoulli/Beta ya generan 0 o 1)
+- `sev_limite_superior` aplica a todas las distribuciones de severidad
+- **No usar como parche** para distribuciones mal parametrizadas — ajustar parámetros primero
+- Ambos campos son opcionales; `null` = sin límite (backward compatible)
+
+### Configuración JSON:
+
+```json
+{
+    "sev_limite_superior": 500000,
+    "freq_limite_superior": 10
+}
+```
+
+Para detalles técnicos completos (rejection sampling, validaciones), ver sección "Límites Superiores" en `ESPECIFICACION_JSON_RISK_LAB.md`.
 
 ---
 
@@ -892,7 +1294,7 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 
 | Parámetro | Mínimo | Máximo | Notas |
 |-----------|--------|--------|-------|
-| `sev_minimo` | 0 | < sev_mas_probable | Puede ser 0 |
+| `sev_minimo` | > 0 | < sev_mas_probable | **Nunca 0 ni null** (causa crash) |
 | `sev_mas_probable` | > sev_minimo | < sev_maximo | Valor central |
 | `sev_maximo` | > sev_mas_probable | Sin límite | Valor extremo |
 
@@ -904,10 +1306,12 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 | Binomial | `num_eventos` | ≥ 1 (entero) |
 | Binomial | `prob_exito` | 0 - 1 |
 | Bernoulli | `prob_exito` | 0 - 1 |
-| Poisson-Gamma | `pg_minimo` | > 0 |
-| Poisson-Gamma | `pg_mas_probable` | > pg_minimo |
-| Poisson-Gamma | `pg_maximo` | > pg_mas_probable |
-| Poisson-Gamma | `pg_confianza` | 1 - 99 (típico: 90) |
+| Poisson-Gamma | `pg_alpha` | **> 1** (SIEMPRE obligatorio, nunca null) |
+| Poisson-Gamma | `pg_beta` | **> 0** (SIEMPRE obligatorio, nunca null) |
+| Poisson-Gamma | `pg_minimo` | > 0 (opcional, para documentación) |
+| Poisson-Gamma | `pg_mas_probable` | > pg_minimo (opcional) |
+| Poisson-Gamma | `pg_maximo` | > pg_mas_probable (opcional) |
+| Poisson-Gamma | `pg_confianza` | 1 - 99, típico: 90 (opcional) |
 | Beta | `beta_minimo` | 0 - 100 (%) |
 | Beta | `beta_mas_probable` | > beta_minimo, < beta_maximo |
 | Beta | `beta_maximo` | > beta_mas_probable, ≤ 100 |
@@ -917,8 +1321,8 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 
 | Modelo | Parámetro | Rango válido |
 |--------|-----------|--------------|
-| Estático | `impacto_porcentual` | -99 a +200 |
-| Estático | `impacto_severidad_pct` | -99 a +200 |
+| Estático | `impacto_porcentual` | -99 a +∞ (sin límite superior) |
+| Estático | `impacto_severidad_pct` | -99 a +∞ (sin límite superior) |
 | Estocástico | `confiabilidad` | 0 - 100 |
 | Estocástico | `reduccion_efectiva` | -100 a +99 |
 | Estocástico | `reduccion_fallo` | -100 a +99 |
@@ -928,6 +1332,13 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 | Seguro | `seguro_cobertura_pct` | 1 - 100 |
 | Seguro | `seguro_limite_ocurrencia` | 0 - 999,999,999 |
 | Seguro | `seguro_limite` | 0 - 999,999,999 |
+
+### Límites Superiores:
+
+| Parámetro | Rango válido | Notas |
+|-----------|--------------|-------|
+| `sev_limite_superior` | `null` o > 0 | Monto en moneda. `null` = sin límite |
+| `freq_limite_superior` | `null` o entero > 0 | Número máximo de ocurrencias. `null` = sin límite |
 
 ### Simulación:
 
@@ -945,17 +1356,20 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 2. **Todos los UUIDs son únicos** (generar con uuid4)
 3. **Parámetros de severidad coherentes**: minimo < mas_probable < maximo
 4. **Parámetros de frecuencia válidos**:
-   - Poisson: tasa > 0
+   - Poisson: tasa > 0 (nunca null ni 0)
    - Binomial: num_eventos > 0, 0 ≤ prob_exito ≤ 1
    - Bernoulli: 0 ≤ prob_exito ≤ 1
-   - Poisson-Gamma: pg_minimo < pg_mas_probable < pg_maximo
-   - Beta: 0 ≤ beta_minimo < beta_mas_probable < beta_maximo ≤ 100
+   - Poisson-Gamma: `pg_alpha` > 1 y `pg_beta` > 0 **SIEMPRE** (nunca null). Si se incluyen min/mode/max: pg_minimo < pg_mas_probable < pg_maximo
+   - Beta: `beta_alpha` > 0 y `beta_beta` > 0 **SIEMPRE** (nunca null). Además: 0 ≤ beta_minimo < beta_mas_probable < beta_maximo ≤ 100 (porcentajes, nunca null)
 5. **Sin ciclos en dependencias**
 6. **IDs de padres existen**
 7. **Al menos un evento definido**
 8. **Factores tienen tipo_modelo válido** ("estatico" o "estocastico")
-9. **Seguros tienen tipo_severidad = "seguro"** y parámetros válidos
+9. **Seguros tienen tipo_severidad = "seguro" y parámetros válidos**
 10. **Seguros tienen seguro_tipo_deducible válido** ("agregado" o "por_ocurrencia")
+11. **Si usa escalamiento sev_freq: `sev_freq_activado` = `true` y modelo/parámetros válidos**
+12. **Si usa reincidencia tabla: `sev_freq_tabla` es array con `{desde, hasta, multiplicador}`**
+13. **Si usa límites superiores: `sev_limite_superior` es `null` o > 0; `freq_limite_superior` es `null` o entero > 0**
 
 ---
 
@@ -977,57 +1391,15 @@ Los factores estocásticos también pueden incluir campos del modelo estático p
 
 | Usuario dice | Traducción sugerida |
 |--------------|---------------------|
-| "Menor, unos pocos miles" | PERT (1K, 5K, 15K) |
-| "Moderado, decenas de miles" | LogNormal (20K, 50K, 150K) |
-| "Significativo, cientos de miles" | LogNormal (100K, 300K, 1M) |
-| "Catastrófico, millones" | Pareto (500K, 2M, 10M) |
-| "No tengo idea, entre X e Y" | Uniforme (X, Y) |
+| "Menor, unos pocos miles" | PERT min/mode/max (1K, 5K, 15K) |
+| "Moderado, decenas de miles" | LogNormal **direct** — convertir (20K, 50K, 150K) a mu/sigma con guía PERT→LogNormal |
+| "Significativo, cientos de miles" | LogNormal **direct** — convertir (100K, 300K, 1M) a mu/sigma con guía PERT→LogNormal |
+| "Catastrófico, millones" | Pareto/GPD **direct** — usar guía de estimación c/scale/loc |
+| "No tengo idea, entre X e Y" | Uniforme min/max (X, Y) |
+
+> **Recordatorio**: LogNormal y Pareto/GPD **requieren** `sev_input_method: "direct"`. Ver la sección "Modo Avanzado: Parámetros Directos de Distribuciones" para guías de conversión.
 
 ---
-
-## Plantilla JSON Completa
-
-```json
-{
-    "num_simulaciones": 10000,
-    "eventos_riesgo": [
-        {
-            "id": "GENERAR-UUID-UNICO",
-            "nombre": "Nombre descriptivo del evento",
-            "activo": true,
-            
-            "sev_opcion": 2,
-            "sev_input_method": "min_mode_max",
-            "sev_minimo": 10000,
-            "sev_mas_probable": 50000,
-            "sev_maximo": 200000,
-            "sev_params_direct": {},
-            
-            "freq_opcion": 1,
-            "tasa": 2.0,
-            "num_eventos": null,
-            "prob_exito": null,
-            "pg_minimo": null,
-            "pg_mas_probable": null,
-            "pg_maximo": null,
-            "pg_confianza": null,
-            "pg_alpha": null,
-            "pg_beta": null,
-            "beta_minimo": null,
-            "beta_mas_probable": null,
-            "beta_maximo": null,
-            "beta_confianza": null,
-            "beta_alpha": null,
-            "beta_beta": null,
-            
-            "vinculos": [],
-            "factores_ajuste": []
-        }
-    ],
-    "scenarios": [],
-    "current_scenario_name": null
-}
-```
 
 ## Escenarios Alternativos
 
@@ -1048,19 +1420,21 @@ Los escenarios permiten comparar diferentes configuraciones (ej: con/sin control
             "nombre": "Sin Controles",
             "descripcion": "Escenario baseline sin controles implementados",
             "eventos_riesgo": [
-                // Mismos eventos pero sin factores_ajuste o con factores inactivos
+                { "id": "...", "nombre": "...", "activo": true, "sev_opcion": 3, "..." : "evento COMPLETO sin factores_ajuste" }
             ]
         },
         {
             "nombre": "Pesimista",
             "descripcion": "Frecuencias y severidades aumentadas 30%",
             "eventos_riesgo": [
-                // Eventos con parámetros ajustados
+                { "id": "...", "nombre": "...", "activo": true, "sev_opcion": 3, "..." : "evento COMPLETO con parametros ajustados" }
             ]
         }
     ]
 }
 ```
+
+> ⚠️ **Cada evento dentro de un escenario debe ser COMPLETO** — con todos los campos obligatorios (id, nombre, activo, sev_*, freq_*, vinculos, factores_ajuste, etc.). No existen "overrides parciales". Ver la estructura completa en `ESPECIFICACION_JSON_RISK_LAB.md`.
 
 ---
 
@@ -1096,17 +1470,49 @@ Los escenarios permiten comparar diferentes configuraciones (ej: con/sin control
 
 Antes de entregar el JSON al usuario, verificar:
 
-- [ ] Todos los UUIDs son únicos
-- [ ] Todos los nombres de eventos son descriptivos y únicos
-- [ ] sev_minimo < sev_mas_probable < sev_maximo (cuando aplica)
-- [ ] Parámetros de frecuencia válidos según distribución elegida
-- [ ] No hay ciclos en los vínculos
-- [ ] Todos los id_padre referencian eventos existentes
-- [ ] Factores tienen tipo_modelo definido ("estatico" o "estocastico")
-- [ ] Seguros tienen tipo_severidad = "seguro" y seguro_tipo_deducible válido
-- [ ] Seguros tienen seguro_cobertura_pct entre 1-100
-- [ ] JSON es válido sintácticamente
+**Integridad sintáctica:**
+- [ ] El JSON es un documento completo (no truncado) que pasa `json.loads()` sin error
+- [ ] Todos los valores numéricos son números válidos (un solo punto decimal máximo, no strings)
+- [ ] No hay caracteres de control sin escapar, comentarios ni trailing commas
+
+**Estructura y claves:**
+- [ ] Todos los UUIDs son únicos (formato UUID v4)
+- [ ] Todos los nombres de eventos son descriptivos y no vacíos
+- [ ] `eventos_riesgo`, `scenarios`, `vinculos`, `factores_ajuste` son listas `[]` (nunca `null`)
+- [ ] Cada escenario usa `eventos_riesgo` como clave (no `events` ni otra variante)
 - [ ] num_simulaciones es al menos 1000 (recomendado 10000)
+
+**Severidad:**
+- [ ] Si `sev_input_method: "min_mode_max"` → `sev_minimo < sev_mas_probable < sev_maximo`, todos > 0 (nunca 0, nunca null)
+- [ ] Si `sev_input_method: "direct"` → `sev_minimo/mas_probable/maximo` son `null` (claves presentes) y `sev_params_direct` tiene parámetros válidos (nunca `{}` vacío)
+- [ ] `std`/`sigma`/`s`/`scale` siempre > 0 en `sev_params_direct`
+- [ ] PERT/Uniforme solo con `"min_mode_max"`; LogNormal/Pareto solo con `"direct"`
+
+**Frecuencia:**
+- [ ] `freq_opcion=1` → `tasa` > 0 (nunca null ni 0)
+- [ ] `freq_opcion=2` → `num_eventos` > 0 (entero) y `0 ≤ prob_exito ≤ 1`
+- [ ] `freq_opcion=3` → `0 ≤ prob_exito ≤ 1`
+- [ ] `freq_opcion=4` → `pg_alpha` > 1 y `pg_beta` > 0, ambos numéricos (**nunca null**)
+- [ ] `freq_opcion=5` → `beta_alpha` > 0 y `beta_beta` > 0 (**nunca null**); `beta_minimo/mas_probable/maximo/confianza` numéricos (**nunca null**)
+
+**Factores y seguros:**
+- [ ] Todo factor tiene campo `nombre` (no vacío)
+- [ ] Factores tienen `tipo_modelo` definido (`"estatico"` o `"estocastico"`)
+- [ ] Todo factor estático que afecte severidad tiene `afecta_severidad: true` explícito
+- [ ] **Seguros son `factores_ajuste` (NUNCA eventos independientes)** con `tipo_severidad: "seguro"`
+- [ ] Seguros: `afecta_severidad: true` (OBLIGATORIO), `afecta_frecuencia: false`, `impacto_porcentual: 0`, `impacto_severidad_pct: 0`
+- [ ] Seguros: `seguro_tipo_deducible` es `"agregado"` o `"por_ocurrencia"`, `seguro_cobertura_pct` entre 1-100
+
+**Vínculos:**
+- [ ] Todo `id_padre` referencia un `id` existente dentro del mismo archivo/escenario
+- [ ] `tipo` en mayúsculas exactas: `"AND"`, `"OR"`, `"EXCLUYE"`
+- [ ] `probabilidad` entre 1-100, `factor_severidad` entre 0.10-5.00, `umbral_severidad` ≥ 0
+- [ ] `factor_severidad` = 1.0 para tipo EXCLUYE
+- [ ] Sin ciclos en el grafo de dependencias (DAG)
+
+**Límites superiores (si se usan):**
+- [ ] `sev_limite_superior` es `null` o número > 0
+- [ ] `freq_limite_superior` es `null` o entero > 0
 
 ---
 

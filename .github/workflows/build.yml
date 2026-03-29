@@ -91,7 +91,7 @@ jobs:
   build-macos:
     needs: setup
     if: needs.setup.outputs.build_macos == 'true'
-    runs-on: macos-13
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code

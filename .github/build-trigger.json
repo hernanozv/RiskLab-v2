@@ -1,5 +1,5 @@
 {
-  "platform": "macos",
-  "triggered_at": "2026-03-29T22:15:00Z",
+  "platform": "all",
+  "triggered_at": "2026-03-29T22:21:00Z",
   "note": "Update this file to trigger a build. platform: windows | macos | all"
 }

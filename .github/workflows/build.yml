@@ -2,17 +2,18 @@ name: Build Executables
 
 on:
   push:
+    branches:
+      - 'claude/pyinstaller-executable-*'
     tags:
-      - 'build/windows'
-      - 'build/macos'
-      - 'build/all'
       - 'v*.*.*'
+    paths:
+      - '.github/build-trigger.json'
   workflow_dispatch:
     inputs:
       platform:
         description: 'Platform to build'
         required: true
-        default: 'windows'
+        default: 'all'
         type: choice
         options:
           - windows
@@ -20,11 +21,46 @@ on:
           - all
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      build_windows: ${{ steps.check.outputs.build_windows }}
+      build_macos: ${{ steps.check.outputs.build_macos }}
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine build targets
+        id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            PLATFORM="${{ github.event.inputs.platform }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            PLATFORM="all"
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            PLATFORM=$(python3 -c "import json; d=json.load(open('.github/build-trigger.json')); print(d.get('platform','all'))")
+          fi
+
+          echo "is_release=${IS_RELEASE:-false}" >> $GITHUB_OUTPUT
+
+          if [[ "$PLATFORM" == "windows" || "$PLATFORM" == "all" ]]; then
+            echo "build_windows=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_windows=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [[ "$PLATFORM" == "macos" || "$PLATFORM" == "all" ]]; then
+            echo "build_macos=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_macos=false" >> $GITHUB_OUTPUT
+          fi
+
   build-windows:
+    needs: setup
+    if: needs.setup.outputs.build_windows == 'true'
     runs-on: windows-latest
-    if: |
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all')) ||
-      (github.event_name == 'push' && (endsWith(github.ref, 'build/windows') || endsWith(github.ref, 'build/all') || startsWith(github.ref, 'refs/tags/v')))
 
     steps:
       - name: Checkout code
@@ -53,10 +89,9 @@ jobs:
           retention-days: 7
 
   build-macos:
+    needs: setup
+    if: needs.setup.outputs.build_macos == 'true'
     runs-on: macos-13
-    if: |
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all')) ||
-      (github.event_name == 'push' && (endsWith(github.ref, 'build/macos') || endsWith(github.ref, 'build/all') || startsWith(github.ref, 'refs/tags/v')))
 
     steps:
       - name: Checkout code
@@ -84,9 +119,9 @@ jobs:
           retention-days: 7
 
   release:
-    needs: [build-windows, build-macos]
+    needs: [setup, build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.setup.outputs.is_release == 'true'
 
     steps:
       - name: Download Windows artifact

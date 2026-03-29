@@ -77,15 +77,11 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller Risk_Lab_Beta.spec
 
-      - name: Zip output
-        run: Compress-Archive -Path dist\Risk_Lab_Beta -DestinationPath RiskLab-Windows.zip
-        shell: pwsh
-
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: RiskLab-Windows
-          path: RiskLab-Windows.zip
+          path: dist\Risk_Lab_Beta\
           retention-days: 7
 
   build-macos:
@@ -108,8 +104,8 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller Risk_Lab_Beta_mac.spec
 
-      - name: Zip output
-        run: zip -r RiskLab-macOS.zip "dist/Risk Lab Beta.app"
+      - name: Package .app (preserving symlinks and permissions)
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Risk Lab Beta.app" RiskLab-macOS.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -128,11 +124,15 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: RiskLab-Windows
+          path: RiskLab-Windows
 
       - name: Download macOS artifact
         uses: actions/download-artifact@v8
         with:
           name: RiskLab-macOS
+
+      - name: Package Windows artifact for release
+        run: cd RiskLab-Windows && zip -r ../RiskLab-Windows.zip . && cd ..
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2.6.1

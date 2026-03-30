@@ -1,6 +1,6 @@
 # Risk_Lab_Beta_mac.spec
 # -*- mode: python ; coding: utf-8 -*-
-# Spec exclusivo para macOS — genera un .app bundle nativo
+# Spec exclusivo para macOS — genera carpeta de distribución (igual que Windows)
 import sys
 import os
 from glob import glob
@@ -104,17 +104,4 @@ coll = COLLECT(
     upx=False,
     upx_exclude=[],
     name='Risk Lab Beta',
-)
-
-app = BUNDLE(
-    coll,
-    name='Risk Lab Beta.app',
-    icon='images/risk_lab_logo.png',
-    bundle_identifier='com.risklab.beta',
-    info_plist={
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
-        'NSHighResolutionCapable': True,
-        'NSPrincipalClass': 'NSApplication',
-    },
 )

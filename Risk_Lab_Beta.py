@@ -2096,6 +2096,8 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         evento['_factores_severidad_vector'] = factores_severidad_vector  # NUEVO
                         evento['_usa_estocastico'] = True
                         evento['_seguros_aplicables'] = seguros_aplicables  # Seguros se aplican siempre
+                        # Cache: flag de no-op para evitar np.allclose por simulación
+                        evento['_factores_severidad_vector_es_unidad'] = bool(np.allclose(factores_severidad_vector, 1.0))
                         
                         # Flags guardados correctamente para usar en sampleo
                         
@@ -2364,6 +2366,8 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 # Solo aplicar donde condicion_final es True; resto queda 1.0
                 factor_severidad_vinculos = np.where(condicion_final, factor_severidad_vinculos, 1.0)
                 evento['_factor_severidad_vinculos'] = factor_severidad_vinculos
+                # Cache: flag de no-op para evitar np.allclose por simulación
+                evento['_factor_severidad_vinculos_es_unidad'] = bool(np.allclose(factor_severidad_vinculos, 1.0))
             else:
                 evento['_factor_severidad_vinculos'] = None
 
@@ -3201,7 +3205,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 # ANTES de aplicar controles y seguros
                 # =====================================================
                 factor_sev_vinculos = evento.get('_factor_severidad_vinculos')
-                if factor_sev_vinculos is not None and not np.allclose(factor_sev_vinculos, 1.0):
+                if factor_sev_vinculos is not None and not evento.get('_factor_severidad_vinculos_es_unidad', False):
                     indices_con_ocurrencias_v = np.flatnonzero(final_event_frequencies > 0)
                     frecuencias_en_esas_simulaciones_v = final_event_frequencies[indices_con_ocurrencias_v]
                     factores_por_perdida_v = np.repeat(factor_sev_vinculos[indices_con_ocurrencias_v], frecuencias_en_esas_simulaciones_v)
@@ -3223,7 +3227,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 if evento.get('_usa_estocastico', False):
                     # Modelo estocástico: necesitamos mapear el vector de factores a las pérdidas individuales
                     factores_sev_vector = evento.get('_factores_severidad_vector')
-                    if factores_sev_vector is not None and not np.allclose(factores_sev_vector, 1.0):
+                    if factores_sev_vector is not None and not evento.get('_factores_severidad_vector_es_unidad', False):
                         # Mapear factores de simulación a pérdidas individuales
                         indices_con_ocurrencias = np.flatnonzero(final_event_frequencies > 0)
                         frecuencias_en_esas_simulaciones = final_event_frequencies[indices_con_ocurrencias]
@@ -3385,17 +3389,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                   f"(Pago medio seguro: ${pago_seguro.mean():,.0f})")
         
         perdidas_por_evento[idx] = perdidas_para_este_evento
-        
+
         perdidas_totales += perdidas_para_este_evento
+        # Optimización: acumular frecuencias_totales incrementalmente para evitar
+        # un vstack final de toda la matriz frecuencias_por_evento.
+        frecuencias_totales += final_event_frequencies
 
     # FIN DEL BUCLE: for evento_id in orden_eventos_ids:
-
-    # PASO 3: Calcular frecuencias_totales una vez, después del bucle.
-    if num_eventos > 0: 
-        # Usar vstack para evitar dtype=object y acelerar la suma
-        frecuencias_totales = np.sum(np.vstack(frecuencias_por_evento), axis=0).astype(np.int32)
-    else:
-        frecuencias_totales = np.zeros(num_simulaciones, dtype=np.int32)
 
     return perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento
 
@@ -3450,8 +3450,13 @@ class SimulacionThread(QThread):
             total = self.num_simulaciones
             if total <= 0:
                 raise ValueError("El número de simulaciones debe ser mayor que 0")
-            # Dividir en hasta 100 chunks, evitando tamaños 0
-            num_chunks = min(100, total)
+            # Dividir en pocos chunks. Optimización: Bajamos de 100 a 10 chunks
+            # porque el setup interno (preparación de factores, recreación de
+            # distribuciones scipy y prints) tiene costo fijo por llamada y
+            # llamarlo 100 veces era un cuello de botella mayor.
+            # 10 chunks ofrecen suficiente granularidad de progreso (10% por chunk)
+            # con ~10x menos overhead.
+            num_chunks = min(10, total)
             chunk_edges = np.linspace(0, total, num_chunks + 1, dtype=int)
 
             # Precomputar y reutilizar el orden de eventos para todos los chunks
@@ -3462,8 +3467,13 @@ class SimulacionThread(QThread):
             # Inicializar los arrays de resultados completos
             perdidas_totales = np.zeros(self.num_simulaciones)
             frecuencias_totales = np.zeros(self.num_simulaciones, dtype=np.int32)
-            perdidas_por_evento = None
-            frecuencias_por_evento = None
+            # Optimización: usamos arrays 2D contiguos (num_eventos, num_simulaciones)
+            # en lugar de listas de arrays. Beneficios:
+            # - Una asignación de slice por chunk (vs num_eventos asignaciones)
+            # - Mejor cache locality
+            # - list(arr_2d) al final retorna vistas 1D compatibles con el caller
+            perdidas_por_evento_2d = None
+            frecuencias_por_evento_2d = None
 
             for i in range(num_chunks):
                 if not self.is_running:
@@ -3482,24 +3492,28 @@ class SimulacionThread(QThread):
                 )
 
                 # Actualizar los resultados acumulados
-                # Actualizar perdidas_totales y frecuencias_totales
                 perdidas_totales[start:end] = resultados[0]
                 frecuencias_totales[start:end] = resultados[1]
 
-                # Inicializar perdidas_por_evento y frecuencias_por_evento la primera vez
-                if perdidas_por_evento is None:
+                # Inicializar arrays 2D la primera vez (al conocer num_eventos)
+                if perdidas_por_evento_2d is None:
                     num_eventos = len(resultados[2])
-                    perdidas_por_evento = [np.zeros(self.num_simulaciones) for _ in range(num_eventos)]
-                    frecuencias_por_evento = [np.zeros(self.num_simulaciones, dtype=np.int32) for _ in range(num_eventos)]
+                    perdidas_por_evento_2d = np.zeros((num_eventos, self.num_simulaciones))
+                    frecuencias_por_evento_2d = np.zeros((num_eventos, self.num_simulaciones), dtype=np.int32)
 
-                # Acumular perdidas_por_evento y frecuencias_por_evento
-                for idx in range(len(perdidas_por_evento)):
-                    perdidas_por_evento[idx][start:end] = resultados[2][idx]
-                    frecuencias_por_evento[idx][start:end] = resultados[3][idx]
+                # Acumular en bloque: una asignación por chunk en lugar de num_eventos
+                # np.stack convierte la lista de arrays del chunk en un 2D contiguo
+                if num_eventos > 0:
+                    perdidas_por_evento_2d[:, start:end] = np.stack(resultados[2])
+                    frecuencias_por_evento_2d[:, start:end] = np.stack(resultados[3])
 
                 # Emitir señal de progreso
                 progreso = int((i + 1) * 100 / num_chunks)
                 self.progreso_actualizado.emit(progreso)
+
+            # Convertir a lista de vistas 1D para preservar la interfaz pública
+            perdidas_por_evento = list(perdidas_por_evento_2d) if perdidas_por_evento_2d is not None else []
+            frecuencias_por_evento = list(frecuencias_por_evento_2d) if frecuencias_por_evento_2d is not None else []
 
             if not self.is_running:
                 return
@@ -16670,7 +16684,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         del evento_data['_seguros_aplicables']
                     if '_factor_severidad_vinculos' in evento_data:
                         del evento_data['_factor_severidad_vinculos']
-                    
+                    # Flags de cache no-op añadidas en optimización
+                    if '_factor_severidad_vinculos_es_unidad' in evento_data:
+                        del evento_data['_factor_severidad_vinculos_es_unidad']
+                    if '_factores_severidad_vector_es_unidad' in evento_data:
+                        del evento_data['_factores_severidad_vector_es_unidad']
+
                     # DEBUG: Verificar que factores_ajuste se está guardando
                     if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
                         print(f"[DEBUG GUARDAR JSON] Guardando evento '{evento_data.get('nombre')}' con {len(evento_data['factores_ajuste'])} factores")
@@ -16706,7 +16725,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             del evento_data['_seguros_aplicables']
                         if '_factor_severidad_vinculos' in evento_data:
                             del evento_data['_factor_severidad_vinculos']
-                        
+                        # Flags de cache no-op añadidas en optimización
+                        if '_factor_severidad_vinculos_es_unidad' in evento_data:
+                            del evento_data['_factor_severidad_vinculos_es_unidad']
+                        if '_factores_severidad_vector_es_unidad' in evento_data:
+                            del evento_data['_factores_severidad_vector_es_unidad']
+
                         escenario_data['eventos_riesgo'].append(evento_data)
                     configuracion['scenarios'].append(escenario_data)
 

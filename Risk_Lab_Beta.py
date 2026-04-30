@@ -6746,17 +6746,25 @@ class RiskLabApp(QtWidgets.QMainWindow):
     
     def crear_hero_banner(self, titulo="Risk Lab", subtitulo="Plataforma de Simulación de Riesgos"):
         """Crea un hero banner moderno y compacto con accent bar amarillo.
-        
-        Mejoras aplicadas:
-        - Altura reducida de 70px a 60px (ahorro del 14%)
-        - Fondo blanco limpio con accent bar amarillo como identidad de marca
-        - Logo a 46px con padding mínimo (garantiza visualización completa)
-        - Mejor jerarquía visual con tipografía optimizada
-        
+
+        Adaptativo a resolución: en pantallas con altura < 800 px, el banner
+        se reduce de 60 px a 42 px para liberar espacio vertical para el
+        contenido principal.
+
         Args:
             titulo: Texto principal del banner
             subtitulo: Texto descriptivo secundario
         """
+        # Detectar pantalla pequeña para usar dimensiones reducidas
+        try:
+            _screen = QtWidgets.QApplication.primaryScreen()
+            _is_compact = _screen is not None and _screen.availableGeometry().height() < 800
+        except Exception:
+            _is_compact = False
+        _hero_height = 42 if _is_compact else 60
+        _logo_height = 30 if _is_compact else 46
+        _hero_v_padding = 4 if _is_compact else 7
+        _hero_h_padding = 10 if _is_compact else 14
         # Wrapper para contener header + accent bar
         header_wrapper = QtWidgets.QWidget()
         wrapper_layout = QtWidgets.QVBoxLayout(header_wrapper)
@@ -6767,17 +6775,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
         hero_container = QtWidgets.QWidget()
         hero_container.setObjectName("heroBanner")
         hero_layout = QtWidgets.QHBoxLayout(hero_container)
-        hero_layout.setContentsMargins(14, 7, 14, 7)  # Márgenes ajustados para 60px
+        hero_layout.setContentsMargins(_hero_h_padding, _hero_v_padding, _hero_h_padding, _hero_v_padding)
         hero_layout.setSpacing(12)
-        
-        # Logo de Risk Lab (lado izquierdo) - Tamaño aumentado para verse completo
+
+        # Logo de Risk Lab (lado izquierdo) - Tamaño adaptativo
         logo_label = QtWidgets.QLabel()
         logo_path = resource_path("images/risk_lab_logo.png")
-        
+
         if os.path.exists(logo_path):
             logo_pixmap = QtGui.QPixmap(logo_path)
-            # Escalar logo a 46px - tamaño que garantiza que se vea completo
-            logo_pixmap = logo_pixmap.scaledToHeight(46, QtCore.Qt.SmoothTransformation)
+            # Escalar logo según tamaño compacto/normal
+            logo_pixmap = logo_pixmap.scaledToHeight(_logo_height, QtCore.Qt.SmoothTransformation)
             logo_label.setPixmap(logo_pixmap)
             # Fondo gris muy claro en lugar de negro para mejor integración
             logo_label.setStyleSheet("""
@@ -6863,9 +6871,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
             }
         """)
         
-        # Altura a 60px para que el logo de 46px se vea completo sin cortes
-        hero_container.setMinimumHeight(60)
-        hero_container.setMaximumHeight(60)
+        # Altura adaptativa: 42px en pantallas pequeñas, 60px en normales
+        hero_container.setMinimumHeight(_hero_height)
+        hero_container.setMaximumHeight(_hero_height)
         
         # Agregar header al wrapper
         wrapper_layout.addWidget(hero_container)
@@ -7184,17 +7192,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 background-color: #F5F7FA;
             }
         """)
-        
+
+        # Detectar pantalla pequeña para aplicar márgenes/spacing reducidos
+        try:
+            _screen = QtWidgets.QApplication.primaryScreen()
+            _is_compact = _screen is not None and _screen.availableGeometry().height() < 800
+        except Exception:
+            _is_compact = False
+        _outer_margin = 6 if _is_compact else 10
+        _outer_spacing = 6 if _is_compact else 10
+
         # Usamos un QGridLayout como layout principal
         layout = QtWidgets.QGridLayout(self.results_tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(_outer_margin, _outer_margin, _outer_margin, _outer_margin)
+        layout.setSpacing(_outer_spacing)
         current_row = 0
-        
+
         # Barra de progreso con etiqueta informativa
         progress_panel = QtWidgets.QWidget()
         progress_layout = QtWidgets.QGridLayout(progress_panel)
-        progress_layout.setContentsMargins(10, 10, 10, 10)
+        progress_layout.setContentsMargins(_outer_margin, _outer_margin, _outer_margin, _outer_margin)
         
         progress_label = QtWidgets.QLabel("Progreso de la simulación:")
         progress_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)

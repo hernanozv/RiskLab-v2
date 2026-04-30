@@ -7326,14 +7326,51 @@ class RiskLabApp(QtWidgets.QMainWindow):
         results_splitter.addWidget(graphs_panel)
         results_splitter.setStretchFactor(0, 1)  # El panel de texto
         results_splitter.setStretchFactor(1, 3)  # Dar aún más espacio a los gráficos
-        results_splitter.setSizes([500, 950])    # Tamaño inicial privilegiando el panel derecho
-        
+        # Tamaño inicial dinámico según el ancho de pantalla disponible
+        # (el ancho real de la ventana aún no está disponible en este punto).
+        # Proporción 35% texto / 65% gráficos. Antes era fijo [500, 950] = 1450 px
+        # que sobrepasaba en pantallas < 1450 px y forzaba scroll horizontal.
+        try:
+            _screen = QtWidgets.QApplication.primaryScreen()
+            if _screen is not None:
+                avail_w = int(_screen.availableGeometry().width() * 0.85)
+            else:
+                avail_w = 1200
+        except Exception:
+            avail_w = 1200
+        avail_w = max(800, avail_w)
+        _left_w = int(avail_w * 0.35)
+        _right_w = avail_w - _left_w
+        results_splitter.setSizes([_left_w, _right_w])
+        # Guardar referencia al splitter para poder ajustarlo dinámicamente
+        self._results_splitter = results_splitter
+
         # Añadir splitter al layout principal
         layout.addWidget(results_splitter, current_row, 0, 1, 4)
         layout.setRowStretch(current_row, 10)  # Dar mayor peso de estiramiento a la fila de resultados
         
         # Diccionario para almacenar referencias a las secciones creadas
         self.secciones_resultados = {}
+
+    def _wrap_canvas_in_scroll(self, canvas, min_w=600, min_h=400):
+        """Envuelve un canvas de matplotlib en un QScrollArea.
+
+        Permite que en pantallas pequeñas el gráfico no se corte: si el canvas
+        excede el viewport, aparecen scrollbars. El canvas mantiene un tamaño
+        mínimo para legibilidad y se expande cuando hay espacio disponible.
+        """
+        try:
+            canvas.setMinimumSize(min_w, min_h)
+        except Exception:
+            pass
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { background-color: #FFFFFF; border: none; }")
+        scroll.setWidget(canvas)
+        return scroll
 
     def actualizar_probabilidad_excedencia(self):
         """Calcula y muestra P[Impacto > T] basado en la tolerancia actual y los resultados."""
@@ -14049,7 +14086,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         distrib_ctrls_layout.addWidget(self.cb_tol_line_distrib)
         distrib_ctrls_layout.addStretch()
         layout1.addWidget(distrib_ctrls)
-        layout1.addWidget(canvas1)
+        layout1.addWidget(self._wrap_canvas_in_scroll(canvas1))
         # Dibujar línea de tolerancia inicial en Distribución
         try:
             T = float(self.tolerancia_ex_spin.value()) if hasattr(self, 'tolerancia_ex_spin') else float(np.percentile(perdidas_totales, 90))
@@ -14211,7 +14248,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             distrib2_ctrls_layout.addWidget(self.cb_tol_line_distrib_sin_cero)
             distrib2_ctrls_layout.addStretch()
             layout2.addWidget(distrib2_ctrls)
-            layout2.addWidget(canvas2)
+            layout2.addWidget(self._wrap_canvas_in_scroll(canvas2))
             # Dibujar línea de tolerancia inicial (vertical) en x=T con etiqueta
             try:
                 T2 = float(self.tolerancia_ex_spin.value()) if hasattr(self, 'tolerancia_ex_spin') else float(np.percentile(perdidas_totales_sin_cero, 90))
@@ -14364,7 +14401,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         exceed_ctrls_layout.addStretch()
         layout3.addWidget(exceed_ctrls)
-        layout3.addWidget(canvas3)
+        layout3.addWidget(self._wrap_canvas_in_scroll(canvas3))
         
         # Dibujar línea horizontal inicial en y=T
         try:
@@ -14482,7 +14519,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         tab4 = QtWidgets.QWidget()
         layout_boxplot = QtWidgets.QVBoxLayout(tab4)
-        layout_boxplot.addWidget(canvas_boxplot)
+        layout_boxplot.addWidget(self._wrap_canvas_in_scroll(canvas_boxplot))
         self.graficos_tab_widget.addTab(tab4, "Box Plot")
         try:
             curr = self.progress_bar.value()
@@ -14783,7 +14820,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             tab7 = QtWidgets.QWidget()
             layout4 = QtWidgets.QVBoxLayout(tab7)
-            layout4.addWidget(canvas4)
+            layout4.addWidget(self._wrap_canvas_in_scroll(canvas4))
             self.graficos_tab_widget.addTab(tab7, "Frecuencia")
             try:
                 curr = self.progress_bar.value()
@@ -14938,7 +14975,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             tab8 = QtWidgets.QWidget()
             layout5 = QtWidgets.QVBoxLayout(tab8)
-            layout5.addWidget(canvas5)
+            layout5.addWidget(self._wrap_canvas_in_scroll(canvas5))
             self.graficos_tab_widget.addTab(tab8, "Dispersión")
             try:
                 curr = self.progress_bar.value()
@@ -15021,7 +15058,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 canvas6.add_tooltip_data(ax6, [mean_val], [y_mean], labels=[label_mean])
             tab9 = QtWidgets.QWidget()
             layout6 = QtWidgets.QVBoxLayout(tab9)
-            layout6.addWidget(canvas6)
+            layout6.addWidget(self._wrap_canvas_in_scroll(canvas6))
             self.graficos_tab_widget.addTab(tab9, "Dist. por Evento")
             try:
                 curr = self.progress_bar.value()
@@ -15211,7 +15248,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 contrib_ctrls_layout.addStretch()
                 
                 layout7.addWidget(contrib_ctrls)
-                layout7.addWidget(canvas7)
+                layout7.addWidget(self._wrap_canvas_in_scroll(canvas7))
                 self.graficos_tab_widget.addTab(tab10, "Contribución")
                 try:
                     curr = self.progress_bar.value()
@@ -15328,7 +15365,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         tab11 = QtWidgets.QWidget()
         layout8 = QtWidgets.QVBoxLayout(tab11)
-        layout8.addWidget(canvas8)
+        layout8.addWidget(self._wrap_canvas_in_scroll(canvas8))
         self.graficos_tab_widget.addTab(tab11, "Perd por Evento")
         try:
             curr = self.progress_bar.value()
@@ -15456,7 +15493,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         tab12 = QtWidgets.QWidget()
         layout10 = QtWidgets.QVBoxLayout(tab12)
-        layout10.addWidget(canvas10)
+        layout10.addWidget(self._wrap_canvas_in_scroll(canvas10))
         self.graficos_tab_widget.addTab(tab12, "Tail Risk")
         try:
             curr = self.progress_bar.value()
@@ -15821,7 +15858,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Integrar en la interfaz
         tab_term = QtWidgets.QWidget()
         layout_term = QtWidgets.QVBoxLayout(tab_term)
-        layout_term.addWidget(canvas_term)
+        layout_term.addWidget(self._wrap_canvas_in_scroll(canvas_term))
         self.graficos_tab_widget.addTab(tab_term, "Termómetro")
         try:
             curr = self.progress_bar.value()
@@ -15924,7 +15961,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         tab14 = QtWidgets.QWidget()
         layout_semaforo = QtWidgets.QVBoxLayout(tab14)
-        layout_semaforo.addWidget(canvas_semaforo)
+        layout_semaforo.addWidget(self._wrap_canvas_in_scroll(canvas_semaforo))
         self.graficos_tab_widget.addTab(tab14, "Semáforo")
         try:
             curr = self.progress_bar.value()
@@ -16030,7 +16067,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         escenarios_ctrls_layout.addStretch()
         
         layout_escenarios.addWidget(escenarios_ctrls)
-        layout_escenarios.addWidget(canvas_escenarios)
+        layout_escenarios.addWidget(self._wrap_canvas_in_scroll(canvas_escenarios))
         self.graficos_tab_widget.addTab(tab15, "Escenarios")
         try:
             curr = self.progress_bar.value()
@@ -16230,7 +16267,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         tab17 = QtWidgets.QWidget()
         layout_calendario = QtWidgets.QVBoxLayout(tab17)
-        layout_calendario.addWidget(canvas_calendario)
+        layout_calendario.addWidget(self._wrap_canvas_in_scroll(canvas_calendario))
         self.graficos_tab_widget.addTab(tab17, "Calendario")
         try:
             curr = self.progress_bar.value()

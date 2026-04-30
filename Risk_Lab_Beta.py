@@ -13887,12 +13887,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
         fig1 = Figure(figsize=(8, 5))
         canvas1 = InteractiveFigureCanvas(fig1)
         ax1 = fig1.add_subplot(111)
-        
-        # Histograma con estilo MercadoLibre
-        sns.histplot(perdidas_totales, bins=bins, kde=True, 
-                     color=MELI_AZUL, edgecolor='white', 
+
+        # Optimización: para N grande, sns.histplot con kde=True ejecuta
+        # gaussian_kde sobre todos los puntos (~350-400ms con N=100k).
+        # Computamos la KDE manualmente con subsample y la dibujamos encima
+        # del histograma. El histograma sigue usando todos los datos.
+        sns.histplot(perdidas_totales, bins=bins, kde=False,
+                     color=MELI_AZUL, edgecolor='white',
                      linewidth=0.5, alpha=0.85, ax=ax1)
-        
+        try:
+            HISTKDE_SUBSAMPLE = 10000
+            n_pt = len(perdidas_totales)
+            if n_pt > HISTKDE_SUBSAMPLE:
+                _sub = np.random.default_rng(42).choice(perdidas_totales, HISTKDE_SUBSAMPLE, replace=False)
+            else:
+                _sub = perdidas_totales
+            if len(_sub) > 1 and np.std(_sub) > 0:
+                _kde = stats.gaussian_kde(_sub)
+                _x_min = float(np.min(perdidas_totales))
+                _x_max = float(np.max(perdidas_totales))
+                if _x_max > _x_min:
+                    _x = np.linspace(_x_min, _x_max, 200)
+                    _y_density = _kde(_x)
+                    # Escalar densidad a counts (mismo eje que el histograma de sns.histplot)
+                    _bins_n = bins if isinstance(bins, int) else (len(bins) - 1)
+                    _bin_w = (_x_max - _x_min) / max(1, _bins_n)
+                    _y_counts = _y_density * n_pt * _bin_w
+                    ax1.plot(_x, _y_counts, color=MELI_AZUL_CORP if 'MELI_AZUL_CORP' in dir() else '#0F4C81',
+                             linewidth=1.2, alpha=0.85)
+        except Exception:
+            pass
+
         # Cálculo de estadísticas clave
         media = np.mean(perdidas_totales)
         mediana = np.median(perdidas_totales)
@@ -13938,9 +13963,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         # Configurar datos para tooltips interactivos
         # Crear una función de formato para los tooltips
+        # Optimización: ordenar UNA SOLA VEZ las pérdidas para evitar ordenar
+        # en cada hover (np.sort sobre 100k elementos costaba ~10ms por hover).
+        _perdidas_sorted = np.sort(perdidas_totales)
+        _perdidas_n = len(perdidas_totales)
         def formatter_distribucion(x, y):
-            percentil = np.searchsorted(np.sort(perdidas_totales), x)
-            percentil = min(100, max(0, int(percentil / len(perdidas_totales) * 100)))
+            percentil = np.searchsorted(_perdidas_sorted, x)
+            percentil = min(100, max(0, int(percentil / _perdidas_n * 100)))
             return f"Pérdida: {currency_format(x)}\nPercentil: ~{percentil}%\nFrecuencia: {int(y)}"
         
         # Extraer datos del histograma para tooltips
@@ -14020,11 +14049,31 @@ class RiskLabApp(QtWidgets.QMainWindow):
             canvas2 = InteractiveFigureCanvas(fig2)
             ax2 = fig2.add_subplot(111)
             
-            # Usar un tono más claro del azul para diferenciar del primer gráfico
-            sns.histplot(perdidas_totales_sin_cero, bins=bins, kde=True, 
-                         color=MELI_AZUL, edgecolor='white', 
+            # Optimización: misma técnica que Gráfico 1 (KDE custom con subsample)
+            sns.histplot(perdidas_totales_sin_cero, bins=bins, kde=False,
+                         color=MELI_AZUL, edgecolor='white',
                          linewidth=0.5, alpha=0.85, ax=ax2)
-            
+            try:
+                HISTKDE_SUBSAMPLE = 10000
+                _n = len(perdidas_totales_sin_cero)
+                if _n > HISTKDE_SUBSAMPLE:
+                    _sub = np.random.default_rng(42).choice(perdidas_totales_sin_cero, HISTKDE_SUBSAMPLE, replace=False)
+                else:
+                    _sub = perdidas_totales_sin_cero
+                if len(_sub) > 1 and np.std(_sub) > 0:
+                    _kde = stats.gaussian_kde(_sub)
+                    _xmin = float(np.min(perdidas_totales_sin_cero))
+                    _xmax = float(np.max(perdidas_totales_sin_cero))
+                    if _xmax > _xmin:
+                        _x = np.linspace(_xmin, _xmax, 200)
+                        _y_density = _kde(_x)
+                        _bins_n = bins if isinstance(bins, int) else (len(bins) - 1)
+                        _bin_w = (_xmax - _xmin) / max(1, _bins_n)
+                        _y_counts = _y_density * _n * _bin_w
+                        ax2.plot(_x, _y_counts, color='#0F4C81', linewidth=1.2, alpha=0.85)
+            except Exception:
+                pass
+
             # Calcular estadísticas
             media_sin_cero = np.mean(perdidas_totales_sin_cero)
             mediana_sin_cero = np.median(perdidas_totales_sin_cero)
@@ -14789,41 +14838,58 @@ class RiskLabApp(QtWidgets.QMainWindow):
             fig5 = Figure()
             canvas5 = InteractiveFigureCanvas(fig5)
             ax5 = fig5.add_subplot(111)
-            sns.scatterplot(x=frecuencias_totales + np.random.uniform(-0.2, 0.2, size=frecuencias_totales.size),
-                            y=perdidas_totales,
-                            alpha=0.5, s=20, ax=ax5, hue=frecuencias_totales, palette='viridis', legend=False)
+
+            # Optimización de rendimiento: subsamplear los puntos del scatter cuando
+            # N es grande. Visualmente la nube de dispersión converge con ~5000 puntos
+            # (los puntos extra solo aumentan saturación). La REGRESIÓN se calcula
+            # sobre el dataset completo para mantener precisión estadística.
+            SCATTER_SAMPLE_SIZE = 5000
+            n_total = frecuencias_totales.size
+            if n_total > SCATTER_SAMPLE_SIZE:
+                _rng_scatter = np.random.default_rng(42)
+                idx_sample = _rng_scatter.choice(n_total, SCATTER_SAMPLE_SIZE, replace=False)
+                freq_plot = frecuencias_totales[idx_sample]
+                perd_plot = perdidas_totales[idx_sample]
+            else:
+                freq_plot = frecuencias_totales
+                perd_plot = perdidas_totales
+
+            sns.scatterplot(x=freq_plot + np.random.uniform(-0.2, 0.2, size=freq_plot.size),
+                            y=perd_plot,
+                            alpha=0.5, s=20, ax=ax5, hue=freq_plot, palette='viridis', legend=False)
+            # Regresión sobre TODOS los datos (precisión completa)
             sns.regplot(x=frecuencias_totales, y=perdidas_totales, scatter=False, ax=ax5, color='red', line_kws={'linewidth':1})
             ax5.set_title('Dispersión de Frecuencia vs. Pérdida Total')
             ax5.set_xlabel('Frecuencia Total de Eventos')
             ax5.set_ylabel('Pérdida Total')
             ax5.yaxis.set_major_formatter(FuncFormatter(currency_formatter))
-            
+
             # Configurar tooltips para el gráfico de dispersión
             def formatter_dispersion(x, y):
                 return f"Eventos: {int(x)}\nPérdida: {currency_format(y)}"
-            
-            # Añadir tooltip para cada punto de datos (frecuencia, pérdida)
-            # Usamos los datos originales, no los jittered que se muestran visualmente
-            canvas5.add_tooltip_data(ax5, frecuencias_totales, perdidas_totales, formatter=formatter_dispersion)
-            
+
+            # Tooltips solo sobre los puntos efectivamente dibujados (subsample).
+            # Esto evita construir un KDTree con 100k puntos que no son visibles.
+            canvas5.add_tooltip_data(ax5, freq_plot, perd_plot, formatter=formatter_dispersion)
+
             # Añadir tooltip para la línea de regresión
             # Calcular algunos puntos a lo largo de la línea de regresión para mostrar tooltips
             x_min, x_max = min(frecuencias_totales), max(frecuencias_totales)
             x_points = np.linspace(x_min, x_max, 5)
-            
-            # Calcular los valores y correspondientes usando regresión lineal
+
+            # Calcular los valores y correspondientes usando regresión lineal (sobre todos los datos)
             z = np.polyfit(frecuencias_totales, perdidas_totales, 1)
             p = np.poly1d(z)
             y_points = p(x_points)
-            
+
             # Tooltip para la línea de tendencia
             def formatter_tendencia(x, y):
                 pendiente = z[0]
                 intercepto = z[1]
                 return f"Línea de tendencia\nPendiente: {currency_format(pendiente)} / evento\nValor proyectado: {currency_format(y)}"
-                
-            canvas5.add_tooltip_data(ax5, x_points, y_points, 
-                               formatter=formatter_tendencia, 
+
+            canvas5.add_tooltip_data(ax5, x_points, y_points,
+                               formatter=formatter_tendencia,
                                highlight_color='red')
 
             tab8 = QtWidgets.QWidget()
@@ -14842,54 +14908,73 @@ class RiskLabApp(QtWidgets.QMainWindow):
         canvas6 = InteractiveFigureCanvas(fig6)
         ax6 = fig6.add_subplot(111)
         datos_plot = False
+        # Optimización de rendimiento: cachear el KDE de cada evento UNA sola vez
+        # para reusarlo en los tooltips. Antes se llamaba a sns.kdeplot (que computa
+        # el KDE) y luego stats.gaussian_kde para los tooltips, duplicando el cómputo.
+        # Para 5 eventos con N=100k cada uno, el doble cómputo costaba ~7 segundos.
+        # Adicionalmente, si N es grande subsampleamos para acelerar el KDE
+        # (la forma de la distribución no cambia perceptiblemente con N>10k).
+        kde_cache = {}  # idx -> (x_vals, y_vals)
+        KDE_SUBSAMPLE_SIZE = 10000
+        _rng_kde = np.random.default_rng(42)
         for idx, perdidas_evento in enumerate(perdidas_por_evento):
             nombre_evento = eventos_riesgo[idx]['nombre']
             if np.std(perdidas_evento) > 0:
-                sns.kdeplot(perdidas_evento, label=nombre_evento, ax=ax6, bw_method='silverman')
-                datos_plot = True
+                if len(perdidas_evento) > KDE_SUBSAMPLE_SIZE:
+                    sub = _rng_kde.choice(perdidas_evento, KDE_SUBSAMPLE_SIZE, replace=False)
+                else:
+                    sub = perdidas_evento
+                try:
+                    kde = stats.gaussian_kde(sub, bw_method='silverman')
+                    x_min = float(np.min(perdidas_evento))
+                    x_max = float(np.max(perdidas_evento))
+                    if x_max > x_min:
+                        x_vals = np.linspace(x_min, x_max, 200)
+                        y_vals = kde(x_vals)
+                        ax6.plot(x_vals, y_vals, label=nombre_evento)
+                        kde_cache[idx] = (x_vals, y_vals)
+                        datos_plot = True
+                except Exception:
+                    # Fallback: usar sns.kdeplot directo (en caso de error con scipy)
+                    try:
+                        sns.kdeplot(sub, label=nombre_evento, ax=ax6, bw_method='silverman')
+                        datos_plot = True
+                    except Exception:
+                        pass
         if datos_plot:
             ax6.set_title('Comparación entre Eventos de Riesgo')
             ax6.set_xlabel('Pérdida')
             ax6.set_ylabel('Densidad')
             ax6.legend(fontsize=8)
             ax6.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
-            
+
             # Configurar tooltips para las distribuciones de pérdida por evento
-            # Para cada distribución, agregar tooltips en varios puntos clave
+            # Reutilizamos el KDE ya computado en la cache (kde_cache).
             for idx, perdidas_evento in enumerate(perdidas_por_evento):
                 nombre_evento = eventos_riesgo[idx]['nombre']
-                if np.std(perdidas_evento) > 0:
-                    # Calcular los principales estadísticos
-                    p25 = np.percentile(perdidas_evento, 25)
-                    p50 = np.percentile(perdidas_evento, 50)
-                    p75 = np.percentile(perdidas_evento, 75)
-                    p90 = np.percentile(perdidas_evento, 90)
-                    p95 = np.percentile(perdidas_evento, 95)
-                    mean_val = np.mean(perdidas_evento)
-                    
-                    # Crear puntos donde mostrar tooltips (25, 50, 75, 90, 95 percentiles)
-                    tooltip_points = [p25, p50, p75, p90, p95]
-                    
-                    # Obtener la densidad de KDE para cada valor (usando la curva que ya existe)
-                    try:
-                        x_vals = np.linspace(min(perdidas_evento), max(perdidas_evento), 1000)
-                        kde = stats.gaussian_kde(perdidas_evento, bw_method='silverman')
-                        y_vals = kde(x_vals)
-                        
-                        # Interpolar para obtener las alturas KDE en los puntos de interés
-                        y_points = np.interp(tooltip_points, x_vals, y_vals)
-                        
-                        # Crear los tooltips para los percentiles
-                        for i, (x, y, p) in enumerate(zip(tooltip_points, y_points, [25, 50, 75, 90, 95])):
-                            label = f"{nombre_evento}\nP{p}: {currency_format(x)}"
-                            canvas6.add_tooltip_data(ax6, [x], [y], labels=[label])
-                        
-                        # Tooltip especial para la media
-                        y_mean = np.interp(mean_val, x_vals, y_vals)
-                        label_mean = f"{nombre_evento}\nMedia: {currency_format(mean_val)}"
-                        canvas6.add_tooltip_data(ax6, [mean_val], [y_mean], labels=[label_mean])
-                    except Exception:
-                        pass
+                if idx not in kde_cache:
+                    continue
+                x_vals, y_vals = kde_cache[idx]
+                # Calcular los principales estadísticos
+                p25 = np.percentile(perdidas_evento, 25)
+                p50 = np.percentile(perdidas_evento, 50)
+                p75 = np.percentile(perdidas_evento, 75)
+                p90 = np.percentile(perdidas_evento, 90)
+                p95 = np.percentile(perdidas_evento, 95)
+                mean_val = np.mean(perdidas_evento)
+
+                tooltip_points = [p25, p50, p75, p90, p95]
+
+                # Interpolar contra el KDE cacheado
+                y_points = np.interp(tooltip_points, x_vals, y_vals)
+
+                for i, (x, y, p) in enumerate(zip(tooltip_points, y_points, [25, 50, 75, 90, 95])):
+                    label = f"{nombre_evento}\nP{p}: {currency_format(x)}"
+                    canvas6.add_tooltip_data(ax6, [x], [y], labels=[label])
+
+                y_mean = np.interp(mean_val, x_vals, y_vals)
+                label_mean = f"{nombre_evento}\nMedia: {currency_format(mean_val)}"
+                canvas6.add_tooltip_data(ax6, [mean_val], [y_mean], labels=[label_mean])
             tab9 = QtWidgets.QWidget()
             layout6 = QtWidgets.QVBoxLayout(tab9)
             layout6.addWidget(canvas6)

@@ -33,7 +33,11 @@ import uuid
 import copy
 
 # Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
-from log_odds_utils import aplicar_factor_a_probabilidad, ajustar_probabilidad_por_factores
+from log_odds_utils import (
+    aplicar_factor_a_probabilidad,
+    aplicar_factor_a_probabilidad_vec,
+    ajustar_probabilidad_por_factores,
+)
 
 # ---------------------------------------------------------------------------
 # Flag para silenciar prints debug en el hot loop de la simulación.
@@ -1931,6 +1935,100 @@ def _crear_seccion_escalamiento_ui(parent_layout, evento_data):
 
     return config, on_freq_changed
 
+# ---------------------------------------------------------------------------
+# Helper vectorizado para muestreo de frecuencias estocásticas.
+# Reemplaza ~5 bloques de loops Python con scipy.stats.*.rvs por simulación
+# por una sola llamada vectorizada de NumPy. Las distribuciones generadas son
+# las mismas (mismos parámetros). Verificación empírica: tests QA-2..QA-5.
+# ---------------------------------------------------------------------------
+def _samplear_frecuencia_estocastica_vec(evento, factores_subset, rng):
+    """Genera muestras de frecuencia para un evento con factores estocásticos,
+    vectorizando el muestreo de scipy.
+
+    Args:
+        evento: dict con freq_opcion y parámetros de la distribución.
+        factores_subset: np.ndarray de factores (uno por simulación a generar).
+            Para eventos con vínculos, ya viene 'sliced' por indices_a_simular.
+        rng: np.random.Generator o RandomState compartido con el resto de la sim.
+
+    Returns:
+        np.ndarray int32 con las muestras de frecuencia, o None si la
+        distribución (freq_opcion) no soporta vectorización (caller debe usar
+        dist_freq.rvs como fallback).
+    """
+    freq_opcion = evento.get('freq_opcion', 3)
+    n = factores_subset.size
+
+    if n == 0:
+        return np.zeros(0, dtype=np.int32)
+
+    if freq_opcion == 1:  # Poisson
+        tasa_original = evento.get('tasa', 1.0)
+        lambdas = np.maximum(tasa_original * factores_subset, 0.0001)
+        return rng.poisson(lam=lambdas).astype(np.int32)
+
+    if freq_opcion == 2:  # Binomial
+        prob_original = evento.get('prob_exito', 0.5)
+        n_trials = evento.get('num_eventos', 1)
+        probs_aj = aplicar_factor_a_probabilidad_vec(prob_original, factores_subset)
+        probs_aj = np.clip(probs_aj, 0.0001, 0.9999)
+        return rng.binomial(n=n_trials, p=probs_aj).astype(np.int32)
+
+    if freq_opcion == 3:  # Bernoulli
+        prob_original = evento.get('prob_exito', 0.5)
+        probs_aj = aplicar_factor_a_probabilidad_vec(prob_original, factores_subset)
+        probs_aj = np.clip(probs_aj, 0.0001, 0.9999)
+        return (rng.random(n) < probs_aj).astype(np.int32)
+
+    if freq_opcion == 4:  # Poisson-Gamma (Negative Binomial)
+        mas_prob = evento.get('pg_mas_probable', 1.0)
+        minimo = evento.get('pg_minimo', 0)
+        maximo = evento.get('pg_maximo', mas_prob * 2)
+
+        mus = np.maximum(mas_prob * factores_subset, 0.0001)
+        # Cálculo vectorizado equivalente al loop original
+        escalas = np.where(mas_prob > 0, mus / mas_prob, 1.0)
+        sigmas = (maximo - minimo) * escalas / 6.0
+        sigmas_safe = np.where(sigmas > 1e-3, sigmas, 1.0)
+        alphas = (mus / sigmas_safe) ** 2
+        betas = mus / (sigmas_safe ** 2)
+        ps = np.clip(betas / (betas + 1), 0.0001, 0.9999)
+        # Mismas validaciones que el loop original
+        valid = (sigmas > 1e-3) & (alphas > 0) & (alphas < 1e6) & (betas > 0)
+        # Usar valores safe en posiciones inválidas para evitar errores en numpy
+        alphas_safe = np.where(valid, alphas, 1.0)
+        ps_safe = np.where(valid, ps, 0.5)
+        nb_samples = rng.negative_binomial(alphas_safe, ps_safe)
+        # Fallback a Poisson cuando los parámetros no son válidos para NB
+        ps_samples = rng.poisson(mus)
+        return np.where(valid, nb_samples, ps_samples).astype(np.int32)
+
+    if freq_opcion == 5:  # Beta + Bernoulli
+        mas_prob = evento.get('beta_mas_probable', 50) / 100.0
+        minimo = evento.get('beta_minimo', 0) / 100.0
+        maximo = evento.get('beta_maximo', 100) / 100.0
+        sigma_original = (maximo - minimo) / 6.0
+
+        probs_aj = aplicar_factor_a_probabilidad_vec(mas_prob, factores_subset)
+        probs_aj = np.clip(probs_aj, 0.0001, 0.9999)
+
+        if sigma_original > 0:
+            alpha_beta_sum = probs_aj * (1 - probs_aj) / (sigma_original ** 2) - 1
+            alphas = probs_aj * alpha_beta_sum
+            betas = (1 - probs_aj) * alpha_beta_sum
+            valid = (alphas > 0) & (betas > 0)
+            alphas_safe = np.where(valid, alphas, 1.0)
+            betas_safe = np.where(valid, betas, 1.0)
+            p_sampled = rng.beta(alphas_safe, betas_safe)
+            p_final = np.where(valid, p_sampled, probs_aj)
+        else:
+            p_final = probs_aj
+        return (rng.random(n) < p_final).astype(np.int32)
+
+    # Distribución no soportada → caller debe usar dist_freq.rvs como fallback
+    return None
+
+
 # Funciones para generar la LDA y mostrar resultados
 def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden_eventos_ids=None, rng=None):
     _dbg(f"\n[DEBUG SIMULACION] ========================================")
@@ -2384,143 +2482,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     usa_estocastico = evento.get('_usa_estocastico', False)
                     
                     if usa_estocastico:
-                        # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
+                        # MODELO ESTOCÁSTICO: muestreo vectorizado
                         factores_vector = evento.get('_factores_vector')
-                        
-                        if freq_opcion == 1:  # Poisson
-                            tasa_original = evento.get('tasa', 1.0)
-                            # Aplicar factores a cada simulación
-                            tasas_ajustadas = tasa_original * factores_vector[indices_a_simular]
-                            tasas_ajustadas = np.maximum(tasas_ajustadas, 0.0001)  # Evitar λ=0
-                            
-                            # Generar muestras con tasas individuales
-                            muestras_frecuencia_simuladas = np.array([
-                                poisson.rvs(mu=lam, random_state=rng) for lam in tasas_ajustadas
-                            ], dtype=np.int32)
-                            
-                        elif freq_opcion == 3:  # Bernoulli
-                            prob_original = evento.get('prob_exito', 0.5)
-                            
-                            # Aplicar factores a cada simulación usando log-odds
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(prob_original, factor)
-                                for factor in factores_vector[indices_a_simular]
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            
-                            # Generar muestras con probabilidades individuales
-                            muestras_frecuencia_simuladas = np.array([
-                                bernoulli.rvs(p=p, random_state=rng) for p in probs_ajustadas
-                            ], dtype=np.int32)
-                        
-                        elif freq_opcion == 2:  # Binomial
-                            prob_original = evento.get('prob_exito', 0.5)
-                            n = evento.get('num_eventos', 1)
-                            
-                            # Aplicar factores usando log-odds
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(prob_original, factor)
-                                for factor in factores_vector[indices_a_simular]
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            
-                            # Generar muestras
-                            muestras_frecuencia_simuladas = np.array([
-                                binom.rvs(n=n, p=p, random_state=rng) for p in probs_ajustadas
-                            ], dtype=np.int32)
-                        
-                        elif freq_opcion == 4:  # Poisson-Gamma (Binomial Negativa)
-                            mas_probable_original = evento.get('pg_mas_probable', 1.0)
-                            
-                            # Aplicar factores multiplicativamente
-                            mus_ajustados = mas_probable_original * factores_vector[indices_a_simular]
-                            mus_ajustados = np.maximum(mus_ajustados, 0.0001)
-                            
-                            # Obtener parámetros
-                            minimo = evento.get('pg_minimo', 0)
-                            maximo = evento.get('pg_maximo', mas_probable_original * 2)
-                            
-                            muestras_lista = []
-                            for mu_ajustado in mus_ajustados:
-                                try:
-                                    escala = mu_ajustado / mas_probable_original if mas_probable_original > 0 else 1.0
-                                    minimo_ajustado = minimo * escala
-                                    maximo_ajustado = maximo * escala
-                                    
-                                    sigma = (maximo_ajustado - minimo_ajustado) / 6
-                                    if sigma > 0.001 and mu_ajustado > 0:  # Umbral mínimo para sigma
-                                        alpha = (mu_ajustado / sigma) ** 2
-                                        beta_param = mu_ajustado / (sigma ** 2)
-                                        
-                                        # Validar parámetros razonables para nbinom
-                                        if alpha > 0 and beta_param > 0 and alpha < 1e6:
-                                            p = beta_param / (beta_param + 1)
-                                            p = min(max(p, 0.0001), 0.9999)
-                                            muestra = nbinom.rvs(n=alpha, p=p, random_state=rng)
-                                        else:
-                                            # Fallback: usar Poisson simple con μ ajustado
-                                            muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                    elif mu_ajustado > 0:
-                                        # Fallback: usar Poisson simple cuando sigma es muy pequeño
-                                        muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                    else:
-                                        muestra = 0
-                                except:
-                                    # Fallback seguro en caso de cualquier error
-                                    muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng) if mu_ajustado > 0 else 0
-                                
-                                muestras_lista.append(muestra)
-                            
-                            muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
-                        
-                        elif freq_opcion == 5:  # Beta
-                            
-                            mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
-                            
-                            # Aplicar factores usando log-odds
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(mas_probable_original, factor)
-                                for factor in factores_vector[indices_a_simular]
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            
-                            # Obtener parámetros
-                            minimo = evento.get('beta_minimo', 0) / 100.0
-                            maximo = evento.get('beta_maximo', 100) / 100.0
-                            sigma_original = (maximo - minimo) / 6
-                            
-                            muestras_lista = []
-                            for prob_ajustada in probs_ajustadas:
-                                try:
-                                    if sigma_original > 0:
-                                        alpha_beta_sum = prob_ajustada * (1 - prob_ajustada) / (sigma_original ** 2) - 1
-                                        alpha = prob_ajustada * alpha_beta_sum
-                                        beta_param = (1 - prob_ajustada) * alpha_beta_sum
-                                        
-                                        if alpha > 0 and beta_param > 0:
-                                            p_sampled = beta.rvs(a=alpha, b=beta_param, random_state=rng)
-                                            muestra = bernoulli.rvs(p=p_sampled, random_state=rng)
-                                        else:
-                                            muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                    else:
-                                        muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                except:
-                                    muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                
-                                muestras_lista.append(muestra)
-                            
-                            muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
-                        
-                        else:
-                            # Fallback para distribuciones no soportadas
+                        muestras_frecuencia_simuladas = _samplear_frecuencia_estocastica_vec(
+                            evento, factores_vector[indices_a_simular], rng
+                        )
+                        if muestras_frecuencia_simuladas is None:
+                            # Distribución no soportada → fallback al modelo estático
                             _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
-                            muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
-                            muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
-                    
+                            muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng).astype(np.int32)
                     else:
                         # MODELO ESTÁTICO O SIN AJUSTES: Usar dist_freq normal
-                        muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
-                        muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
+                        muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng).astype(np.int32)
                     
                     # Manejar posibles valores infinitos o NaN
                     muestras_frecuencia_simuladas = np.nan_to_num(muestras_frecuencia_simuladas, nan=0, posinf=0, neginf=0)
@@ -2590,105 +2563,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         freq_opcion = evento.get('freq_opcion', 3)
                         
                         if usa_estocastico:
-                            # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
+                            # MODELO ESTOCÁSTICO: muestreo vectorizado
                             factores_vector = evento.get('_factores_vector')
-                            
-                            if freq_opcion == 1:  # Poisson
-                                tasa_original = evento.get('tasa', 1.0)
-                                tasas_ajustadas = tasa_original * factores_vector[indices_a_simular]
-                                tasas_ajustadas = np.maximum(tasas_ajustadas, 0.0001)
-                                muestras_frecuencia_simuladas = np.array([
-                                    poisson.rvs(mu=lam, random_state=rng) for lam in tasas_ajustadas
-                                ], dtype=np.int32)
-                            
-                            elif freq_opcion == 3:  # Bernoulli
-                                prob_original = evento.get('prob_exito', 0.5)
-                                probs_ajustadas = np.array([
-                                    aplicar_factor_a_probabilidad(prob_original, factor)
-                                    for factor in factores_vector[indices_a_simular]
-                                ])
-                                probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                                muestras_frecuencia_simuladas = np.array([
-                                    bernoulli.rvs(p=p, random_state=rng) for p in probs_ajustadas
-                                ], dtype=np.int32)
-                            
-                            elif freq_opcion == 2:  # Binomial
-                                prob_original = evento.get('prob_exito', 0.5)
-                                n = evento.get('num_eventos', 1)
-                                probs_ajustadas = np.array([
-                                    aplicar_factor_a_probabilidad(prob_original, factor)
-                                    for factor in factores_vector[indices_a_simular]
-                                ])
-                                probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                                muestras_frecuencia_simuladas = np.array([
-                                    binom.rvs(n=n, p=p, random_state=rng) for p in probs_ajustadas
-                                ], dtype=np.int32)
-                            
-                            elif freq_opcion == 4:  # Poisson-Gamma
-                                mas_probable_original = evento.get('pg_mas_probable', 1.0)
-                                mus_ajustados = mas_probable_original * factores_vector[indices_a_simular]
-                                mus_ajustados = np.maximum(mus_ajustados, 0.0001)
-                                minimo = evento.get('pg_minimo', 0)
-                                maximo = evento.get('pg_maximo', mas_probable_original * 2)
-                                muestras_lista = []
-                                for mu_ajustado in mus_ajustados:
-                                    try:
-                                        escala = mu_ajustado / mas_probable_original if mas_probable_original > 0 else 1.0
-                                        minimo_ajustado = minimo * escala
-                                        maximo_ajustado = maximo * escala
-                                        sigma = (maximo_ajustado - minimo_ajustado) / 6
-                                        if sigma > 0.001 and mu_ajustado > 0:  # Umbral mínimo para sigma
-                                            alpha = (mu_ajustado / sigma) ** 2
-                                            beta_param = mu_ajustado / (sigma ** 2)
-                                            if alpha > 0 and beta_param > 0 and alpha < 1e6:
-                                                p = beta_param / (beta_param + 1)
-                                                p = min(max(p, 0.0001), 0.9999)
-                                                muestra = nbinom.rvs(n=alpha, p=p, random_state=rng)
-                                            else:
-                                                muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                        elif mu_ajustado > 0:
-                                            muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                        else:
-                                            muestra = 0
-                                    except:
-                                        muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng) if mu_ajustado > 0 else 0
-                                    muestras_lista.append(muestra)
-                                muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
-                            
-                            elif freq_opcion == 5:  # Beta
-                                mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
-                                probs_ajustadas = np.array([
-                                    aplicar_factor_a_probabilidad(mas_probable_original, factor)
-                                    for factor in factores_vector[indices_a_simular]
-                                ])
-                                probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                                minimo = evento.get('beta_minimo', 0) / 100.0
-                                maximo = evento.get('beta_maximo', 100) / 100.0
-                                sigma_original = (maximo - minimo) / 6
-                                muestras_lista = []
-                                for prob_ajustada in probs_ajustadas:
-                                    try:
-                                        if sigma_original > 0:
-                                            alpha_beta_sum = prob_ajustada * (1 - prob_ajustada) / (sigma_original ** 2) - 1
-                                            alpha = prob_ajustada * alpha_beta_sum
-                                            beta_param = (1 - prob_ajustada) * alpha_beta_sum
-                                            if alpha > 0 and beta_param > 0:
-                                                p_sampled = beta.rvs(a=alpha, b=beta_param, random_state=rng)
-                                                muestra = bernoulli.rvs(p=p_sampled, random_state=rng)
-                                            else:
-                                                muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                        else:
-                                            muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                    except:
-                                        muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                    muestras_lista.append(muestra)
-                                muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
-                            
-                            else:
+                            muestras_frecuencia_simuladas = _samplear_frecuencia_estocastica_vec(
+                                evento, factores_vector[indices_a_simular], rng
+                            )
+                            if muestras_frecuencia_simuladas is None:
                                 _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
-                                muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
-                                muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
-                        
+                                muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng).astype(np.int32)
                         else:
                             # MODELO ESTÁTICO O SIN AJUSTES
                             muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
@@ -2736,105 +2618,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     freq_opcion = evento.get('freq_opcion', 3)
                     
                     if usa_estocastico:
-                        # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
+                        # MODELO ESTOCÁSTICO: muestreo vectorizado
                         factores_vector = evento.get('_factores_vector')
-                        
-                        if freq_opcion == 1:  # Poisson
-                            tasa_original = evento.get('tasa', 1.0)
-                            tasas_ajustadas = tasa_original * factores_vector
-                            tasas_ajustadas = np.maximum(tasas_ajustadas, 0.0001)
-                            muestras_frecuencia = np.array([
-                                poisson.rvs(mu=lam, random_state=rng) for lam in tasas_ajustadas
-                            ], dtype=np.int32)
-                        
-                        elif freq_opcion == 3:  # Bernoulli
-                            prob_original = evento.get('prob_exito', 0.5)
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(prob_original, factor)
-                                for factor in factores_vector
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            muestras_frecuencia = np.array([
-                                bernoulli.rvs(p=p, random_state=rng) for p in probs_ajustadas
-                            ], dtype=np.int32)
-                        
-                        elif freq_opcion == 2:  # Binomial
-                            prob_original = evento.get('prob_exito', 0.5)
-                            n = evento.get('num_eventos', 1)
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(prob_original, factor)
-                                for factor in factores_vector
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            muestras_frecuencia = np.array([
-                                binom.rvs(n=n, p=p, random_state=rng) for p in probs_ajustadas
-                            ], dtype=np.int32)
-                        
-                        elif freq_opcion == 4:  # Poisson-Gamma
-                            mas_probable_original = evento.get('pg_mas_probable', 1.0)
-                            mus_ajustados = mas_probable_original * factores_vector
-                            mus_ajustados = np.maximum(mus_ajustados, 0.0001)
-                            minimo = evento.get('pg_minimo', 0)
-                            maximo = evento.get('pg_maximo', mas_probable_original * 2)
-                            muestras_lista = []
-                            for mu_ajustado in mus_ajustados:
-                                try:
-                                    escala = mu_ajustado / mas_probable_original if mas_probable_original > 0 else 1.0
-                                    minimo_ajustado = minimo * escala
-                                    maximo_ajustado = maximo * escala
-                                    sigma = (maximo_ajustado - minimo_ajustado) / 6
-                                    if sigma > 0.001 and mu_ajustado > 0:  # Umbral mínimo para sigma
-                                        alpha = (mu_ajustado / sigma) ** 2
-                                        beta_param = mu_ajustado / (sigma ** 2)
-                                        if alpha > 0 and beta_param > 0 and alpha < 1e6:
-                                            p = beta_param / (beta_param + 1)
-                                            p = min(max(p, 0.0001), 0.9999)
-                                            muestra = nbinom.rvs(n=alpha, p=p, random_state=rng)
-                                        else:
-                                            muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                    elif mu_ajustado > 0:
-                                        muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                    else:
-                                        muestra = 0
-                                except:
-                                    muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng) if mu_ajustado > 0 else 0
-                                muestras_lista.append(muestra)
-                            muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
-                        
-                        elif freq_opcion == 5:  # Beta
-                            mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
-                            probs_ajustadas = np.array([
-                                aplicar_factor_a_probabilidad(mas_probable_original, factor)
-                                for factor in factores_vector
-                            ])
-                            probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                            minimo = evento.get('beta_minimo', 0) / 100.0
-                            maximo = evento.get('beta_maximo', 100) / 100.0
-                            sigma_original = (maximo - minimo) / 6
-                            muestras_lista = []
-                            for prob_ajustada in probs_ajustadas:
-                                try:
-                                    if sigma_original > 0:
-                                        alpha_beta_sum = prob_ajustada * (1 - prob_ajustada) / (sigma_original ** 2) - 1
-                                        alpha = prob_ajustada * alpha_beta_sum
-                                        beta_param = (1 - prob_ajustada) * alpha_beta_sum
-                                        if alpha > 0 and beta_param > 0:
-                                            p_sampled = beta.rvs(a=alpha, b=beta_param, random_state=rng)
-                                            muestra = bernoulli.rvs(p=p_sampled, random_state=rng)
-                                        else:
-                                            muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                    else:
-                                        muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                except:
-                                    muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                muestras_lista.append(muestra)
-                            muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
-                        
-                        else:
+                        muestras_frecuencia = _samplear_frecuencia_estocastica_vec(
+                            evento, factores_vector, rng
+                        )
+                        if muestras_frecuencia is None:
                             _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
-                            muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)
-                            muestras_frecuencia = muestras_frecuencia.astype(np.int32)
-                    
+                            muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng).astype(np.int32)
                     else:
                         # MODELO ESTÁTICO O SIN AJUSTES
                         muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)
@@ -2877,148 +2668,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 freq_opcion = evento.get('freq_opcion', 3)
                 
                 if usa_estocastico:
-                    # MODELO ESTOCÁSTICO: Aplicar factores vectorizados
+                    # MODELO ESTOCÁSTICO: muestreo vectorizado
                     factores_vector = evento.get('_factores_vector')
-                    
-                    if freq_opcion == 1:  # Poisson
-                        tasa_original = evento.get('tasa', 1.0)
-                        # Aplicar factores a cada simulación
-                        tasas_ajustadas = tasa_original * factores_vector
-                        tasas_ajustadas = np.maximum(tasas_ajustadas, 0.0001)  # Evitar λ=0
-                        
-                        # Generar muestras con tasas individuales
-                        muestras_frecuencia = np.array([
-                            poisson.rvs(mu=lam, random_state=rng) for lam in tasas_ajustadas
-                        ], dtype=np.int32)
-                        
-                    elif freq_opcion == 3:  # Bernoulli
-                        prob_original = evento.get('prob_exito', 0.5)
-                        
-                        # Aplicar factores a cada simulación usando log-odds
-                        probs_ajustadas = np.array([
-                            aplicar_factor_a_probabilidad(prob_original, factor)
-                            for factor in factores_vector
-                        ])
-                        probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                        
-                        # Generar muestras con probabilidades individuales
-                        muestras_frecuencia = np.array([
-                            bernoulli.rvs(p=p, random_state=rng) for p in probs_ajustadas
-                        ], dtype=np.int32)
-                    
-                    elif freq_opcion == 2:  # Binomial
-                        prob_original = evento.get('prob_exito', 0.5)
-                        n = evento.get('num_eventos', 1)
-                        
-                        # Aplicar factores usando log-odds
-                        probs_ajustadas = np.array([
-                            aplicar_factor_a_probabilidad(prob_original, factor)
-                            for factor in factores_vector
-                        ])
-                        probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                        
-                        # Generar muestras
-                        muestras_frecuencia = np.array([
-                            binom.rvs(n=n, p=p, random_state=rng) for p in probs_ajustadas
-                        ], dtype=np.int32)
-                    
-                    elif freq_opcion == 4:  # Poisson-Gamma (Binomial Negativa)
-                        mas_probable_original = evento.get('pg_mas_probable', 1.0)
-                        
-                        # Aplicar factores multiplicativamente al valor más probable (mu)
-                        mus_ajustados = mas_probable_original * factores_vector
-                        mus_ajustados = np.maximum(mus_ajustados, 0.0001)
-                        
-                        # Obtener parámetros de forma de la distribución
-                        minimo = evento.get('pg_minimo', 0)
-                        maximo = evento.get('pg_maximo', mas_probable_original * 2)
-                        
-                        # Calcular parámetros alpha y beta para cada mu ajustada
-                        # Usar aproximación PERT: mu ≈ (min + 4*mode + max)/6
-                        # sigma ≈ (max - min)/6
-                        muestras_lista = []
-                        for mu_ajustado in mus_ajustados:
-                            try:
-                                # Escalar min y max proporcionalmente
-                                escala = mu_ajustado / mas_probable_original if mas_probable_original > 0 else 1.0
-                                minimo_ajustado = minimo * escala
-                                maximo_ajustado = maximo * escala
-                                
-                                # Calcular parámetros de Binomial Negativa
-                                sigma = (maximo_ajustado - minimo_ajustado) / 6
-                                if sigma > 0.001 and mu_ajustado > 0:  # Umbral mínimo para sigma
-                                    alpha = (mu_ajustado / sigma) ** 2
-                                    beta_param = mu_ajustado / (sigma ** 2)
-                                    
-                                    if alpha > 0 and beta_param > 0 and alpha < 1e6:
-                                        p = beta_param / (beta_param + 1)
-                                        p = min(max(p, 0.0001), 0.9999)
-                                        muestra = nbinom.rvs(n=alpha, p=p, random_state=rng)
-                                    else:
-                                        # Fallback a Poisson simple
-                                        muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                elif mu_ajustado > 0:
-                                    # Fallback a Poisson simple cuando sigma es muy pequeño
-                                    muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng)
-                                else:
-                                    muestra = 0
-                            except:
-                                # Fallback seguro
-                                muestra = poisson.rvs(mu=max(mu_ajustado, 0.0001), random_state=rng) if mu_ajustado > 0 else 0
-                            
-                            muestras_lista.append(muestra)
-                        
-                        muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
-                    
-                    elif freq_opcion == 5:  # Beta
-                        
-                        # Beta genera probabilidades, luego se usa para eventos binarios
-                        mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
-                        
-                        # Aplicar factores usando log-odds a la probabilidad más probable
-                        probs_ajustadas = np.array([
-                            aplicar_factor_a_probabilidad(mas_probable_original, factor)
-                            for factor in factores_vector
-                        ])
-                        probs_ajustadas = np.clip(probs_ajustadas, 0.0001, 0.9999)
-                        
-                        # Obtener parámetros de forma
-                        minimo = evento.get('beta_minimo', 0) / 100.0
-                        maximo = evento.get('beta_maximo', 100) / 100.0
-                        sigma_original = (maximo - minimo) / 6
-                        
-                        # Generar eventos usando la distribución Beta ajustada
-                        muestras_lista = []
-                        for prob_ajustada in probs_ajustadas:
-                            try:
-                                # Recalcular alpha y beta manteniendo dispersión relativa
-                                if sigma_original > 0:
-                                    alpha_beta_sum = prob_ajustada * (1 - prob_ajustada) / (sigma_original ** 2) - 1
-                                    alpha = prob_ajustada * alpha_beta_sum
-                                    beta_param = (1 - prob_ajustada) * alpha_beta_sum
-                                    
-                                    if alpha > 0 and beta_param > 0:
-                                        # Samplear de Beta para obtener p, luego generar evento binario
-                                        p_sampled = beta.rvs(a=alpha, b=beta_param, random_state=rng)
-                                        muestra = bernoulli.rvs(p=p_sampled, random_state=rng)
-                                    else:
-                                        # Fallback a Bernoulli directo
-                                        muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                                else:
-                                    muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                            except:
-                                muestra = bernoulli.rvs(p=prob_ajustada, random_state=rng)
-                            
-                            muestras_lista.append(muestra)
-                        
-                        muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
-                    
-                    else:
-                        # Fallback para distribuciones no soportadas
+                    muestras_frecuencia = _samplear_frecuencia_estocastica_vec(
+                        evento, factores_vector, rng
+                    )
+                    if muestras_frecuencia is None:
                         _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
-                        muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)
-                        muestras_frecuencia = muestras_frecuencia.astype(np.int32)
-                
+                        muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng).astype(np.int32)
                 else:
                     # MODELO ESTÁTICO O SIN AJUSTES: Usar dist_freq normal
                     muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)

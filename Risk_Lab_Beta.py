@@ -1415,28 +1415,37 @@ def generar_distribucion_frecuencia(opcion, tasa=None, num_eventos_posibles=None
         raise e
 
 def ordenar_eventos_por_dependencia(eventos_riesgo):
-    id_a_evento = {evento['id']: evento for evento in eventos_riesgo}
+    """Topological sort de eventos respetando dependencias padre→hijo.
+
+    Optimización: complejidad reducida de O(N²) a O(N+E) precalculando un
+    mapa padre→[hijos] una sola vez en lugar de re-escanear toda la lista
+    de eventos por cada llamada de DFS.
+    """
+    ids_validos = {evento['id'] for evento in eventos_riesgo}
+    # Mapa padre_id -> [hijo_ids] (con deduplicación por padre)
+    hijos_map = {evento['id']: [] for evento in eventos_riesgo}
+    for ev in eventos_riesgo:
+        ev_id = ev['id']
+        if 'vinculos' in ev:
+            seen_padres = set()
+            for vinculo in ev['vinculos']:
+                padre_id = vinculo.get('id_padre')
+                if padre_id in hijos_map and padre_id not in seen_padres:
+                    hijos_map[padre_id].append(ev_id)
+                    seen_padres.add(padre_id)
+        elif 'eventos_padres' in ev:
+            seen_padres = set()
+            for padre_id in ev.get('eventos_padres', []):
+                if padre_id in hijos_map and padre_id not in seen_padres:
+                    hijos_map[padre_id].append(ev_id)
+                    seen_padres.add(padre_id)
+
     visitados = set()
     stack = []
 
     def dfs(evento_id):
         visitados.add(evento_id)
-        evento = id_a_evento[evento_id]
-
-        # Buscar los hijos (eventos que dependen de este)
-        hijos_ids = []
-        for ev in eventos_riesgo:
-            # Verificar en la nueva estructura de vínculos
-            if 'vinculos' in ev:
-                for vinculo in ev['vinculos']:
-                    if vinculo['id_padre'] == evento_id:
-                        hijos_ids.append(ev['id'])
-                        break
-            # Compatibilidad con formato antiguo
-            elif 'eventos_padres' in ev and evento_id in ev.get('eventos_padres', []):
-                hijos_ids.append(ev['id'])
-
-        for hijo_id in hijos_ids:
+        for hijo_id in hijos_map.get(evento_id, ()):
             if hijo_id not in visitados:
                 dfs(hijo_id)
         stack.append(evento_id)
@@ -11212,8 +11221,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if not eventos_activos_originales:
                 raise ValueError("Debe activar al menos un evento de riesgo para ejecutar la simulación.")
             
-            # Hacer copia profunda para evitar modificar el modelo de datos original
-            eventos_activos = copy.deepcopy(eventos_activos_originales)
+            # Hacer copia superficial para evitar modificar el modelo de datos original.
+            # Optimización: la deep copy completa era costosa para modelos con muchos eventos.
+            # La simulación NO muta listas internas (vinculos, factores_ajuste, sev_freq_tabla):
+            # solo lee de ellas y, en el caso de 'vinculos', se REASIGNA el atributo en la copia
+            # (evento['vinculos'] = vinculos_validos), lo cual con shallow copy ya no afecta
+            # al original. Las listas/dicts compartidos son tratados como inmutables por la sim.
+            eventos_activos = [{**e} for e in eventos_activos_originales]
             
             # Crear un set con los IDs de eventos activos para filtrar vínculos
             ids_eventos_activos = {e['id'] for e in eventos_activos}

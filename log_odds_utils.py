@@ -132,6 +132,46 @@ def ajustar_probabilidad_por_factores(
     return probabilidad_ajustada, explicacion
 
 
+def aplicar_factor_a_probabilidad_vec(probabilidad_base: float, factores_vector) -> np.ndarray:
+    """
+    Versión vectorizada de aplicar_factor_a_probabilidad. Aplica un vector de
+    factores multiplicativos a una misma probabilidad base, retornando un vector
+    de probabilidades ajustadas.
+
+    Algoritmo equivalente al escalar (verificado matemáticamente):
+      log_odds = log(p_base / (1 - p_base))
+      log_odds_ajustado = log_odds + (factor - 1)
+      prob_ajustada = sigmoid(log_odds_ajustado)
+      → clipeada a [0.0001, 0.9999]
+      → factor == 1 retorna probabilidad_base exacta
+      → factor <= 0 retorna 0.0001
+
+    Args:
+        probabilidad_base: Probabilidad inicial en (0, 1).
+        factores_vector: array-like de factores multiplicativos.
+
+    Returns:
+        np.ndarray de probabilidades ajustadas, mismo tamaño que factores_vector,
+        clipeadas a (0.0001, 0.9999).
+    """
+    f = np.asarray(factores_vector, dtype=np.float64)
+    if not (0 < probabilidad_base < 1):
+        return np.full_like(f, float(np.clip(probabilidad_base, 0.0001, 0.9999)))
+
+    log_odds_base = np.log(probabilidad_base / (1 - probabilidad_base))
+    log_odds = log_odds_base + (f - 1.0)
+    # Logística numéricamente estable
+    probs = np.where(
+        log_odds >= 0,
+        1.0 / (1.0 + np.exp(-log_odds)),
+        np.exp(log_odds) / (1.0 + np.exp(log_odds))
+    )
+    # Paridad exacta con la versión escalar para los casos especiales
+    probs = np.where(f == 1.0, probabilidad_base, probs)
+    probs = np.where(f <= 0, 0.0001, probs)
+    return np.clip(probs, 0.0001, 0.9999)
+
+
 def aplicar_factor_a_probabilidad(probabilidad_base: float, factor_multiplicativo: float) -> float:
     """
     Aplica un factor multiplicativo a una probabilidad usando log-odds.

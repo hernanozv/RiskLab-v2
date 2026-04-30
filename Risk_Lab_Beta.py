@@ -13719,8 +13719,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
             fig4 = Figure()
             canvas4 = FigureCanvas(fig4)
             ax4 = fig4.add_subplot(111)
-            bins = range(0, int(frecuencias_totales.max()) + 2)
-            sns.histplot(frecuencias_totales, bins=bins, color='#1f77b4', edgecolor='black', ax=ax4)
+            max_freq_pdf = int(frecuencias_totales.max())
+            # Optimización: cuando hay muchos valores únicos, sns.histplot con un bin
+            # por entero puede tardar varios segundos. Limitamos a ~100 bins máx.
+            if max_freq_pdf >= 200:
+                num_bins = min(100, max_freq_pdf + 1)
+                sns.histplot(frecuencias_totales, bins=num_bins,
+                             color='#1f77b4', edgecolor='black', ax=ax4)
+            else:
+                bins = range(0, max_freq_pdf + 2)
+                sns.histplot(frecuencias_totales, bins=bins,
+                             color='#1f77b4', edgecolor='black', ax=ax4)
             ax4.set_title('Histograma de Frecuencia de Eventos')
             ax4.set_xlabel('Número de Eventos')
             ax4.set_ylabel('Frecuencia')
@@ -14577,15 +14586,30 @@ class RiskLabApp(QtWidgets.QMainWindow):
             # Contar la frecuencia de cada número de eventos
             frecuencia_counts = np.bincount(frecuencias_totales.astype(int))
             x_values = np.arange(len(frecuencia_counts))
+            n_bins = len(frecuencia_counts)
 
-            # Usar la misma paleta de colores del gráfico de distribución (azul como base)
-            ax4.bar(x_values, frecuencia_counts, 
-                   color=MELI_AZUL, edgecolor='white',
-                   alpha=0.8, width=0.7)
-            
+            # Optimización de rendimiento: cuando hay muchos bins, ax.bar() crea miles
+            # de Rectangle patches y el render bloquea la UI varios segundos.
+            # Para n_bins >= 200 usamos fill_between (un único PathCollection),
+            # ~100-200x más rápido y visualmente equivalente a un histograma escalonado.
+            USE_FILL_THRESHOLD = 200
+            usar_modo_rapido = n_bins >= USE_FILL_THRESHOLD
+
+            if usar_modo_rapido:
+                # Render escalonado: 1 PathCollection en lugar de N patches.
+                ax4.fill_between(x_values, frecuencia_counts, step='mid',
+                                 color=MELI_AZUL, alpha=0.8, edgecolor='none')
+                ax4.plot(x_values, frecuencia_counts, color=MELI_AZUL,
+                         linewidth=0.8, drawstyle='steps-mid')
+            else:
+                # Histograma con barras (mejor estética para pocos bins)
+                ax4.bar(x_values, frecuencia_counts,
+                       color=MELI_AZUL, edgecolor='white',
+                       alpha=0.8, width=0.7)
+
             # Destacar la moda (valor más frecuente) con un color distinto
             idx_max = np.argmax(frecuencia_counts)
-            ax4.bar([idx_max], [frecuencia_counts[idx_max]], 
+            ax4.bar([idx_max], [frecuencia_counts[idx_max]],
                    color=MELI_ROJO, edgecolor='white',
                    alpha=1.0, width=0.7, zorder=10,
                    label=f'Moda: {int(x_values[idx_max])} eventos')
@@ -14643,14 +14667,23 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # x es el número de eventos, y es la frecuencia (cantidad de simulaciones)
                 porcentaje = (y / len(frecuencias_totales)) * 100
                 return f"Eventos: {int(x)}\nSimulaciones: {int(y)}\nPorcentaje: {porcentaje:.2f}%"
-            
-            # Añadir tooltips para cada barra del histograma
-            canvas4.add_tooltip_data(ax4, x_values, frecuencia_counts, formatter=formatter_frecuencia)
-            
+
+            # Optimización: en el modo rápido (muchos bins) NO agregamos un tooltip por
+            # cada bin (eso construye un KDTree con N puntos y satura memoria). En su
+            # lugar, samplemos los bins más representativos: top 50 por conteo + moda + media.
+            if usar_modo_rapido:
+                top_k = min(50, n_bins)
+                top_idx = np.argsort(frecuencia_counts)[-top_k:][::-1]
+                canvas4.add_tooltip_data(ax4, x_values[top_idx], frecuencia_counts[top_idx],
+                                         formatter=formatter_frecuencia)
+            else:
+                # Pocos bins: tooltip por cada barra (interactividad fina)
+                canvas4.add_tooltip_data(ax4, x_values, frecuencia_counts, formatter=formatter_frecuencia)
+
             # Añadir tooltip especial para la moda (valor más frecuente)
             moda_tooltip = f"Moda: {int(x_values[idx_max])} eventos\nSimulaciones: {frecuencia_counts[idx_max]}\nPorcentaje: {(frecuencia_counts[idx_max]/len(frecuencias_totales))*100:.2f}%"
             canvas4.add_tooltip_data(ax4, [idx_max], [frecuencia_counts[idx_max]], labels=[moda_tooltip], highlight_color=MELI_ROJO)
-            
+
             # Añadir tooltip para la media
             media_tooltip = f"Media: {media_freq:.2f} eventos"
             canvas4.add_tooltip_data(ax4, [media_freq], [0], labels=[media_tooltip], highlight_color=MELI_VERDE)

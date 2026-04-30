@@ -3781,12 +3781,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
             # Usar 92% del espacio disponible para dejar margen visual
             window_width = int(screen_width * 0.92)
             window_height = int(screen_height * 0.90)
-            
+
             # Tamaño mínimo adaptativo (menor en pantallas pequeñas)
             min_width = min(900, screen_width - 50)
             min_height = min(600, screen_height - 50)
             window_width = max(window_width, min_width)
             window_height = max(window_height, min_height)
+
+            # Imponer tamaño mínimo a nivel de ventana para que el usuario no
+            # pueda achicarla a un punto donde la UI deja de ser usable.
+            # Si la pantalla es muy pequeña, usar lo que haya disponible.
+            self.setMinimumSize(min_width, min_height)
             
             # NO establecer setMaximumSize - permite maximizar libremente
             
@@ -7086,16 +7091,28 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.agregar_animacion_hover_boton(simular_button)  # Animación hover
         botones_layout.addWidget(simular_button, 1, 1)
         
-        # Añadir el panel de botones al layout principal
-        layout.addWidget(botones_panel, current_row, 0, 1, 4)
-        layout.setRowStretch(current_row, 1)  # Peso menor para los botones
-        
+        # Añadir el panel de botones al layout principal del TAB (NO al scroll area).
+        # Esto garantiza que los botones de acción ("Editar", "Duplicar", "Eliminar",
+        # "Ejecutar Simulación") siempre estén visibles al pie de la pantalla,
+        # independientemente del scroll de la tabla de eventos.
+        # (Antes los botones eran scrolleables y desaparecían en pantallas pequeñas
+        #  cuando había muchos eventos.)
+
         # Estado inicial: botones deshabilitados (no hay selección)
         self.actualizar_estado_botones_eventos()
-        
+
         # Conectar el scroll area con el contenido y agregarlo al tab
         scroll_area.setWidget(content_widget)
-        tab_layout.addWidget(scroll_area)
+        tab_layout.addWidget(scroll_area, 1)  # stretch=1: el scroll ocupa el espacio disponible
+
+        # Panel de botones FIJO fuera del scroll area
+        botones_wrapper = QtWidgets.QWidget()
+        botones_wrapper.setStyleSheet("QWidget { background-color: #F5F7FA; }")
+        botones_wrapper_layout = QtWidgets.QVBoxLayout(botones_wrapper)
+        botones_wrapper_layout.setContentsMargins(8, 4, 8, 8)
+        botones_wrapper_layout.setSpacing(0)
+        botones_wrapper_layout.addWidget(botones_panel)
+        tab_layout.addWidget(botones_wrapper, 0)  # stretch=0: tamaño fijo
 
     def actualizar_estado_botones_eventos(self):
         """Actualiza el estado habilitado/deshabilitado de los botones según la selección en la tabla."""
@@ -11700,9 +11717,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 background-color: #F5F7FA;
             }
         """)
-        
-        # Usamos un QGridLayout como layout principal
-        layout = QtWidgets.QGridLayout(self.scenarios_tab)
+
+        # Layout principal del tab: scroll area arriba + botones fijos abajo.
+        # (Mismo patrón que setup_config_tab para garantizar que los botones
+        #  de acción siempre sean visibles aún con muchos escenarios.)
+        tab_layout = QtWidgets.QVBoxLayout(self.scenarios_tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+
+        scroll_area_sc = QtWidgets.QScrollArea()
+        scroll_area_sc.setWidgetResizable(True)
+        scroll_area_sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll_area_sc.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll_area_sc.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area_sc.setStyleSheet("QScrollArea { border: none; background-color: #F5F7FA; }")
+
+        content_widget_sc = QtWidgets.QWidget()
+        content_widget_sc.setStyleSheet("QWidget { background-color: #F5F7FA; }")
+
+        # Usamos un QGridLayout como layout del contenido
+        layout = QtWidgets.QGridLayout(content_widget_sc)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
         current_row = 0
@@ -11858,13 +11892,23 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.agregar_animacion_hover_boton(simular_button)  # Animación hover
         bottom_layout.addWidget(simular_button, 1, 1)
         
-        # Añadir panel inferior al layout principal
-        layout.addWidget(bottom_panel, current_row, 0, 1, 4)
-        layout.setRowStretch(current_row, 0)  # Sin stretch para que no se expandan los botones
-        
         # Estado inicial: botones deshabilitados (no hay selección)
         self.actualizar_estado_botones_escenarios()
-        
+
+        # Conectar el scroll area con el contenido y agregarlo al tab.
+        # El bottom_panel se agrega al tab_layout (NO al scroll), de modo que los
+        # botones siempre estén visibles al pie sin importar el scroll de la tabla.
+        scroll_area_sc.setWidget(content_widget_sc)
+        tab_layout.addWidget(scroll_area_sc, 1)  # stretch=1: ocupa el espacio disponible
+
+        bottom_wrapper_sc = QtWidgets.QWidget()
+        bottom_wrapper_sc.setStyleSheet("QWidget { background-color: #F5F7FA; }")
+        bottom_wrapper_layout_sc = QtWidgets.QVBoxLayout(bottom_wrapper_sc)
+        bottom_wrapper_layout_sc.setContentsMargins(10, 4, 10, 10)
+        bottom_wrapper_layout_sc.setSpacing(0)
+        bottom_wrapper_layout_sc.addWidget(bottom_panel)
+        tab_layout.addWidget(bottom_wrapper_sc, 0)  # stretch=0: tamaño fijo
+
         # La conexión doble clic ya fue configurada en la línea 3658
         # Evitamos la duplicación de la señal que causaba dos confirmaciones
 

@@ -32,6 +32,21 @@ import traceback
 import uuid
 import copy
 
+# Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
+from log_odds_utils import aplicar_factor_a_probabilidad, ajustar_probabilidad_por_factores
+
+# ---------------------------------------------------------------------------
+# Flag para silenciar prints debug en el hot loop de la simulación.
+# Por defecto False (rendimiento). Cambiar a True para diagnóstico.
+# Se respeta también la variable de entorno RISKLAB_DEBUG_SIM=1.
+# ---------------------------------------------------------------------------
+_DEBUG_SIM = os.environ.get('RISKLAB_DEBUG_SIM', '0') == '1'
+
+def _dbg(*args, **kwargs):
+    """Print condicional usado por la simulación. No-op cuando _DEBUG_SIM es False."""
+    if _DEBUG_SIM:
+        print(*args, **kwargs)
+
 
 # Clases personalizadas de SpinBox que ignoran el scroll del mouse
 class NoScrollSpinBox(QtWidgets.QSpinBox):
@@ -1918,11 +1933,11 @@ def _crear_seccion_escalamiento_ui(parent_layout, evento_data):
 
 # Funciones para generar la LDA y mostrar resultados
 def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden_eventos_ids=None, rng=None):
-    print(f"\n[DEBUG SIMULACION] ========================================")
-    print(f"[DEBUG SIMULACION] generar_lda_con_secuencialidad INICIANDO")
-    print(f"[DEBUG SIMULACION] Número de eventos recibidos: {len(eventos_riesgo)}")
-    print(f"[DEBUG SIMULACION] Número de simulaciones: {num_simulaciones}")
-    print(f"[DEBUG SIMULACION] ========================================\n")
+    _dbg(f"\n[DEBUG SIMULACION] ========================================")
+    _dbg(f"[DEBUG SIMULACION] generar_lda_con_secuencialidad INICIANDO")
+    _dbg(f"[DEBUG SIMULACION] Número de eventos recibidos: {len(eventos_riesgo)}")
+    _dbg(f"[DEBUG SIMULACION] Número de simulaciones: {num_simulaciones}")
+    _dbg(f"[DEBUG SIMULACION] ========================================\n")
     
     id_a_evento = {evento['id']: evento for evento in eventos_riesgo}
     id_a_index = {evento['id']: idx for idx, evento in enumerate(eventos_riesgo)}
@@ -1933,23 +1948,25 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
     frecuencias_por_evento = [np.zeros(num_simulaciones, dtype=np.int32) for _ in range(num_eventos)]
     
     # DEBUG: Inspeccionar TODOS los eventos
-    print(f"[DEBUG EVENTOS] Inspeccionando eventos recibidos:")
-    for i, e in enumerate(eventos_riesgo):
-        nombre = e.get('nombre', 'Sin nombre')
-        tiene_factores = 'factores_ajuste' in e
-        factores = e.get('factores_ajuste', [])
-        print(f"  [{i}] '{nombre}': tiene_factores={tiene_factores}, factores={factores}")
+    if _DEBUG_SIM:
+        print(f"[DEBUG EVENTOS] Inspeccionando eventos recibidos:")
+        for i, e in enumerate(eventos_riesgo):
+            nombre = e.get('nombre', 'Sin nombre')
+            tiene_factores = 'factores_ajuste' in e
+            factores = e.get('factores_ajuste', [])
+            print(f"  [{i}] '{nombre}': tiene_factores={tiene_factores}, factores={factores}")
     
     # DEBUG: Mostrar eventos con factores de ajuste
-    eventos_con_ajustes = [e for e in eventos_riesgo if e.get('factores_ajuste')]
-    if eventos_con_ajustes:
-        print(f"\n[DEBUG] === INICIO SIMULACIÓN ===")
-        print(f"[DEBUG] {len(eventos_con_ajustes)} evento(s) con factores de ajuste configurados:")
-        for e in eventos_con_ajustes:
-            factores = e.get('factores_ajuste', [])
-            activos = [f for f in factores if f.get('activo', True)]
-            print(f"  - '{e.get('nombre')}': {len(activos)}/{len(factores)} factores activos")
-        print(f"[DEBUG] ==========================\n")
+    if _DEBUG_SIM:
+        eventos_con_ajustes = [e for e in eventos_riesgo if e.get('factores_ajuste')]
+        if eventos_con_ajustes:
+            print(f"\n[DEBUG] === INICIO SIMULACIÓN ===")
+            print(f"[DEBUG] {len(eventos_con_ajustes)} evento(s) con factores de ajuste configurados:")
+            for e in eventos_con_ajustes:
+                factores = e.get('factores_ajuste', [])
+                activos = [f for f in factores if f.get('activo', True)]
+                print(f"  - '{e.get('nombre')}': {len(activos)}/{len(factores)} factores activos")
+            print(f"[DEBUG] ==========================\n")
 
     # Ordenar eventos para procesar padres antes que hijos
     if orden_eventos_ids is None:
@@ -1968,7 +1985,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         # ====================================================================
         if 'factores_ajuste' in evento and evento['factores_ajuste']:
             try:
-                from log_odds_utils import ajustar_probabilidad_por_factores
                 
                 # Verificar si hay al menos un factor activo
                 factores_activos = [f for f in evento['factores_ajuste'] if f.get('activo', True)]
@@ -1976,7 +1992,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 # DEBUG: Informar que se están aplicando ajustes
                 nombre_evento = evento.get('nombre', 'Sin nombre')
                 if factores_activos:
-                    print(f"[DEBUG] Aplicando {len(factores_activos)} factores activos a evento '{nombre_evento}'")
+                    _dbg(f"[DEBUG] Aplicando {len(factores_activos)} factores activos a evento '{nombre_evento}'")
                 
                 if factores_activos:
                     # Extraer información de la distribución de frecuencia
@@ -1989,7 +2005,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     
                     if tiene_estocasticos:
                         # ===== MODELO ESTOCÁSTICO: Generar vector de factores por simulación =====
-                        print(f"[DEBUG ESTOCASTICO] Evento '{nombre_evento}' tiene factores estocásticos")
+                        _dbg(f"[DEBUG ESTOCASTICO] Evento '{nombre_evento}' tiene factores estocásticos")
                         
                         # Generar vector de factores multiplicativos (uno por simulación)
                         factores_vector = np.ones(num_simulaciones)
@@ -2029,7 +2045,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 # DEBUG stats
                                 num_funciona = np.sum(funciona)
                                 pct_funciona = 100 * num_funciona / num_simulaciones
-                                print(f"[DEBUG ESTOCASTICO]   Factor '{f['nombre']}': {pct_funciona:.1f}% funciona "
+                                _dbg(f"[DEBUG ESTOCASTICO]   Factor '{f['nombre']}': {pct_funciona:.1f}% funciona "
                                       f"(esperado: {confiabilidad*100:.1f}%)")
                             
                             else:  # Estático (mezclado con estocásticos)
@@ -2058,7 +2074,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                             'tipo_deducible': tipo_ded,
                                             'limite_ocurrencia': lim_ocurr
                                         })
-                                        print(f"[DEBUG ESTOCASTICO]   Seguro '{f.get('nombre')}': Tipo={tipo_ded}, "
+                                        _dbg(f"[DEBUG ESTOCASTICO]   Seguro '{f.get('nombre')}': Tipo={tipo_ded}, "
                                               f"Ded=${ded_val:,.0f}, Cob={cob_val:.0f}%, Lím=${lim_val:,.0f}, LímOcurr=${lim_ocurr:,.0f}")
                                     else:
                                         impacto_sev = f.get('impacto_severidad_pct', 0)
@@ -2070,9 +2086,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         factores_vector = np.maximum(factores_vector, 0.01)
                         factores_severidad_vector = np.maximum(factores_severidad_vector, 0.01)
                         
-                        print(f"[DEBUG ESTOCASTICO]   Factor frecuencia: min={factores_vector.min():.4f}, "
+                        _dbg(f"[DEBUG ESTOCASTICO]   Factor frecuencia: min={factores_vector.min():.4f}, "
                               f"mean={factores_vector.mean():.4f}, max={factores_vector.max():.4f}")
-                        print(f"[DEBUG ESTOCASTICO]   Factor severidad: min={factores_severidad_vector.min():.4f}, "
+                        _dbg(f"[DEBUG ESTOCASTICO]   Factor severidad: min={factores_severidad_vector.min():.4f}, "
                               f"mean={factores_severidad_vector.mean():.4f}, max={factores_severidad_vector.max():.4f}")
                         
                         # Guardar vectores para usar al generar muestras
@@ -2115,7 +2131,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         'tipo_deducible': tipo_ded_s,
                                         'limite_ocurrencia': lim_ocurr_s
                                     })
-                                    print(f"[DEBUG]   Seguro '{f.get('nombre')}': Tipo={tipo_ded_s}, "
+                                    _dbg(f"[DEBUG]   Seguro '{f.get('nombre')}': Tipo={tipo_ded_s}, "
                                           f"Ded=${ded_val_s:,.0f}, Cob={cob_val_s:.0f}%, Lím=${lim_val_s:,.0f}, LímOcurr=${lim_ocurr_s:,.0f}")
                                 else:
                                     # Reducción porcentual
@@ -2128,9 +2144,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         factor_multiplicativo = max(factor_multiplicativo, 0.01)  # Mínimo 1% de la frecuencia original
                         factor_severidad = max(factor_severidad, 0.01)  # Mínimo 1% de la severidad original
                         
-                        print(f"[DEBUG]   Factor frecuencia: {factor_multiplicativo:.4f} ({(factor_multiplicativo-1)*100:+.1f}%)")
+                        _dbg(f"[DEBUG]   Factor frecuencia: {factor_multiplicativo:.4f} ({(factor_multiplicativo-1)*100:+.1f}%)")
                         if factor_severidad != 1.0:
-                            print(f"[DEBUG]   Factor severidad porcentual: {factor_severidad:.4f} ({(factor_severidad-1)*100:+.1f}%)")
+                            _dbg(f"[DEBUG]   Factor severidad porcentual: {factor_severidad:.4f} ({(factor_severidad-1)*100:+.1f}%)")
                         
                         evento['_usa_estocastico'] = False
                         # Guardar factor de severidad porcentual y seguros
@@ -2147,28 +2163,26 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 tasa_ajustada = tasa_original * factor_multiplicativo
                                 tasa_ajustada = max(tasa_ajustada, 0.0001)  # Evitar λ=0
                                 dist_freq = poisson(mu=tasa_ajustada)
-                                print(f"[DEBUG]   Poisson: λ {tasa_original:.4f} → {tasa_ajustada:.4f}")
+                                _dbg(f"[DEBUG]   Poisson: λ {tasa_original:.4f} → {tasa_ajustada:.4f}")
                         
                         elif freq_opcion == 2:  # Binomial (n, p)
                             prob_original = evento.get('prob_exito')
                             n = evento.get('num_eventos', 1)
                             if prob_original is not None and 0 < prob_original < 1:
                                 # Para probabilidades, usar log-odds
-                                from log_odds_utils import ajustar_probabilidad_por_factores
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, evento['factores_ajuste'])
                                 prob_ajustada = min(max(prob_ajustada, 0.0001), 0.9999)
                                 dist_freq = binom(n=n, p=prob_ajustada)
-                                print(f"[DEBUG]   Binomial: p {prob_original:.4f} → {prob_ajustada:.4f}")
+                                _dbg(f"[DEBUG]   Binomial: p {prob_original:.4f} → {prob_ajustada:.4f}")
                         
                         elif freq_opcion == 3:  # Bernoulli (p)
                             prob_original = evento.get('prob_exito')
                             if prob_original is not None and 0 < prob_original < 1:
                                 # Para probabilidades, usar log-odds
-                                from log_odds_utils import ajustar_probabilidad_por_factores
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, evento['factores_ajuste'])
                                 prob_ajustada = min(max(prob_ajustada, 0.0001), 0.9999)
                                 dist_freq = bernoulli(p=prob_ajustada)
-                                print(f"[DEBUG]   Bernoulli: p {prob_original:.4f} → {prob_ajustada:.4f}")
+                                _dbg(f"[DEBUG]   Bernoulli: p {prob_original:.4f} → {prob_ajustada:.4f}")
                         
                         elif freq_opcion == 4:  # Poisson-Gamma (distribución sobre λ)
                             # Ajustar el valor más probable (que representa la tasa esperada)
@@ -2197,17 +2211,17 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         beta = mu / (sigma ** 2)
                                         if alpha > 0 and beta > 0 and alpha < 1e6:
                                             dist_freq = nbinom(n=alpha, p=beta/(beta+1))
-                                            print(f"[DEBUG]   Poisson-Gamma: Valor más probable {mas_probable_original:.4f} → {mas_probable_ajustado:.4f}")
+                                            _dbg(f"[DEBUG]   Poisson-Gamma: Valor más probable {mas_probable_original:.4f} → {mas_probable_ajustado:.4f}")
                                         else:
                                             # Fallback a Poisson simple
                                             dist_freq = poisson(mu=max(mu, 0.0001))
-                                            print(f"[DEBUG]   Poisson-Gamma: parámetros extremos, usando Poisson(μ={mu:.4f})")
+                                            _dbg(f"[DEBUG]   Poisson-Gamma: parámetros extremos, usando Poisson(μ={mu:.4f})")
                                     else:
                                         # Fallback a Poisson simple si sigma es muy pequeño
                                         dist_freq = poisson(mu=max(mu, 0.0001))
-                                        print(f"[DEBUG]   Poisson-Gamma: sigma muy pequeño, usando Poisson(μ={mu:.4f})")
+                                        _dbg(f"[DEBUG]   Poisson-Gamma: sigma muy pequeño, usando Poisson(μ={mu:.4f})")
                                 except Exception as e:
-                                    print(f"[DEBUG]   Poisson-Gamma: Error ({e}), usando original")
+                                    _dbg(f"[DEBUG]   Poisson-Gamma: Error ({e}), usando original")
                         
                         elif freq_opcion == 5:  # Beta (distribución sobre p)
                             # El valor más probable representa una probabilidad
@@ -2216,7 +2230,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 prob_original = mas_probable_original / 100.0
                                 if 0 < prob_original < 1:
                                     # Para probabilidades, usar log-odds
-                                    from log_odds_utils import ajustar_probabilidad_por_factores
                                     prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, evento['factores_ajuste'])
                                     prob_ajustada = min(max(prob_ajustada, 0.0001), 0.9999)
                                     
@@ -2237,12 +2250,12 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                             # Usar Beta para generar p, luego Bernoulli
                                             # En simulación, samplear de Beta y luego usar ese p
                                             dist_freq = beta(a=alpha_ajustado, b=beta_ajustado)
-                                            print(f"[DEBUG]   Beta: p más probable {prob_original:.4f} → {prob_ajustada:.4f}")
+                                            _dbg(f"[DEBUG]   Beta: p más probable {prob_original:.4f} → {prob_ajustada:.4f}")
                                         else:
-                                            print(f"[DEBUG]   Beta: Parámetros inválidos, usando Bernoulli simple")
+                                            _dbg(f"[DEBUG]   Beta: Parámetros inválidos, usando Bernoulli simple")
                                             dist_freq = bernoulli(p=prob_ajustada)
                                     except:
-                                        print(f"[DEBUG]   Beta: Error en cálculo, usando Bernoulli simple")
+                                        _dbg(f"[DEBUG]   Beta: Error en cálculo, usando Bernoulli simple")
                                         dist_freq = bernoulli(p=prob_ajustada)
             
             except ImportError:
@@ -2287,7 +2300,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 umbral = max(0, vinculo.get('umbral_severidad', 0))
 
                 if id_padre not in id_a_index:
-                    print(f"[DEBUG] Vínculo ignorado: id_padre {id_padre} no encontrado en id_a_index")
+                    _dbg(f"[DEBUG] Vínculo ignorado: id_padre {id_padre} no encontrado en id_a_index")
                     continue
 
                 padre_idx = id_a_index[id_padre]
@@ -2325,7 +2338,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     tiene_excluye = True
                     condicion_excluye = condicion_excluye & ~vinculo_activo
                 else:
-                    print(f"[DEBUG] Tipo de vínculo no reconocido: '{tipo}', ignorando")
+                    _dbg(f"[DEBUG] Tipo de vínculo no reconocido: '{tipo}', ignorando")
 
             # Combinar condiciones según los tipos presentes
             condicion_final = np.ones(num_simulaciones, dtype=bool)
@@ -2382,7 +2395,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             ], dtype=np.int32)
                             
                         elif freq_opcion == 3:  # Bernoulli
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             prob_original = evento.get('prob_exito', 0.5)
                             
                             # Aplicar factores a cada simulación usando log-odds
@@ -2398,7 +2410,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             ], dtype=np.int32)
                         
                         elif freq_opcion == 2:  # Binomial
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             prob_original = evento.get('prob_exito', 0.5)
                             n = evento.get('num_eventos', 1)
                             
@@ -2459,7 +2470,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
                         
                         elif freq_opcion == 5:  # Beta
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             
                             mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
                             
@@ -2499,7 +2509,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         
                         else:
                             # Fallback para distribuciones no soportadas
-                            print(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
+                            _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
                             muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
                             muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
                     
@@ -2588,7 +2598,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 ], dtype=np.int32)
                             
                             elif freq_opcion == 3:  # Bernoulli
-                                from log_odds_utils import aplicar_factor_a_probabilidad
                                 prob_original = evento.get('prob_exito', 0.5)
                                 probs_ajustadas = np.array([
                                     aplicar_factor_a_probabilidad(prob_original, factor)
@@ -2600,7 +2609,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 ], dtype=np.int32)
                             
                             elif freq_opcion == 2:  # Binomial
-                                from log_odds_utils import aplicar_factor_a_probabilidad
                                 prob_original = evento.get('prob_exito', 0.5)
                                 n = evento.get('num_eventos', 1)
                                 probs_ajustadas = np.array([
@@ -2644,7 +2652,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
                             
                             elif freq_opcion == 5:  # Beta
-                                from log_odds_utils import aplicar_factor_a_probabilidad
                                 mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
                                 probs_ajustadas = np.array([
                                     aplicar_factor_a_probabilidad(mas_probable_original, factor)
@@ -2674,7 +2681,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 muestras_frecuencia_simuladas = np.array(muestras_lista, dtype=np.int32)
                             
                             else:
-                                print(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
+                                _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
                                 muestras_frecuencia_simuladas = dist_freq.rvs(size=len(indices_a_simular), random_state=rng)
                                 muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
                         
@@ -2737,7 +2744,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             ], dtype=np.int32)
                         
                         elif freq_opcion == 3:  # Bernoulli
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             prob_original = evento.get('prob_exito', 0.5)
                             probs_ajustadas = np.array([
                                 aplicar_factor_a_probabilidad(prob_original, factor)
@@ -2749,7 +2755,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             ], dtype=np.int32)
                         
                         elif freq_opcion == 2:  # Binomial
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             prob_original = evento.get('prob_exito', 0.5)
                             n = evento.get('num_eventos', 1)
                             probs_ajustadas = np.array([
@@ -2793,7 +2798,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
                         
                         elif freq_opcion == 5:  # Beta
-                            from log_odds_utils import aplicar_factor_a_probabilidad
                             mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
                             probs_ajustadas = np.array([
                                 aplicar_factor_a_probabilidad(mas_probable_original, factor)
@@ -2823,7 +2827,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
                         
                         else:
-                            print(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
+                            _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
                             muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)
                             muestras_frecuencia = muestras_frecuencia.astype(np.int32)
                     
@@ -2884,7 +2888,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         ], dtype=np.int32)
                         
                     elif freq_opcion == 3:  # Bernoulli
-                        from log_odds_utils import aplicar_factor_a_probabilidad
                         prob_original = evento.get('prob_exito', 0.5)
                         
                         # Aplicar factores a cada simulación usando log-odds
@@ -2900,7 +2903,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         ], dtype=np.int32)
                     
                     elif freq_opcion == 2:  # Binomial
-                        from log_odds_utils import aplicar_factor_a_probabilidad
                         prob_original = evento.get('prob_exito', 0.5)
                         n = evento.get('num_eventos', 1)
                         
@@ -2965,7 +2967,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         muestras_frecuencia = np.array(muestras_lista, dtype=np.int32)
                     
                     elif freq_opcion == 5:  # Beta
-                        from log_odds_utils import aplicar_factor_a_probabilidad
                         
                         # Beta genera probabilidades, luego se usa para eventos binarios
                         mas_probable_original = evento.get('beta_mas_probable', 50) / 100.0
@@ -3010,7 +3011,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     
                     else:
                         # Fallback para distribuciones no soportadas
-                        print(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
+                        _dbg(f"[ADVERTENCIA] Distribución freq_opcion={freq_opcion} no soporta factores estocásticos. Usando modelo estático.")
                         muestras_frecuencia = dist_freq.rvs(size=num_simulaciones, random_state=rng)
                         muestras_frecuencia = muestras_frecuencia.astype(np.int32)
                 
@@ -3164,7 +3165,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         total_perdidas_del_evento_concatenadas *= _multiplicadores
                         _media_despues = total_perdidas_del_evento_concatenadas.mean()
                         nombre_evento = evento.get('nombre', evento_id)
-                        print(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Reincidencia ({tipo_esc}) aplicado "
+                        _dbg(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Reincidencia ({tipo_esc}) aplicado "
                               f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
                               f"mult rango: {_multiplicadores.min():.2f}-{_multiplicadores.max():.2f})")
                     
@@ -3191,7 +3192,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         total_perdidas_del_evento_concatenadas *= _factores_por_perdida
                         _media_despues = total_perdidas_del_evento_concatenadas.mean()
                         nombre_evento = evento.get('nombre', evento_id)
-                        print(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Sistémico (alpha={alpha}) aplicado "
+                        _dbg(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Sistémico (alpha={alpha}) aplicado "
                               f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
                               f"factor rango: {sev_freq_factor[_indices_pos].min():.3f}-{sev_freq_factor[_indices_pos].max():.3f})")
                 
@@ -3205,13 +3206,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     frecuencias_en_esas_simulaciones_v = final_event_frequencies[indices_con_ocurrencias_v]
                     factores_por_perdida_v = np.repeat(factor_sev_vinculos[indices_con_ocurrencias_v], frecuencias_en_esas_simulaciones_v)
                     perdidas_antes_vinculos = total_perdidas_del_evento_concatenadas.mean()
-                    total_perdidas_del_evento_concatenadas = total_perdidas_del_evento_concatenadas * factores_por_perdida_v
+                    total_perdidas_del_evento_concatenadas *= factores_por_perdida_v
                     perdidas_despues_vinculos = total_perdidas_del_evento_concatenadas.mean()
                     factor_min_v = factores_por_perdida_v.min()
                     factor_max_v = factores_por_perdida_v.max()
                     factor_med_v = factores_por_perdida_v.mean()
                     nombre_evento = evento.get('nombre', evento_id)
-                    print(f"[DEBUG SEVERIDAD VINCULOS] Evento '{nombre_evento}': factor severidad vínculos aplicado "
+                    _dbg(f"[DEBUG SEVERIDAD VINCULOS] Evento '{nombre_evento}': factor severidad vínculos aplicado "
                           f"(media: ${perdidas_antes_vinculos:,.0f} → ${perdidas_despues_vinculos:,.0f}, "
                           f"factor rango: {factor_min_v:.2f}x - {factor_max_v:.2f}x, media: {factor_med_v:.2f}x)")
 
@@ -3229,20 +3230,20 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # Repetir el factor de cada simulación por el número de ocurrencias en esa simulación
                         factores_por_perdida = np.repeat(factores_sev_vector[indices_con_ocurrencias], frecuencias_en_esas_simulaciones)
                         perdidas_antes_factor = total_perdidas_del_evento_concatenadas.mean()
-                        total_perdidas_del_evento_concatenadas = total_perdidas_del_evento_concatenadas * factores_por_perdida
+                        total_perdidas_del_evento_concatenadas *= factores_por_perdida
                         perdidas_despues_factor = total_perdidas_del_evento_concatenadas.mean()
                         nombre_evento = evento.get('nombre', evento_id)
-                        print(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estocástico aplicado a pérdidas individuales "
+                        _dbg(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estocástico aplicado a pérdidas individuales "
                               f"(media: ${perdidas_antes_factor:,.0f} → ${perdidas_despues_factor:,.0f})")
                 else:
                     # Modelo estático: aplicar factor único a todas las pérdidas
                     factor_sev_estatico = evento.get('_factor_severidad_estatico', 1.0)
                     if factor_sev_estatico != 1.0:
                         perdidas_antes_factor = total_perdidas_del_evento_concatenadas.mean()
-                        total_perdidas_del_evento_concatenadas = total_perdidas_del_evento_concatenadas * factor_sev_estatico
+                        total_perdidas_del_evento_concatenadas *= factor_sev_estatico
                         perdidas_despues_factor = total_perdidas_del_evento_concatenadas.mean()
                         nombre_evento = evento.get('nombre', evento_id)
-                        print(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estático {factor_sev_estatico:.4f} aplicado a pérdidas individuales "
+                        _dbg(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estático {factor_sev_estatico:.4f} aplicado a pérdidas individuales "
                               f"(media: ${perdidas_antes_factor:,.0f} → ${perdidas_despues_factor:,.0f})")
                 
                 # =====================================================
@@ -3269,17 +3270,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         pago_seguro = np.minimum(pago_seguro, limite_ocurr)
                     
                     # Guardar info para aplicar límite agregado después de sumar por simulación
+                    # (Optimización: se eliminó la copia de 'pago_por_ocurrencia' porque solo
+                    # se lee 'limite_agregado' más adelante.)
                     info_seguros_ocurrencia.append({
                         'seguro': seguro,
-                        'pago_por_ocurrencia': pago_seguro.copy(),
                         'limite_agregado': limite_agregado
                     })
-                    
+
                     # Acumular pagos (se restará después de verificar límite agregado)
                     pagos_seguro_por_ocurrencia += pago_seguro
                     
                     nombre_evento = evento.get('nombre', evento_id)
-                    print(f"[DEBUG SEGURO POR OCURRENCIA] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
+                    _dbg(f"[DEBUG SEGURO POR OCURRENCIA] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
                           f"(Ded=${deducible:,.0f}/ocurr, Cob={cobertura_pct*100:.0f}%, LímOcurr=${limite_ocurr:,.0f}, LímAnual=${limite_agregado:,.0f})")
 
                 # Asignar pérdidas BRUTAS a las simulaciones (sin restar seguro aún)
@@ -3315,16 +3317,16 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             num_excedidas = np.sum(exceso_sobre_limite > 0)
                             if num_excedidas > 0:
                                 nombre_evento = evento.get('nombre', evento_id)
-                                print(f"[DEBUG SEGURO POR OCURRENCIA]   Límite agregado ${limite_agregado:,.0f}/año aplicado en {num_excedidas} simulaciones")
+                                _dbg(f"[DEBUG SEGURO POR OCURRENCIA]   Límite agregado ${limite_agregado:,.0f}/año aplicado en {num_excedidas} simulaciones")
                     
                     # Pérdidas netas = brutas - pago del seguro (respetando límite agregado)
                     perdidas_para_este_evento = perdidas_brutas_por_sim - pagos_seguro_por_sim
-                    perdidas_para_este_evento = np.maximum(perdidas_para_este_evento, 0)
+                    np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)
                     
                     # Debug
                     if len(seguros_por_ocurrencia) > 0:
                         nombre_evento = evento.get('nombre', evento_id)
-                        print(f"[DEBUG SEGURO POR OCURRENCIA]   Pérdida media anual: ${perdidas_brutas_por_sim.mean():,.0f} → ${perdidas_para_este_evento.mean():,.0f} "
+                        _dbg(f"[DEBUG SEGURO POR OCURRENCIA]   Pérdida media anual: ${perdidas_brutas_por_sim.mean():,.0f} → ${perdidas_para_este_evento.mean():,.0f} "
                               f"(Pago medio seguro: ${pagos_seguro_por_sim.mean():,.0f})")
                 else:
                     perdidas_para_este_evento = np.zeros(num_simulaciones)
@@ -3342,8 +3344,8 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
         if perdidas_para_este_evento is None:
             perdidas_para_este_evento = np.zeros(num_simulaciones)
-        
-        perdidas_para_este_evento = np.clip(perdidas_para_este_evento, 0, 1e12)
+
+        np.clip(perdidas_para_este_evento, 0, 1e12, out=perdidas_para_este_evento)
         
         # =====================================================
         # NOTA: El factor de severidad ya se aplicó a las pérdidas
@@ -3372,14 +3374,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
             
             # Restar el pago del seguro de las pérdidas agregadas
             perdidas_antes = perdidas_para_este_evento.mean()
-            perdidas_para_este_evento = perdidas_para_este_evento - pago_seguro
-            perdidas_para_este_evento = np.maximum(perdidas_para_este_evento, 0)  # No puede ser negativa
+            perdidas_para_este_evento -= pago_seguro
+            np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)  # No puede ser negativa
             perdidas_despues = perdidas_para_este_evento.mean()
             
             nombre_evento = evento.get('nombre', evento_id)
-            print(f"[DEBUG SEGURO AGREGADO] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
+            _dbg(f"[DEBUG SEGURO AGREGADO] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
                   f"(Ded=${deducible:,.0f}/año, Cob={cobertura_pct*100:.0f}%, Lím=${limite:,.0f}/año)")
-            print(f"[DEBUG SEGURO AGREGADO]   Pérdida media anual: ${perdidas_antes:,.0f} → ${perdidas_despues:,.0f} "
+            _dbg(f"[DEBUG SEGURO AGREGADO]   Pérdida media anual: ${perdidas_antes:,.0f} → ${perdidas_despues:,.0f} "
                   f"(Pago medio seguro: ${pago_seguro.mean():,.0f})")
         
         perdidas_por_evento[idx] = perdidas_para_este_evento
@@ -3425,17 +3427,18 @@ class SimulacionThread(QThread):
 
     def __init__(self, eventos_riesgo, num_simulaciones, generar_reporte=False, pdf_filename=None):
         super().__init__()
-        
-        # DEBUG: Verificar eventos recibidos en el thread
-        print(f"\n[DEBUG THREAD INIT] ========================================")
-        print(f"[DEBUG THREAD INIT] SimulacionThread.__init__ recibió {len(eventos_riesgo)} eventos")
-        for i, e in enumerate(eventos_riesgo):
-            nombre = e.get('nombre', 'Sin nombre')
-            tiene_factores = 'factores_ajuste' in e
-            factores = e.get('factores_ajuste', [])
-            print(f"[DEBUG THREAD INIT]   [{i}] '{nombre}': tiene_factores={tiene_factores}, factores={factores}")
-        print(f"[DEBUG THREAD INIT] ========================================\n")
-        
+
+        # DEBUG: Verificar eventos recibidos en el thread (gated por _DEBUG_SIM)
+        if _DEBUG_SIM:
+            print(f"\n[DEBUG THREAD INIT] ========================================")
+            print(f"[DEBUG THREAD INIT] SimulacionThread.__init__ recibió {len(eventos_riesgo)} eventos")
+            for i, e in enumerate(eventos_riesgo):
+                nombre = e.get('nombre', 'Sin nombre')
+                tiene_factores = 'factores_ajuste' in e
+                factores = e.get('factores_ajuste', [])
+                print(f"[DEBUG THREAD INIT]   [{i}] '{nombre}': tiene_factores={tiene_factores}, factores={factores}")
+            print(f"[DEBUG THREAD INIT] ========================================\n")
+
         self.eventos_riesgo = eventos_riesgo
         self.num_simulaciones = num_simulaciones
         self.generar_reporte = generar_reporte
@@ -9615,7 +9618,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         try:
                             prob_original = float(prob_text)
                             if 0 < prob_original < 1:
-                                from log_odds_utils import ajustar_probabilidad_por_factores
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, factores_ajuste_existentes)
                                 cambio_pct = ((prob_ajustada / prob_original) - 1) * 100
                                 prob_ajustada_label.setText(
@@ -9632,7 +9634,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         try:
                             prob_original = float(prob_text)
                             if 0 < prob_original < 1:
-                                from log_odds_utils import ajustar_probabilidad_por_factores
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, factores_ajuste_existentes)
                                 cambio_pct = ((prob_ajustada / prob_original) - 1) * 100
                                 prob_ajustada_label.setText(
@@ -9666,7 +9667,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             mas_prob_original = float(mas_prob_text)
                             prob_original = mas_prob_original / 100.0
                             if 0 < prob_original < 1:
-                                from log_odds_utils import ajustar_probabilidad_por_factores
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, factores_ajuste_existentes)
                                 mas_prob_ajustado = prob_ajustada * 100
                                 cambio_pct = ((prob_ajustada / prob_original) - 1) * 100
@@ -11846,7 +11846,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if len(frecuencias_totales) > 0:
             try:
                 if max_freq_total <= 100000:
-                    mode_freq_total = int(np.argmax(np.bincount(frecuencias_totales.astype(np.int32))))
+                    mode_freq_total = int(np.argmax(np.bincount(frecuencias_totales)))
                 else:
                     mode_freq_total = int(stats.mode(frecuencias_totales, keepdims=True).mode[0])
             except Exception:
@@ -11869,8 +11869,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
             lambda x: ('{:.2f}'.format(x).replace('.', ',')) if x != int(x) else ('{:.0f}'.format(x)))
 
         # Obtener resumen ejecutivo
-        var_90 = np.percentile(perdidas_totales, 90)
-        opvar_99 = np.percentile(perdidas_totales, 99)
+        # Optimización: reutilizar valores ya computados en `percentiles` en lugar de
+        # llamar a np.percentile dos veces más (90 y 99 ya están en percentiles_valores).
+        var_90 = float(percentiles[percentiles_valores.index(90)])
+        opvar_99 = float(percentiles[percentiles_valores.index(99)])
         opvar = perdidas_totales[perdidas_totales >= opvar_99].mean()
         texto_resultados += obtener_resumen_ejecutivo_texto(media, desviacion_estandar, var_90, opvar_99, opvar,
                                                             min_freq_total, mode_freq_total, max_freq_total)
@@ -11893,7 +11895,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if len(frecuencias_evento) > 0:
                 try:
                     if max_freq <= 100000:
-                        mode_freq = int(np.argmax(np.bincount(frecuencias_evento.astype(np.int32))))
+                        mode_freq = int(np.argmax(np.bincount(frecuencias_evento)))
                     else:
                         mode_freq = int(stats.mode(frecuencias_evento, keepdims=True).mode[0])
                 except Exception:
@@ -11910,7 +11912,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 lambda x: ('{:.2f}'.format(x).replace('.', ',')) if x != int(x) else ('{:.0f}'.format(x)))
 
             # Obtenemos el percentil 90 del impacto para el evento
-            p90_evento = np.percentile(perdidas_evento, 90)
+            # Optimización: reutilizar percentil ya computado (90 está en percentiles_valores)
+            p90_evento = float(percentiles_evento[percentiles_valores.index(90)])
 
             # Guardamos las estadísticas en la lista
             estadisticas_eventos.append({
@@ -16584,8 +16587,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
             lambda x: ('{:.2f}'.format(x).replace('.', ',')) if x != int(x) else ('{:.0f}'.format(x)))
 
         # Obtener resumen ejecutivo
-        var_90 = np.percentile(perdidas_totales, 90)
-        opvar_99 = np.percentile(perdidas_totales, 99)
+        # Optimización: reutilizar valores ya computados en `percentiles` en lugar de
+        # llamar a np.percentile dos veces más (90 y 99 ya están en percentiles_valores).
+        var_90 = float(percentiles[percentiles_valores.index(90)])
+        opvar_99 = float(percentiles[percentiles_valores.index(99)])
         opvar = perdidas_totales[perdidas_totales >= opvar_99].mean()
         texto_resultados += obtener_resumen_ejecutivo_texto(media, desviacion_estandar, var_90, opvar_99, opvar,
                                                             min_freq_total, mode_freq_total, max_freq_total)

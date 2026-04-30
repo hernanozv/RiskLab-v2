@@ -1,5 +1,6 @@
 {
-  "platform": "macos",
-  "triggered_at": "2026-03-30T12:31:00Z",
-  "note": "Update this file to trigger a build. platform: windows | macos | all"
+  "platform": "all",
+  "triggered_at": "2026-04-30T20:45:00Z",
+  "note": "Update this file to trigger a build. platform: windows | macos | all",
+  "build_reason": "Build con optimizaciones de simulacion (commits 22d6ac3, bb6d2db, cb62618, 15bedb3): vectorizacion de muestreo estocastico, single-pass chunks, in-place arithmetic, deepcopy optimizado y ordenamiento topologico O(N+E)"
 }

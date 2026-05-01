@@ -52,6 +52,113 @@ def _dbg(*args, **kwargs):
         print(*args, **kwargs)
 
 
+# ==========================================================================
+# Constantes para el feature "Exportar para Análisis (IA)"
+# (descripciones SIEMPRE en español)
+# ==========================================================================
+
+EXPORT_SCHEMA_VERSION = "1.0"
+
+_FREQ_DIST_NAMES = {
+    1: "Poisson",
+    2: "Binomial",
+    3: "Bernoulli",
+    4: "Poisson-Gamma (Binomial Negativa)",
+    5: "Beta"
+}
+
+_FREQ_DIST_DESCRIPTIONS = {
+    1: "Distribución Poisson: cantidad de eventos por año donde la tasa media λ es fija. No tiene tope superior teórico.",
+    2: "Distribución Binomial: cantidad de éxitos en n ensayos independientes con probabilidad p. Acotada en [0, n].",
+    3: "Distribución Bernoulli: el evento ocurre (1) o no ocurre (0) con probabilidad p. Frecuencia binaria por año.",
+    4: "Poisson-Gamma (equivalente a Binomial Negativa): modela frecuencia con dispersión mayor que Poisson (sobre-dispersión).",
+    5: "Beta de probabilidad: la probabilidad p sigue una distribución Beta y luego se sortea Bernoulli(p). Modela incertidumbre sobre p."
+}
+
+_SEV_DIST_NAMES = {
+    1: "Normal (truncada en 0)",
+    2: "LogNormal",
+    3: "PERT (Beta)",
+    4: "Pareto/GPD (truncada en P99.9 cuando xi > 0)",
+    5: "Uniforme"
+}
+
+_SEV_DIST_DESCRIPTIONS = {
+    1: "Distribución Normal de la severidad por ocurrencia. Se trunca en 0 para evitar valores negativos.",
+    2: "Distribución Log-Normal: ln(severidad) ~ Normal. Cola pesada hacia la derecha. Ideal para severidades operacionales.",
+    3: "Distribución PERT (Beta reescalada): definida por mínimo, valor más probable y máximo. Suave y acotada.",
+    4: "Distribución Pareto Generalizada: cola muy pesada. Se trunca en el percentil 99.9 cuando xi > 0 para evitar valores extremos espurios.",
+    5: "Distribución Uniforme entre mínimo y máximo. Cualquier valor en el rango es igual de probable."
+}
+
+# Umbrales fijos usados por Termómetro/Semáforo/Calendario
+_UMBRALES_RIESGO_USD = {
+    "bajo": 3_000_000,
+    "moderado": 32_000_000,
+    "alto": 110_000_000
+}
+
+_AI_BRIEFING_ES = {
+    "que_es_este_archivo": (
+        "Export completo de una simulación Monte Carlo de riesgo operacional "
+        "generada por Risk Lab. Contiene: (a) la configuración de entrada (eventos, "
+        "factores de mitigación, vínculos, escenarios), (b) los resultados agregados y "
+        "por evento con métricas estadísticas exhaustivas, (c) análisis de cola, mapa "
+        "de riesgos y clasificación de criticidad, (d) efectividad observada de los "
+        "controles y seguros, (e) un resumen ejecutivo y un snapshot textual del "
+        "reporte. Está diseñado para que un agente IA pueda interpretar la simulación "
+        "sin contexto externo."
+    ),
+    "como_se_generaron_los_datos": (
+        "Para cada uno de los N escenarios Monte Carlo (típicamente N = 10.000 a 100.000), "
+        "el motor sortea: (1) la frecuencia de cada evento desde su distribución de "
+        "frecuencia (Poisson, Binomial, etc.), (2) la severidad de cada ocurrencia desde "
+        "la distribución de severidad del evento (LogNormal, PERT, etc.). Si el evento "
+        "tiene factores estocásticos (controles probabilísticos), se aplica un factor "
+        "adicional según un sorteo de confiabilidad. Si tiene seguros configurados, se "
+        "deduce el deducible, se aplica la cobertura y se respetan los límites por "
+        "ocurrencia y agregado anual. La pérdida agregada por simulación es la suma de "
+        "pérdidas netas de TODOS los eventos materializados ese año. La distribución "
+        "resultante de N pérdidas anuales es la base de todas las métricas de riesgo."
+    ),
+    "como_interpretar_resultados": [
+        "perdidas_totales[i] es la pérdida total del año Monte Carlo i (suma de todos los eventos en ese año)",
+        "frecuencias_totales[i] es el número total de eventos materializados en el año i",
+        "VaR 99% es la pérdida que en 99 de cada 100 años NO se supera",
+        "OpVaR / Expected Shortfall 99% es la pérdida media CUANDO se supera el VaR 99%",
+        "Modo de frecuencia es el número de eventos más probable en un año típico",
+        "Asimetría > 0: cola hacia la derecha (pérdidas extremas raras pero severas)",
+        "Curtosis > 3: cola más pesada que una distribución Normal",
+        "Período de retorno: cada cuántos años se espera ese nivel de pérdida"
+    ],
+    "glosario_metricas_clave": {
+        "VaR_90": "Value-at-Risk al 90%: pérdida que se supera con 10% de probabilidad anual",
+        "VaR_95": "Value-at-Risk al 95%: pérdida que se supera con 5% de probabilidad anual",
+        "VaR_99": "Value-at-Risk al 99%: cuantil 99 de la distribución de pérdidas anuales",
+        "OpVaR": "Expected Shortfall (CVaR): pérdida media condicional cuando se supera el VaR 99%",
+        "Modo": "Valor más probable de una distribución (la moda)",
+        "Asimetria": "Skewness. > 0 cola derecha, < 0 cola izquierda, 0 = simétrica",
+        "Curtosis": "Kurtosis (exceso). > 0 colas más pesadas que la Normal, < 0 más ligeras",
+        "Coeficiente_Variacion": "Desviación estándar dividida por la media. Volatilidad relativa",
+        "Periodo_de_retorno": "1 dividido la probabilidad anual: cada cuántos años se espera ese nivel",
+        "Importancia_score": "Producto ImpactoP90 × FrecuenciaModo. Combina severidad y frecuencia para ranking"
+    },
+    "preguntas_que_un_agente_puede_responder": [
+        "¿Cuál es la pérdida esperada anual y su volatilidad?",
+        "¿Cómo se compara la pérdida típica con un escenario adverso o extremo?",
+        "¿Qué evento contribuye más al riesgo en escenarios típicos vs en cola?",
+        "¿Es el seguro X efectivo? ¿Cuánto reduce la pérdida bruta?",
+        "¿Los controles estocásticos están funcionando como se diseñaron?",
+        "¿Cada cuántos años se espera una pérdida BAJA, MODERADA, ALTA o CRÍTICA?",
+        "¿La cartera está concentrada en pocos eventos (riesgo de concentración)?",
+        "¿Hay correlación entre cantidad de eventos materializados y pérdida agregada?",
+        "¿Qué pasa con la pérdida si desactivo el control X o el seguro Y?",
+        "¿Cuál es la probabilidad de exceder mi tolerancia de $X?",
+        "¿Qué eventos están en el cuadrante de alta frecuencia y alto impacto?"
+    ]
+}
+
+
 # Clases personalizadas de SpinBox que ignoran el scroll del mouse
 class NoScrollSpinBox(QtWidgets.QSpinBox):
     """QSpinBox que ignora eventos de rueda del mouse para evitar cambios accidentales"""
@@ -4128,17 +4235,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         guardar_config_action = QtWidgets.QAction("Guardar Simulación", self)
         cargar_config_action = QtWidgets.QAction("Cargar Simulación", self)
+        exportar_ia_action = QtWidgets.QAction("Exportar para Análisis (IA)", self)
         exportar_pdf_action = QtWidgets.QAction("Exportar Reporte", self)
         salir_action = QtWidgets.QAction("Salir", self)
 
         archivo_menu.addAction(guardar_config_action)
         archivo_menu.addAction(cargar_config_action)
+        archivo_menu.addAction(exportar_ia_action)
         archivo_menu.addAction(exportar_pdf_action)
         archivo_menu.addSeparator()
         archivo_menu.addAction(salir_action)
 
         guardar_config_action.triggered.connect(self.guardar_configuracion)
         cargar_config_action.triggered.connect(self.cargar_configuracion)
+        exportar_ia_action.triggered.connect(self.exportar_para_ia)
         exportar_pdf_action.triggered.connect(self.exportar_a_pdf)
         salir_action.triggered.connect(self.close)
 
@@ -16528,6 +16638,1463 @@ class RiskLabApp(QtWidgets.QMainWindow):
             texto_resultados += "\n"
 
         return texto_resultados
+
+    # ==========================================================================
+    # FEATURE: Exportar para Análisis (IA)
+    # Exporta un archivo JSON exhaustivo con TODA la info de la simulación
+    # (inputs + outputs + análisis + glosario) para que un agente IA pueda
+    # interpretar los resultados sin contexto externo.
+    # ==========================================================================
+    def exportar_para_ia(self):
+        """Exporta la simulación completa en un archivo JSON optimizado para
+        que un agente IA externo pueda interpretarla."""
+        # Validar que haya datos disponibles
+        if not hasattr(self, 'resultados_simulacion') or self.resultados_simulacion is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Sin resultados",
+                "No hay resultados de simulación para exportar.\n\n"
+                "Por favor ejecutá una simulación primero (botón 'Ejecutar Simulación')."
+            )
+            return
+
+        # 1. Mostrar diálogo de opciones
+        opciones = self._dialogo_export_ia()
+        if opciones is None:
+            return  # Usuario canceló
+
+        # 2. Solicitar ruta de guardado
+        extension = ".risklab.json.gz" if opciones.get("comprimir") else ".risklab.json"
+        nombre_default = f"risklab_export_ia{extension}"
+        filtro = "Risk Lab JSON (*.risklab.json *.json *.gz);;Todos (*)"
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Exportar para Análisis (IA)", nombre_default, filtro
+        )
+        if not filepath:
+            return  # Usuario canceló
+
+        # 3. Construir el payload y serializar
+        try:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            payload = self._construir_export_payload_ia(opciones)
+            self._escribir_export_json(filepath, payload, comprimir=opciones.get("comprimir", False))
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+            # Mensaje de éxito
+            self.statusBar().showMessage(f"Export IA guardado: {os.path.basename(filepath)}", 5000)
+            QtWidgets.QMessageBox.information(
+                self, "Exportación completa",
+                f"Archivo exportado exitosamente:\n\n{filepath}\n\n"
+                "Podés compartir este archivo con un agente IA (Claude, GPT, etc.) "
+                "para que interprete los resultados de la simulación."
+            )
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            error_trace = traceback.format_exc()
+            print(f"Error en exportar_para_ia: {error_trace}")
+            QtWidgets.QMessageBox.critical(
+                self, "Error al exportar",
+                f"Ocurrió un error al generar el archivo:\n\n{str(e)}"
+            )
+
+    def _dialogo_export_ia(self):
+        """Diálogo modal con opciones de exportación. Devuelve dict con
+        las opciones seleccionadas o None si el usuario cancela."""
+        # Estimar tamaños para mostrar al usuario
+        try:
+            n_sim = len(self.resultados_simulacion.get('perdidas_totales', []))
+            n_eventos = len(self.resultados_simulacion.get('eventos_riesgo', []))
+        except Exception:
+            n_sim = 0
+            n_eventos = 0
+        bytes_raw_estimado = (n_sim * (1 + 2 * n_eventos)) * 8
+        mb_raw = bytes_raw_estimado / (1024 * 1024)
+        mb_sin_raw = max(0.2, n_eventos * 0.02 + 0.1)
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Exportar para Análisis (IA)")
+        dialog.setMinimumWidth(560)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        # Header descriptivo
+        header_label = QtWidgets.QLabel(
+            "Exporta un archivo <b>JSON exhaustivo</b> con TODA la información de la "
+            "simulación (configuración, resultados, estadísticas, análisis y glosario). "
+            "Diseñado para que un agente IA pueda interpretar los resultados.\n\n"
+            "<b>Seleccioná qué incluir:</b>"
+        )
+        header_label.setWordWrap(True)
+        layout.addWidget(header_label)
+
+        # Opciones
+        gb_opts = QtWidgets.QGroupBox("Contenido")
+        gb_layout = QtWidgets.QVBoxLayout(gb_opts)
+
+        cb_resumen = QtWidgets.QCheckBox("Resumen ejecutivo y key findings")
+        cb_resumen.setChecked(True)
+        gb_layout.addWidget(cb_resumen)
+
+        cb_estadisticas = QtWidgets.QCheckBox("Estadísticas detalladas (percentiles, asimetría, curtosis, etc.)")
+        cb_estadisticas.setChecked(True)
+        gb_layout.addWidget(cb_estadisticas)
+
+        cb_histogramas = QtWidgets.QCheckBox("Histogramas y curva de excedencia (resúmenes de gráficos)")
+        cb_histogramas.setChecked(True)
+        gb_layout.addWidget(cb_histogramas)
+
+        cb_per_event = QtWidgets.QCheckBox("Resultados desglosados por evento (boxplots, contribución, controles)")
+        cb_per_event.setChecked(True)
+        gb_layout.addWidget(cb_per_event)
+
+        cb_marginal = QtWidgets.QCheckBox("Contribución marginal por percentil (qué evento domina en cola)")
+        cb_marginal.setChecked(True)
+        gb_layout.addWidget(cb_marginal)
+
+        cb_text_snapshot = QtWidgets.QCheckBox("Snapshot textual (mismo reporte que muestra la app)")
+        cb_text_snapshot.setChecked(True)
+        gb_layout.addWidget(cb_text_snapshot)
+
+        cb_raw = QtWidgets.QCheckBox(
+            f"Incluir arrays raw (todas las simulaciones)  ~{mb_raw:.1f} MB"
+        )
+        cb_raw.setChecked(False)
+        cb_raw.setToolTip(
+            "Si lo activás, se incluyen los arrays completos de pérdidas y frecuencias "
+            "por simulación. Útil para reproducibilidad pero el archivo crece. "
+            "Por defecto desactivado: las estadísticas son suficientes para 99% de los análisis."
+        )
+        gb_layout.addWidget(cb_raw)
+
+        layout.addWidget(gb_opts)
+
+        # Compresión
+        gb_comp = QtWidgets.QGroupBox("Formato")
+        gb_comp_layout = QtWidgets.QVBoxLayout(gb_comp)
+        cb_gzip = QtWidgets.QCheckBox("Comprimir con gzip (.json.gz) — reduce ~7x el tamaño")
+        cb_gzip.setChecked(False)
+        gb_comp_layout.addWidget(cb_gzip)
+        layout.addWidget(gb_comp)
+
+        # Aviso de tamaño aproximado
+        size_label = QtWidgets.QLabel(
+            f"<i>Tamaño estimado: ~{mb_sin_raw:.1f} MB (sin arrays raw)</i>"
+        )
+        size_label.setStyleSheet("color: #666666;")
+        layout.addWidget(size_label)
+
+        # Actualizar tamaño cuando cambian las opciones
+        def actualizar_size():
+            base = mb_sin_raw
+            if cb_raw.isChecked():
+                base += mb_raw
+            if cb_gzip.isChecked():
+                base = base / 7.0
+            size_label.setText(f"<i>Tamaño estimado: ~{base:.1f} MB</i>")
+        cb_raw.toggled.connect(actualizar_size)
+        cb_gzip.toggled.connect(actualizar_size)
+
+        # Botones
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        button_box.button(QtWidgets.QDialogButtonBox.Ok).setText("Exportar...")
+        button_box.button(QtWidgets.QDialogButtonBox.Cancel).setText("Cancelar")
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        return {
+            "incluir_resumen_ejecutivo": cb_resumen.isChecked(),
+            "incluir_estadisticas": cb_estadisticas.isChecked(),
+            "incluir_histogramas": cb_histogramas.isChecked(),
+            "incluir_por_evento": cb_per_event.isChecked(),
+            "incluir_contribucion_marginal": cb_marginal.isChecked(),
+            "incluir_text_snapshot": cb_text_snapshot.isChecked(),
+            "incluir_raw_arrays": cb_raw.isChecked(),
+            "comprimir": cb_gzip.isChecked()
+        }
+
+    def _escribir_export_json(self, filepath, payload, comprimir=False):
+        """Serializa el payload a JSON (con o sin gzip)."""
+        json_str = json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default)
+        if comprimir:
+            import gzip
+            if not filepath.endswith(".gz"):
+                filepath = filepath + ".gz"
+            with gzip.open(filepath, "wt", encoding="utf-8") as f:
+                f.write(json_str)
+        else:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(json_str)
+
+    @staticmethod
+    def _calc_stats_completas(arr):
+        """Devuelve dict con estadísticas exhaustivas de un array numérico."""
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            n = int(arr.size)
+            if n == 0:
+                return {"n": 0}
+            media = float(np.mean(arr))
+            std = float(np.std(arr))
+            mediana = float(np.median(arr))
+            minimo = float(np.min(arr))
+            maximo = float(np.max(arr))
+            varianza = float(std ** 2)
+            rango = maximo - minimo
+            cv = (std / media) if abs(media) > 1e-12 else None
+            try:
+                asimetria = float(stats.skew(arr))
+            except Exception:
+                asimetria = None
+            try:
+                curtosis = float(stats.kurtosis(arr))  # exceso, Normal=0
+            except Exception:
+                curtosis = None
+            porc_ceros = float(np.mean(arr == 0) * 100.0)
+            return {
+                "n": n,
+                "media": media,
+                "mediana": mediana,
+                "desviacion_estandar": std,
+                "varianza": varianza,
+                "minimo": minimo,
+                "maximo": maximo,
+                "rango": rango,
+                "coeficiente_variacion": cv,
+                "asimetria": asimetria,
+                "curtosis": curtosis,
+                "porcentaje_ceros": porc_ceros
+            }
+        except Exception:
+            return {"n": 0, "error": "no se pudieron calcular estadisticas"}
+
+    @staticmethod
+    def _calc_percentiles(arr, percentiles=None):
+        """Devuelve dict de percentiles. percentiles puede ser una lista de
+        números (10, 25, 50, ...) o None para usar default exhaustivo."""
+        if percentiles is None:
+            percentiles = [1, 5, 10, 25, 50, 75, 80, 85, 90, 92, 95, 99, 99.5, 99.9, 99.99]
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.size == 0:
+                return {}
+            valores = np.percentile(arr, percentiles)
+            out = {}
+            for p, v in zip(percentiles, valores):
+                key = "p" + (str(p).replace(".", "_") if p != int(p) else str(int(p)))
+                out[key] = float(v)
+            return out
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _calc_var_opvar(arr):
+        """Calcula VaR 90/95/99 y Expected Shortfall 99."""
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.size == 0:
+                return {}
+            var_90 = float(np.percentile(arr, 90))
+            var_95 = float(np.percentile(arr, 95))
+            var_99 = float(np.percentile(arr, 99))
+            cola = arr[arr >= var_99]
+            es_99 = float(np.mean(cola)) if cola.size > 0 else None
+            return {
+                "VaR_90": var_90,
+                "VaR_95": var_95,
+                "VaR_99": var_99,
+                "expected_shortfall_99": es_99,
+                "explicacion": (
+                    f"VaR_99: el 99% de los años NO supera ${var_99:,.0f}. "
+                    f"Expected Shortfall (ES_99): cuando se supera, en promedio se "
+                    f"pierden ${es_99:,.0f}." if es_99 is not None else
+                    f"VaR_99: ${var_99:,.0f}."
+                )
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _calc_histograma(arr, n_bins=100):
+        """Devuelve histograma como dict {bins_edges, counts, n_bins}."""
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.size == 0:
+                return {"bins_edges": [], "counts": [], "n_bins": 0}
+            counts, edges = np.histogram(arr, bins=n_bins)
+            return {
+                "bins_edges": [float(e) for e in edges],
+                "counts": [int(c) for c in counts],
+                "n_bins": int(n_bins)
+            }
+        except Exception:
+            return {"bins_edges": [], "counts": [], "n_bins": 0}
+
+    def _build_risk_map(self, eventos, perdidas_por_evento, frecuencias_por_evento):
+        """Construye el bloque del Mapa de Riesgos: cada evento con
+        ImpactoMedio, ImpactoP90, FrecuenciaModo, FrecuenciaMedia,
+        Importancia y cuadrante."""
+        if not eventos:
+            return None
+        try:
+            registros = []
+            for idx, ev in enumerate(eventos):
+                p_arr = np.asarray(perdidas_por_evento[idx]) if idx < len(perdidas_por_evento) else np.array([])
+                f_arr = np.asarray(frecuencias_por_evento[idx]) if idx < len(frecuencias_por_evento) else np.array([])
+                if p_arr.size == 0:
+                    continue
+                impacto_medio = float(np.mean(p_arr))
+                impacto_p90 = float(np.percentile(p_arr, 90))
+                if f_arr.size > 0 and int(np.max(f_arr)) <= 100000:
+                    freq_modo = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                else:
+                    freq_modo = 0
+                freq_media = float(np.mean(f_arr)) if f_arr.size > 0 else 0.0
+                importancia = impacto_p90 * max(freq_modo, 1e-9)
+                registros.append({
+                    "event_id": ev.get("id"),
+                    "event_name": ev.get("nombre"),
+                    "impacto_medio": impacto_medio,
+                    "impacto_p90": impacto_p90,
+                    "frecuencia_modo": freq_modo,
+                    "frecuencia_media": freq_media,
+                    "importancia_score": importancia,
+                    "importancia_formula": "ImpactoP90 x FrecuenciaModo"
+                })
+            if not registros:
+                return None
+            # Cuadrantes dinámicos: mediana × 1.2 (igual que la app)
+            impactos = [r["impacto_medio"] for r in registros]
+            frecuencias = [r["frecuencia_modo"] for r in registros]
+            try:
+                umbral_x = float(np.median(impactos)) * 1.2
+                umbral_y = float(np.median(frecuencias)) * 1.2
+            except Exception:
+                umbral_x, umbral_y = 0.0, 0.0
+            for r in registros:
+                if r["impacto_medio"] >= umbral_x and r["frecuencia_modo"] >= umbral_y:
+                    r["cuadrante"] = "Alto Impacto / Alta Frecuencia"
+                elif r["impacto_medio"] >= umbral_x and r["frecuencia_modo"] < umbral_y:
+                    r["cuadrante"] = "Alto Impacto / Baja Frecuencia"
+                elif r["impacto_medio"] < umbral_x and r["frecuencia_modo"] >= umbral_y:
+                    r["cuadrante"] = "Bajo Impacto / Alta Frecuencia"
+                else:
+                    r["cuadrante"] = "Bajo Impacto / Baja Frecuencia"
+            return {
+                "_descripcion": (
+                    "Posicionamiento de cada evento en el plano Impacto x Frecuencia "
+                    "para análisis jerárquico. La 'Importancia' combina severidad y "
+                    "probabilidad para ranking de riesgo."
+                ),
+                "umbrales_cuadrantes": {
+                    "impacto_x": umbral_x,
+                    "frecuencia_y": umbral_y,
+                    "criterio": "mediana × 1.2 (calculado dinámicamente)"
+                },
+                "events": registros
+            }
+        except Exception:
+            return None
+
+    def _build_risk_classification(self, perdidas_totales):
+        """Construye el bloque de clasificación de criticidad
+        (Termómetro/Semáforo) con probabilidades por zona."""
+        if perdidas_totales.size == 0:
+            return None
+        try:
+            ub = _UMBRALES_RIESGO_USD["bajo"]
+            um = _UMBRALES_RIESGO_USD["moderado"]
+            ua = _UMBRALES_RIESGO_USD["alto"]
+            n = perdidas_totales.size
+            p_bajo = float(np.mean(perdidas_totales < ub) * 100)
+            p_moderado = float(np.mean((perdidas_totales >= ub) & (perdidas_totales < um)) * 100)
+            p_alto = float(np.mean((perdidas_totales >= um) & (perdidas_totales < ua)) * 100)
+            p_critico = float(np.mean(perdidas_totales >= ua) * 100)
+            media = float(np.mean(perdidas_totales))
+            p99 = float(np.percentile(perdidas_totales, 99))
+
+            def _zona(v):
+                if v < ub:
+                    return "BAJO"
+                if v < um:
+                    return "MODERADO"
+                if v < ua:
+                    return "ALTO"
+                return "CRITICO"
+
+            return {
+                "_descripcion": (
+                    "Clasificación de criticidad de la pérdida agregada según umbrales "
+                    "fijos (mismos que usan los gráficos Termómetro y Semáforo)."
+                ),
+                "umbrales_fijos": {
+                    "bajo": ub,
+                    "moderado": um,
+                    "alto": ua,
+                    "_unit": "USD/año"
+                },
+                "metricas_clave": {
+                    "perdida_media": media,
+                    "perdida_p99": p99
+                },
+                "zona_actual_segun_media": _zona(media),
+                "zona_actual_segun_p99": _zona(p99),
+                "probabilidades_por_zona": {
+                    "bajo_pct": round(p_bajo, 4),
+                    "moderado_pct": round(p_moderado, 4),
+                    "alto_pct": round(p_alto, 4),
+                    "critico_pct": round(p_critico, 4)
+                }
+            }
+        except Exception:
+            return None
+
+    def _build_calendar_periods(self, perdidas_totales, frecuencias_totales):
+        """Calendar/Línea de tiempo de retorno: cada cuántos años se espera
+        cada nivel de pérdida."""
+        if perdidas_totales.size == 0:
+            return None
+        try:
+            ub = _UMBRALES_RIESGO_USD["bajo"]
+            um = _UMBRALES_RIESGO_USD["moderado"]
+            ua = _UMBRALES_RIESGO_USD["alto"]
+            uc = max(ua * 1.5, float(np.percentile(perdidas_totales, 99.5)))
+            eventos_por_año = float(np.mean(frecuencias_totales)) if frecuencias_totales.size > 0 else 0.0
+            niveles = []
+            for nombre, umbral in [("BAJO", ub), ("MODERADO", um), ("ALTO", ua), ("CRITICO", uc)]:
+                p_exc = float(np.mean(perdidas_totales > umbral))
+                prob_anual_pct = round(p_exc * 100, 4)
+                if p_exc > 0 and eventos_por_año > 0:
+                    periodo = 1.0 / (p_exc * eventos_por_año)
+                else:
+                    periodo = float("inf")
+                # Etiqueta humana
+                if periodo == float("inf"):
+                    etiqueta = ">100 años"
+                    periodo_años_val = None
+                elif periodo < 1.0 / 12:
+                    etiqueta = f"Cada {periodo*365:.0f} días"
+                    periodo_años_val = round(periodo, 4)
+                elif periodo < 1.0:
+                    etiqueta = f"Cada {periodo*12:.0f} meses"
+                    periodo_años_val = round(periodo, 4)
+                else:
+                    etiqueta = f"Cada {periodo:.1f} años"
+                    periodo_años_val = round(periodo, 2)
+                niveles.append({
+                    "nivel": nombre,
+                    "umbral": umbral,
+                    "prob_anual_pct": prob_anual_pct,
+                    "periodo_retorno_años": periodo_años_val if periodo != float("inf") else "infinito",
+                    "etiqueta": etiqueta
+                })
+            return {
+                "_descripcion": "Cada cuántos años (período de retorno) se espera superar cada nivel de pérdida.",
+                "frecuencia_eventos_por_año_esperada": round(eventos_por_año, 3),
+                "niveles": niveles
+            }
+        except Exception:
+            return None
+
+    def _build_marginal_contribution(self, eventos, perdidas_totales, perdidas_por_evento):
+        """Contribución marginal por percentil: para cada percentil objetivo,
+        identifica las simulaciones cercanas a ese percentil y calcula la
+        contribución promedio de cada evento en esas simulaciones."""
+        if perdidas_totales.size == 0 or not eventos:
+            return None
+        try:
+            percentiles_objetivo = [None, 75, 80, 90, 95, 99]  # None = Media
+            etiquetas = ["Media", "P75", "P80", "P90", "P95", "P99"]
+            contribuciones = {}
+            for et, pct in zip(etiquetas, percentiles_objetivo):
+                fila = []
+                if pct is None:
+                    indices = np.arange(perdidas_totales.size)
+                else:
+                    valor_p = float(np.percentile(perdidas_totales, pct))
+                    margen_inf = max(0, pct - 2.5)
+                    margen_sup = min(100, pct + 2.5)
+                    u_inf = float(np.percentile(perdidas_totales, margen_inf))
+                    u_sup = float(np.percentile(perdidas_totales, margen_sup))
+                    mascara = (perdidas_totales >= u_inf) & (perdidas_totales <= u_sup)
+                    indices = np.where(mascara)[0]
+                    if indices.size < 50:
+                        u_inf2 = float(np.percentile(perdidas_totales, max(0, pct - 5)))
+                        u_sup2 = float(np.percentile(perdidas_totales, min(100, pct + 5)))
+                        mascara = (perdidas_totales >= u_inf2) & (perdidas_totales <= u_sup2)
+                        indices = np.where(mascara)[0]
+                # Total agregado en ese rango
+                if pct is None:
+                    total_rango = float(np.mean(perdidas_totales))
+                else:
+                    total_rango = float(np.mean(perdidas_totales[indices])) if indices.size > 0 else 0.0
+                for idx, ev in enumerate(eventos):
+                    p_arr = np.asarray(perdidas_por_evento[idx]) if idx < len(perdidas_por_evento) else np.array([])
+                    if p_arr.size == 0:
+                        contrib = 0.0
+                    elif pct is None:
+                        contrib = float(np.mean(p_arr))
+                    else:
+                        contrib = float(np.mean(p_arr[indices])) if indices.size > 0 else 0.0
+                    porc = (contrib / total_rango * 100.0) if total_rango > 0 else 0.0
+                    fila.append({
+                        "evento": ev.get("nombre"),
+                        "contribucion": round(contrib, 2),
+                        "porcentaje": round(porc, 2)
+                    })
+                # Ordenar por contribución desc
+                fila.sort(key=lambda x: -x["contribucion"])
+                contribuciones[et] = fila
+            return {
+                "_descripcion": (
+                    "Contribución de cada evento en simulaciones cercanas a cada percentil "
+                    "(no el promedio simple). Permite ver qué evento DOMINA en cola vs en "
+                    "escenarios típicos."
+                ),
+                "percentiles": etiquetas,
+                "contribuciones_por_percentil": contribuciones
+            }
+        except Exception:
+            return None
+
+    def _build_scenario_impacts(self, perdidas_totales):
+        """¿Qué pasaría si...? — 4 escenarios probabilísticos clave."""
+        if perdidas_totales.size == 0:
+            return None
+        try:
+            return {
+                "_descripcion": (
+                    "Impacto económico esperado en 4 escenarios probabilísticos clave."
+                ),
+                "escenarios": [
+                    {
+                        "nombre": "Típico (Media)",
+                        "valor": float(np.mean(perdidas_totales)),
+                        "probabilidad_etiqueta": "promedio",
+                        "_meaning": "Pérdida esperada en un año típico"
+                    },
+                    {
+                        "nombre": "Adverso (P90)",
+                        "valor": float(np.percentile(perdidas_totales, 90)),
+                        "probabilidad_etiqueta": "10% de probabilidad anual",
+                        "_meaning": "Pérdida que se supera con 10% de probabilidad"
+                    },
+                    {
+                        "nombre": "Muy Adverso (P95)",
+                        "valor": float(np.percentile(perdidas_totales, 95)),
+                        "probabilidad_etiqueta": "5% de probabilidad anual",
+                        "_meaning": "Pérdida que se supera con 5% de probabilidad"
+                    },
+                    {
+                        "nombre": "Extremo (P99)",
+                        "valor": float(np.percentile(perdidas_totales, 99)),
+                        "probabilidad_etiqueta": "1% de probabilidad anual",
+                        "_meaning": "Una vez cada 100 años en promedio"
+                    }
+                ]
+            }
+        except Exception:
+            return None
+
+    def _build_insurance_effectiveness(self, eventos):
+        """Resumen de efectividad de seguros configurados."""
+        polizas = []
+        for ev in eventos:
+            for f in (ev.get("factores_ajuste") or []):
+                if f.get("tipo_severidad") == "seguro" and f.get("activo", True):
+                    polizas.append({
+                        "nombre": f.get("nombre"),
+                        "evento_cubierto": ev.get("nombre"),
+                        "tipo_deducible": f.get("seguro_tipo_deducible", "agregado"),
+                        "deducible": f.get("seguro_deducible", 0),
+                        "cobertura_pct": f.get("seguro_cobertura_pct", 0),
+                        "limite_ocurrencia": f.get("seguro_limite_ocurrencia", 0),
+                        "limite_agregado": f.get("seguro_limite", 0)
+                    })
+        if not polizas:
+            return None
+        return {
+            "_descripcion": (
+                "Pólizas de seguro activas en la simulación. Para evaluar el impacto "
+                "real en la pérdida, comparar con la sección 'results.aggregate' antes "
+                "y después de simular sin estas pólizas."
+            ),
+            "polizas_activas": polizas
+        }
+
+    def _build_chart_summaries(self, perdidas_totales, frecuencias_totales,
+                                perdidas_por_evento, eventos, results_block):
+        """Resúmenes textuales de cada gráfico."""
+        try:
+            stats_perd = results_block.get("aggregate", {}).get("perdidas_totales", {}).get("estadisticas", {})
+            asim = stats_perd.get("asimetria")
+            curt = stats_perd.get("curtosis")
+            media = float(np.mean(perdidas_totales)) if perdidas_totales.size > 0 else 0.0
+            mediana = float(np.median(perdidas_totales)) if perdidas_totales.size > 0 else 0.0
+            p99 = float(np.percentile(perdidas_totales, 99)) if perdidas_totales.size > 0 else 0.0
+
+            # Frecuencia totals
+            freq_moda = None
+            try:
+                if frecuencias_totales.size > 0 and int(np.max(frecuencias_totales)) <= 100000:
+                    freq_moda = int(np.argmax(np.bincount(frecuencias_totales.astype(np.int64))))
+            except Exception:
+                pass
+
+            # Tornado ranking
+            tornado = []
+            for idx, ev in enumerate(eventos):
+                p_arr = np.asarray(perdidas_por_evento[idx]) if idx < len(perdidas_por_evento) else np.array([])
+                if p_arr.size > 0:
+                    tornado.append({
+                        "posicion": idx + 1,
+                        "evento": ev.get("nombre"),
+                        "contribucion": float(np.mean(p_arr))
+                    })
+            tornado.sort(key=lambda x: -x["contribucion"])
+            total_med = sum(t["contribucion"] for t in tornado) or 1.0
+            for r, t in enumerate(tornado, 1):
+                t["posicion"] = r
+                t["porcentaje"] = round(100 * t["contribucion"] / total_med, 2)
+            top3_pct = round(sum(t["porcentaje"] for t in tornado[:3]), 2)
+
+            # Correlación
+            try:
+                corr = float(np.corrcoef(frecuencias_totales, perdidas_totales)[0, 1]) if (
+                    frecuencias_totales.size > 1 and perdidas_totales.size > 1
+                ) else None
+            except Exception:
+                corr = None
+
+            return {
+                "_descripcion": (
+                    "Resumen textual de cada gráfico generado por la app. Permite que un "
+                    "agente IA 'lea' lo que muestra cada gráfico sin necesidad de la imagen."
+                ),
+                "distribucion_perdidas_agregadas": {
+                    "tipo": "Histograma + KDE",
+                    "descripcion": (
+                        f"Distribución de pérdidas anuales agregadas. Asimetría={asim}, curtosis={curt}."
+                    ),
+                    "datos_clave": {
+                        "media": media,
+                        "mediana": mediana,
+                        "p99": p99
+                    }
+                },
+                "frecuencia_eventos": {
+                    "tipo": "Histograma de conteo",
+                    "moda": freq_moda,
+                    "descripcion": (
+                        f"Distribución de frecuencias totales por año. "
+                        f"Modo={freq_moda} eventos/año."
+                    )
+                },
+                "tornado_contribucion": {
+                    "tipo": "Tornado chart horizontal",
+                    "ranking_por_media": tornado[:10],
+                    "concentracion_top3_pct": top3_pct
+                },
+                "dispersion_freq_vs_perdida": {
+                    "tipo": "Scatter + regresión",
+                    "correlacion": corr,
+                    "interpretacion": (
+                        "Correlación positiva fuerte → años con más eventos tienen mayor "
+                        "pérdida agregada (típico operacional)."
+                        if corr is not None and corr > 0.5 else
+                        "Correlación moderada o débil entre frecuencia y pérdida."
+                    )
+                },
+                "tail_risk": {
+                    "tipo": "Histograma cola P80",
+                    "_referencia": "ver results.tail_analysis"
+                },
+                "mapa_riesgos": "ver results.risk_map",
+                "termometro_gauge": "ver results.risk_classification",
+                "semaforo": "ver results.risk_classification.probabilidades_por_zona",
+                "escenarios": "ver results.scenario_impacts",
+                "calendario": "ver results.calendar_periods_of_return"
+            }
+        except Exception:
+            return {}
+
+    def _build_executive_summary(self, perdidas_totales, frecuencias_totales,
+                                  perdidas_por_evento, eventos, results_block):
+        """Resumen ejecutivo pre-procesado para el agente."""
+        try:
+            media = float(np.mean(perdidas_totales)) if perdidas_totales.size > 0 else 0.0
+            var_99 = float(np.percentile(perdidas_totales, 99)) if perdidas_totales.size > 0 else 0.0
+            cola = perdidas_totales[perdidas_totales >= var_99]
+            es_99 = float(np.mean(cola)) if cola.size > 0 else 0.0
+            try:
+                curt = float(stats.kurtosis(perdidas_totales))
+                asim = float(stats.skew(perdidas_totales))
+            except Exception:
+                curt, asim = 0.0, 0.0
+
+            # Concentración top 3
+            contribs = []
+            for idx, ev in enumerate(eventos):
+                p_arr = np.asarray(perdidas_por_evento[idx]) if idx < len(perdidas_por_evento) else np.array([])
+                if p_arr.size > 0:
+                    contribs.append((ev.get("nombre"), float(np.mean(p_arr))))
+            contribs.sort(key=lambda t: -t[1])
+            top3_pct = 0.0
+            top_evento = "—"
+            top_pct = 0.0
+            total_med = sum(c[1] for c in contribs) or 1.0
+            if contribs:
+                top_evento = contribs[0][0]
+                top_pct = round(100 * contribs[0][1] / total_med, 1)
+                top3_pct = round(100 * sum(c[1] for c in contribs[:3]) / total_med, 1)
+
+            porc_ceros = float(np.mean(perdidas_totales == 0) * 100.0) if perdidas_totales.size > 0 else 0.0
+
+            findings = [
+                f"Pérdida media esperada: ${media:,.0f} anuales",
+                f"Con 99% de confianza, las pérdidas no superarán ${var_99:,.0f} (VaR 99%)",
+                f"Si se supera el VaR 99%, la pérdida esperada es ${es_99:,.0f} (Expected Shortfall)",
+                f"El evento '{top_evento}' contribuye {top_pct}% al riesgo agregado medio",
+                f"{porc_ceros:.1f}% de los años no presentan pérdida alguna",
+                f"Cola: kurtosis={curt:.2f}, asimetría={asim:.2f}",
+                f"Top 3 eventos contribuyen {top3_pct}% del riesgo agregado"
+            ]
+
+            # Concentración cualitativa
+            if top3_pct >= 80:
+                conc_label = "Muy Alta"
+            elif top3_pct >= 65:
+                conc_label = "Alta"
+            elif top3_pct >= 45:
+                conc_label = "Moderada"
+            else:
+                conc_label = "Baja (riesgo distribuido)"
+
+            # Clasificación zona
+            classif = results_block.get("risk_classification") or {}
+            zona_media = classif.get("zona_actual_segun_media", "—")
+            zona_p99 = classif.get("zona_actual_segun_p99", "—")
+
+            return {
+                "headline": (
+                    f"Pérdida agregada media de ${media:,.0f} con VaR 99% de "
+                    f"${var_99:,.0f}. Cartera en zona {zona_media} (media) / "
+                    f"{zona_p99} (P99)."
+                ),
+                "key_findings": findings,
+                "concentracion_riesgo": {
+                    "top_3_pct": top3_pct,
+                    "concentracion": conc_label,
+                    "evento_principal": top_evento
+                }
+            }
+        except Exception:
+            return {"headline": "Resumen no disponible", "key_findings": []}
+
+    def _build_schema_documentation(self):
+        """Mini-schema embebido para que el agente entienda los tipos."""
+        return {
+            "input_events[].frecuencia.distribucion": {
+                "type": "string",
+                "valid_values": list(_FREQ_DIST_NAMES.values()),
+                "description": "Familia de distribución de frecuencia anual."
+            },
+            "input_events[].severidad.distribucion": {
+                "type": "string",
+                "valid_values": list(_SEV_DIST_NAMES.values()),
+                "description": "Familia de distribución de severidad por ocurrencia."
+            },
+            "input_events[].factores_ajuste[].tipo_modelo": {
+                "valid_values": ["estatico", "estocastico"],
+                "description": (
+                    "Tipo de control: 'estatico' aplica siempre, 'estocastico' tiene "
+                    "confiabilidad probabilística (puede fallar)."
+                )
+            },
+            "input_events[].vinculos[].tipo": {
+                "valid_values": ["AND", "OR", "EXCLUYE"],
+                "description": "Lógica de dependencia con el evento padre."
+            },
+            "results.aggregate.perdidas_totales.estadisticas.asimetria": {
+                "type": "number",
+                "description": (
+                    "Skewness. > 0 indica cola hacia la derecha (pérdidas extremas raras "
+                    "pero severas). 0 = simétrica."
+                )
+            },
+            "results.aggregate.perdidas_totales.estadisticas.curtosis": {
+                "type": "number",
+                "description": "Exceso de curtosis. > 0 colas más pesadas que la Normal, < 0 más ligeras."
+            },
+            "results.risk_classification.zona_actual_segun_media": {
+                "valid_values": ["BAJO", "MODERADO", "ALTO", "CRITICO"],
+                "description": "Zona de criticidad de la pérdida media según umbrales fijos."
+            }
+        }
+
+    def _build_results_section(self, opciones, perdidas_totales, frecuencias_totales,
+                                perdidas_por_evento, frecuencias_por_evento,
+                                eventos, mapa_nombres):
+        """Construye la sección 'results' del export. Incluye:
+        aggregate (perdidas + frecuencias agregadas), per_event,
+        correlations, exceedance_curve, tail_analysis, risk_map,
+        risk_classification, calendar_periods_of_return,
+        marginal_contribution_per_percentile, scenario_impacts,
+        insurance_effectiveness, chart_summaries."""
+        results = {}
+        incl_stats = opciones.get("incluir_estadisticas", True)
+        incl_hist = opciones.get("incluir_histogramas", True)
+        incl_per_event = opciones.get("incluir_por_evento", True)
+        incl_marginal = opciones.get("incluir_contribucion_marginal", True)
+        incl_raw = opciones.get("incluir_raw_arrays", False)
+        n_sim = int(perdidas_totales.size)
+
+        # ============ AGGREGATE ============
+        agg = {}
+        # Pérdidas agregadas
+        bloque_perd = {
+            "_descripcion": (
+                "Pérdida total agregada por año Monte Carlo "
+                "(suma de pérdidas netas de todos los eventos en el año)."
+            ),
+            "n": n_sim
+        }
+        if incl_stats:
+            bloque_perd["estadisticas"] = self._calc_stats_completas(perdidas_totales)
+            bloque_perd["percentiles"] = self._calc_percentiles(perdidas_totales)
+            bloque_perd["var_y_opvar"] = self._calc_var_opvar(perdidas_totales)
+        if incl_hist:
+            bloque_perd["histograma"] = self._calc_histograma(perdidas_totales, n_bins=100)
+        if incl_raw:
+            bloque_perd["raw_values"] = perdidas_totales.tolist()
+        agg["perdidas_totales"] = bloque_perd
+
+        # Frecuencias agregadas
+        bloque_freq = {
+            "_descripcion": "Cantidad total de eventos materializados por año Monte Carlo.",
+            "n": n_sim
+        }
+        if incl_stats:
+            bloque_freq["estadisticas"] = self._calc_stats_completas(frecuencias_totales)
+            bloque_freq["percentiles"] = self._calc_percentiles(frecuencias_totales)
+            try:
+                if frecuencias_totales.size > 0:
+                    bloque_freq["minimo"] = int(np.min(frecuencias_totales))
+                    bloque_freq["maximo"] = int(np.max(frecuencias_totales))
+                    if int(np.max(frecuencias_totales)) <= 100000:
+                        bloque_freq["moda"] = int(np.argmax(np.bincount(frecuencias_totales.astype(np.int64))))
+                    else:
+                        bloque_freq["moda"] = int(stats.mode(frecuencias_totales, keepdims=True).mode[0])
+            except Exception:
+                pass
+        if incl_hist:
+            bloque_freq["distribucion_completa"] = self._calc_distribucion_frecuencia_completa(frecuencias_totales)
+        if incl_raw:
+            bloque_freq["raw_values"] = frecuencias_totales.astype(int).tolist()
+        agg["frecuencias_totales"] = bloque_freq
+
+        results["aggregate"] = agg
+
+        # ============ PER-EVENT ============
+        if incl_per_event and len(eventos) > 0:
+            per_event_list = []
+            # Pre-computar pérdida media total para % contribución
+            try:
+                perd_media_total = float(np.mean(perdidas_totales))
+                perd_p90_total = float(np.percentile(perdidas_totales, 90))
+                perd_p99_total = float(np.percentile(perdidas_totales, 99))
+            except Exception:
+                perd_media_total, perd_p90_total, perd_p99_total = 0.0, 0.0, 0.0
+
+            # Lista preliminar para ranking
+            contribs = []
+            for idx, ev in enumerate(eventos):
+                if idx < len(perdidas_por_evento):
+                    p_arr = np.asarray(perdidas_por_evento[idx])
+                    media_evt = float(np.mean(p_arr)) if p_arr.size > 0 else 0.0
+                else:
+                    media_evt = 0.0
+                contribs.append((idx, media_evt))
+            ranking_map = {idx: rank+1 for rank, (idx, _) in enumerate(
+                sorted(contribs, key=lambda t: -t[1])
+            )}
+
+            for idx, ev in enumerate(eventos):
+                p_arr = np.asarray(perdidas_por_evento[idx]) if idx < len(perdidas_por_evento) else np.array([])
+                f_arr = np.asarray(frecuencias_por_evento[idx]) if idx < len(frecuencias_por_evento) else np.array([])
+                ev_block = {
+                    "event_id": ev.get("id"),
+                    "event_name": ev.get("nombre")
+                }
+                if p_arr.size > 0 and incl_stats:
+                    ev_block["perdidas_estadisticas"] = self._calc_stats_completas(p_arr)
+                    ev_block["perdidas_percentiles"] = self._calc_percentiles(p_arr)
+                if f_arr.size > 0 and incl_stats:
+                    f_stats = self._calc_stats_completas(f_arr)
+                    try:
+                        if int(np.max(f_arr)) <= 100000:
+                            f_stats["moda"] = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                    except Exception:
+                        pass
+                    f_stats["porcentaje_no_ocurrencia"] = float(np.mean(f_arr == 0) * 100.0)
+                    ev_block["frecuencias_estadisticas"] = f_stats
+
+                # Box plot stats (cuartiles + outliers count)
+                if p_arr.size > 0 and incl_stats:
+                    try:
+                        q1 = float(np.percentile(p_arr, 25))
+                        q3 = float(np.percentile(p_arr, 75))
+                        iqr = q3 - q1
+                        low_w = max(float(np.min(p_arr)), q1 - 1.5 * iqr)
+                        high_w = min(float(np.max(p_arr)), q3 + 1.5 * iqr)
+                        outliers = int(np.sum((p_arr < low_w) | (p_arr > high_w)))
+                        ev_block["boxplot_stats"] = {
+                            "min_excl_outliers": low_w,
+                            "Q1": q1,
+                            "mediana": float(np.median(p_arr)),
+                            "Q3": q3,
+                            "max_excl_outliers": high_w,
+                            "outliers_count": outliers
+                        }
+                    except Exception:
+                        pass
+
+                # Contribución al total
+                try:
+                    if perd_media_total > 0 and p_arr.size > 0:
+                        contrib_media = float(np.mean(p_arr))
+                        ev_block["contribucion_al_total"] = {
+                            "porcentaje_de_perdida_media": round(100.0 * contrib_media / perd_media_total, 2),
+                            "ranking_por_relevancia": ranking_map.get(idx)
+                        }
+                except Exception:
+                    pass
+
+                # Comportamiento observado: factor severidad estatico aplicado, control estocastico
+                comportamiento = {}
+                fact_estatico = ev.get("_factor_severidad_estatico")
+                if fact_estatico is not None and fact_estatico != 1.0:
+                    comportamiento["factor_severidad_estatico_aplicado"] = float(fact_estatico)
+                vec_estoc = ev.get("_factores_severidad_vector")
+                if vec_estoc is not None:
+                    try:
+                        comportamiento["factor_severidad_estocastico_promedio"] = float(np.mean(vec_estoc))
+                    except Exception:
+                        pass
+                if comportamiento:
+                    ev_block["comportamiento_observado"] = comportamiento
+
+                if incl_raw:
+                    if p_arr.size > 0:
+                        ev_block["perdidas_raw"] = p_arr.tolist()
+                    if f_arr.size > 0:
+                        ev_block["frecuencias_raw"] = f_arr.astype(int).tolist()
+
+                per_event_list.append(ev_block)
+            results["per_event"] = per_event_list
+
+        # ============ CORRELATIONS ============
+        try:
+            if perdidas_totales.size > 1 and frecuencias_totales.size > 1:
+                corr_freq_perd = float(np.corrcoef(frecuencias_totales, perdidas_totales)[0, 1])
+            else:
+                corr_freq_perd = None
+        except Exception:
+            corr_freq_perd = None
+        results["correlations"] = {
+            "frecuencia_total_vs_perdida_total": corr_freq_perd,
+            "_explicacion": (
+                "Correlación de Pearson entre la cantidad total de eventos y la pérdida "
+                "total agregada por simulación. Valores cercanos a 1 indican que años con "
+                "más eventos tienden a tener mayor pérdida agregada (típico en operacional)."
+            )
+        }
+
+        # ============ EXCEEDANCE CURVE ============
+        if incl_hist and perdidas_totales.size > 0:
+            percentiles_curva = [10, 25, 50, 75, 80, 85, 90, 92, 95, 99, 99.5, 99.9]
+            try:
+                valores = np.percentile(perdidas_totales, percentiles_curva)
+                puntos = []
+                for p, v in zip(percentiles_curva, valores):
+                    puntos.append({
+                        "threshold": float(v),
+                        "percentil": float(p),
+                        "exceedance_probability": round(1.0 - p / 100.0, 6)
+                    })
+                exc_block = {
+                    "_descripcion": (
+                        "Para cada threshold T, P(L > T): probabilidad anual de que la "
+                        "pérdida agregada supere T. Útil para análisis de tolerancia."
+                    ),
+                    "puntos": puntos
+                }
+                # Tolerancia configurada por el usuario (si existe)
+                try:
+                    if hasattr(self, "tolerancia_ex_spin") and self.tolerancia_ex_spin is not None:
+                        T_user = float(self.tolerancia_ex_spin.value())
+                        prob_user = float(np.mean(perdidas_totales > T_user) * 100.0)
+                        exc_block["tolerancia_configurada_por_usuario"] = {
+                            "valor_T": T_user,
+                            "probabilidad_excedencia_pct": round(prob_user, 4),
+                            "_explicacion": (
+                                f"El usuario configuró ${T_user:,.0f} como tolerancia. Hay "
+                                f"{prob_user:.2f}% de probabilidad anual de superarla."
+                            )
+                        }
+                except Exception:
+                    pass
+                results["exceedance_curve"] = exc_block
+            except Exception:
+                pass
+
+        # ============ TAIL ANALYSIS ============
+        try:
+            if perdidas_totales.size > 0:
+                p80 = float(np.percentile(perdidas_totales, 80))
+                cola = perdidas_totales[perdidas_totales >= p80]
+                top10 = sorted(perdidas_totales, reverse=True)[:10]
+                results["tail_analysis"] = {
+                    "tail_threshold_p80": p80,
+                    "tail_mean": float(np.mean(cola)) if cola.size > 0 else None,
+                    "tail_max": float(np.max(perdidas_totales)),
+                    "tail_size": int(cola.size),
+                    "tail_top10_extreme_losses": [float(v) for v in top10],
+                    "interpretacion": (
+                        f"El 20% de años más severos (cola) tiene pérdida media "
+                        f"${(float(np.mean(cola)) if cola.size > 0 else 0):,.0f}, "
+                        f"vs ${float(np.mean(perdidas_totales)):,.0f} global."
+                    )
+                }
+        except Exception:
+            pass
+
+        # ============ RISK MAP, RISK CLASSIFICATION, CALENDAR ============
+        # (Se llenan en el paso siguiente)
+        risk_map_block = self._build_risk_map(eventos, perdidas_por_evento, frecuencias_por_evento)
+        if risk_map_block:
+            results["risk_map"] = risk_map_block
+        risk_classif_block = self._build_risk_classification(perdidas_totales)
+        if risk_classif_block:
+            results["risk_classification"] = risk_classif_block
+        calendar_block = self._build_calendar_periods(perdidas_totales, frecuencias_totales)
+        if calendar_block:
+            results["calendar_periods_of_return"] = calendar_block
+
+        # ============ MARGINAL CONTRIBUTION PER PERCENTILE ============
+        if incl_marginal:
+            mc_block = self._build_marginal_contribution(
+                eventos, perdidas_totales, perdidas_por_evento
+            )
+            if mc_block:
+                results["marginal_contribution_per_percentile"] = mc_block
+
+        # ============ SCENARIO IMPACTS ============
+        scenario_block = self._build_scenario_impacts(perdidas_totales)
+        if scenario_block:
+            results["scenario_impacts"] = scenario_block
+
+        # ============ INSURANCE EFFECTIVENESS ============
+        ins_block = self._build_insurance_effectiveness(eventos)
+        if ins_block:
+            results["insurance_effectiveness"] = ins_block
+
+        # ============ CHART SUMMARIES ============
+        if incl_hist:
+            results["chart_summaries"] = self._build_chart_summaries(
+                perdidas_totales, frecuencias_totales,
+                perdidas_por_evento, eventos, results
+            )
+
+        return results
+
+    def _construir_export_payload_ia(self, opciones):
+        """Construye el dict completo del export IA en base a la simulación
+        ejecutada y las opciones seleccionadas en el diálogo.
+
+        El resultado es un dict serializable a JSON con secciones:
+        $schema_version, $generated_at, $generator, metadata,
+        ai_agent_briefing, configuration, execution_metadata, input_events,
+        input_scenarios, results, executive_summary, text_snapshot,
+        schema_documentation."""
+        from datetime import datetime, timezone
+
+        res = self.resultados_simulacion
+        eventos = res.get("eventos_riesgo", []) or []
+        perdidas_totales = np.asarray(res.get("perdidas_totales", []))
+        frecuencias_totales = np.asarray(res.get("frecuencias_totales", []))
+        perdidas_por_evento = res.get("perdidas_por_evento", []) or []
+        frecuencias_por_evento = res.get("frecuencias_por_evento", []) or []
+
+        n_sim = int(perdidas_totales.size)
+
+        # Mapa id->nombre para resolver vínculos
+        mapa_nombres = {e.get("id"): e.get("nombre") for e in eventos if e.get("id")}
+
+        # ---- Metadata raíz ----
+        try:
+            scipy_v = stats.__version__ if hasattr(stats, "__version__") else "?"
+        except Exception:
+            scipy_v = "?"
+        try:
+            np_v = np.__version__
+        except Exception:
+            np_v = "?"
+
+        payload = {
+            "$schema_version": EXPORT_SCHEMA_VERSION,
+            "$schema_url": "https://github.com/hernanozv/RiskLab-v2/blob/main/EXPORT_SCHEMA.md",
+            "$generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "$generator": {
+                "tool": "Risk Lab",
+                "version": getattr(self, "APP_VERSION", "?"),
+                "metodologia": "Monte Carlo - Loss Distribution Approach (LDA)"
+            },
+            "metadata": {
+                "moneda": "USD",
+                "unidad_temporal": "año",
+                "idioma_descripciones": "es"
+            },
+            "ai_agent_briefing": _AI_BRIEFING_ES
+        }
+
+        # ---- Configuration ----
+        try:
+            num_sim_config = int(self.num_simulaciones_var.text())
+        except Exception:
+            num_sim_config = n_sim
+        payload["configuration"] = {
+            "num_simulaciones": num_sim_config,
+            "moneda": "USD",
+            "current_scenario_name": getattr(getattr(self, "current_scenario", None), "nombre", None),
+            "execution_source": "scenario" if getattr(self, "current_scenario", None) is not None else "main"
+        }
+
+        # ---- Execution metadata ----
+        try:
+            ordenes = ordenar_eventos_por_dependencia(eventos)
+            id_to_idx = {e.get("id"): i for i, e in enumerate(eventos)}
+            topological_order = []
+            for pos, eid in enumerate(ordenes, 1):
+                idx = id_to_idx.get(eid)
+                ev = eventos[idx] if idx is not None else None
+                topological_order.append({
+                    "position": pos,
+                    "event_id": eid,
+                    "event_name": ev.get("nombre") if ev else None
+                })
+        except Exception:
+            topological_order = []
+
+        payload["execution_metadata"] = {
+            "executed_at": payload["$generated_at"],
+            "engine": {
+                "rng": "PCG64 (numpy.random.default_rng)",
+                "scipy_version": scipy_v,
+                "numpy_version": np_v
+            },
+            "active_events_count": sum(1 for e in eventos if e.get("activo", True)),
+            "total_events_count": len(eventos),
+            "topological_order": topological_order
+        }
+
+        # ---- Input events (decodificados con descripciones) ----
+        payload["input_events"] = [
+            self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
+            for e in eventos
+        ]
+
+        # ---- Input scenarios ----
+        scenarios_block = []
+        for sc in (getattr(self, "scenarios", []) or []):
+            try:
+                eventos_sc = sc.eventos_riesgo or []
+                mapa_sc = {e.get("id"): e.get("nombre") for e in eventos_sc if e.get("id")}
+                scenarios_block.append({
+                    "nombre": sc.nombre,
+                    "descripcion": sc.descripcion,
+                    "eventos_riesgo": [
+                        self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_sc)
+                        for e in eventos_sc
+                    ]
+                })
+            except Exception:
+                continue
+        payload["input_scenarios"] = scenarios_block
+
+        # Las siguientes secciones se llenan paso a paso
+        payload["results"] = self._build_results_section(
+            opciones, perdidas_totales, frecuencias_totales,
+            perdidas_por_evento, frecuencias_por_evento, eventos, mapa_nombres
+        )
+
+        # Resumen ejecutivo y snapshot textual
+        if opciones.get("incluir_resumen_ejecutivo", True):
+            payload["executive_summary"] = self._build_executive_summary(
+                perdidas_totales, frecuencias_totales,
+                perdidas_por_evento, eventos, payload["results"]
+            )
+
+        if opciones.get("incluir_text_snapshot", True):
+            try:
+                texto = self.generar_resultados(
+                    perdidas_totales, frecuencias_totales,
+                    perdidas_por_evento, frecuencias_por_evento,
+                    eventos, generar_reporte=False, pdf_filename=None
+                )
+            except Exception:
+                texto = ""
+            payload["text_snapshot"] = {
+                "_descripcion": (
+                    "Reporte completo en lenguaje natural (mismo texto que muestra "
+                    "la app en el panel de resultados). Útil para que el agente IA "
+                    "lo lea como un PDF."
+                ),
+                "content": texto
+            }
+
+        # Schema documentation embebido
+        payload["schema_documentation"] = self._build_schema_documentation()
+
+        return payload
+
+    @staticmethod
+    def _decodificar_evento_para_export(evento, mapa_nombres_por_id=None):
+        """Convierte un dict de evento (formato interno) a un dict legible y
+        auto-explicativo para el export IA. Incluye descripciones en español
+        de cada distribución, factor, vínculo y configuración."""
+        out = {
+            "id": evento.get("id"),
+            "nombre": evento.get("nombre"),
+            "activo": bool(evento.get("activo", True))
+        }
+
+        # ---- Distribución de Frecuencia ----
+        freq_op = int(evento.get("freq_opcion", 3))
+        freq_dist_name = _FREQ_DIST_NAMES.get(freq_op, f"desconocida ({freq_op})")
+        freq_block = {
+            "distribucion": freq_dist_name,
+            "freq_opcion": freq_op,
+            "freq_limite_superior": evento.get("freq_limite_superior"),
+            "descripcion": _FREQ_DIST_DESCRIPTIONS.get(freq_op, "")
+        }
+        # Parámetros relevantes según la distribución
+        params_freq = {}
+        if freq_op == 1:  # Poisson
+            params_freq["tasa"] = evento.get("tasa")
+        elif freq_op == 2:  # Binomial
+            params_freq["num_eventos"] = evento.get("num_eventos")
+            params_freq["prob_exito"] = evento.get("prob_exito")
+        elif freq_op == 3:  # Bernoulli
+            params_freq["prob_exito"] = evento.get("prob_exito")
+        elif freq_op == 4:  # Poisson-Gamma
+            for k in ("pg_minimo", "pg_mas_probable", "pg_maximo", "pg_confianza", "pg_alpha", "pg_beta"):
+                if k in evento:
+                    params_freq[k] = evento.get(k)
+        elif freq_op == 5:  # Beta
+            for k in ("beta_minimo", "beta_mas_probable", "beta_maximo", "beta_confianza", "beta_alpha", "beta_beta"):
+                if k in evento:
+                    params_freq[k] = evento.get(k)
+        freq_block["parametros"] = params_freq
+        out["frecuencia"] = freq_block
+
+        # ---- Distribución de Severidad ----
+        sev_op = int(evento.get("sev_opcion", 3))
+        sev_dist_name = _SEV_DIST_NAMES.get(sev_op, f"desconocida ({sev_op})")
+        out["severidad"] = {
+            "distribucion": sev_dist_name,
+            "sev_opcion": sev_op,
+            "sev_input_method": evento.get("sev_input_method", "min_mode_max"),
+            "sev_minimo": evento.get("sev_minimo"),
+            "sev_mas_probable": evento.get("sev_mas_probable"),
+            "sev_maximo": evento.get("sev_maximo"),
+            "sev_params_direct": evento.get("sev_params_direct", {}),
+            "sev_limite_superior": evento.get("sev_limite_superior"),
+            "descripcion": _SEV_DIST_DESCRIPTIONS.get(sev_op, "")
+        }
+
+        # ---- Escalamiento Severidad-Frecuencia (sev_freq_*) ----
+        sev_freq_activado = bool(evento.get("sev_freq_activado", False))
+        esc_block = {
+            "activado": sev_freq_activado,
+            "modelo": evento.get("sev_freq_modelo", "reincidencia"),
+            "tipo_escalamiento": evento.get("sev_freq_tipo_escalamiento", "lineal"),
+            "paso": evento.get("sev_freq_paso"),
+            "base": evento.get("sev_freq_base"),
+            "factor_max": evento.get("sev_freq_factor_max"),
+            "tabla": evento.get("sev_freq_tabla", []),
+            "alpha": evento.get("sev_freq_alpha"),
+            "solo_aumento": evento.get("sev_freq_solo_aumento"),
+            "sistemico_factor_max": evento.get("sev_freq_sistemico_factor_max"),
+        }
+        if sev_freq_activado:
+            modelo = esc_block["modelo"]
+            if modelo == "reincidencia":
+                tipo = esc_block["tipo_escalamiento"]
+                if tipo == "lineal":
+                    esc_block["explicacion"] = (
+                        f"Reincidencia lineal con paso {esc_block['paso']}: "
+                        f"1ra ocurrencia x1.0, 2da x{1+(esc_block['paso'] or 0)}, etc., capeado en x{esc_block['factor_max']}."
+                    )
+                elif tipo == "exponencial":
+                    esc_block["explicacion"] = (
+                        f"Reincidencia exponencial con base {esc_block['base']}: "
+                        f"factor = base^(n-1), capeado en x{esc_block['factor_max']}."
+                    )
+                elif tipo == "tabla":
+                    esc_block["explicacion"] = "Reincidencia por tabla custom (ver campo 'tabla')."
+                else:
+                    esc_block["explicacion"] = "Reincidencia con escalamiento de severidad por ocurrencia."
+            elif modelo == "sistemico":
+                esc_block["explicacion"] = (
+                    f"Modelo sistémico (z-score) con alpha={esc_block['alpha']}: "
+                    f"años con frecuencia inusualmente alta tienen severidad amplificada."
+                )
+        else:
+            esc_block["explicacion"] = "Escalamiento severidad-frecuencia desactivado: severidad fija por ocurrencia."
+        out["escalamiento_severidad_por_frecuencia"] = esc_block
+
+        # ---- Factores de Ajuste (controles, factores estáticos, seguros) ----
+        factores_decodificados = []
+        for f in (evento.get("factores_ajuste") or []):
+            tipo_modelo = f.get("tipo_modelo", "estatico")
+            tipo_severidad = f.get("tipo_severidad", "porcentual")
+            es_seguro = (tipo_severidad == "seguro")
+            f_out = {
+                "nombre": f.get("nombre"),
+                "activo": bool(f.get("activo", True)),
+                "tipo_modelo": tipo_modelo,
+                "afecta_frecuencia": bool(f.get("afecta_frecuencia", True)),
+                "afecta_severidad": bool(f.get("afecta_severidad", False))
+            }
+            if es_seguro:
+                f_out["tipo_severidad"] = "seguro"
+                f_out["seguro"] = {
+                    "tipo_deducible": f.get("seguro_tipo_deducible", "agregado"),
+                    "deducible": f.get("seguro_deducible", 0),
+                    "cobertura_pct": f.get("seguro_cobertura_pct", 0),
+                    "limite_ocurrencia": f.get("seguro_limite_ocurrencia", 0),
+                    "limite_agregado_anual": f.get("seguro_limite", 0)
+                }
+                td = f_out["seguro"]["tipo_deducible"]
+                ded = f_out["seguro"]["deducible"]
+                cob = f_out["seguro"]["cobertura_pct"]
+                lim_oc = f_out["seguro"]["limite_ocurrencia"]
+                lim_ag = f_out["seguro"]["limite_agregado_anual"]
+                f_out["explicacion"] = (
+                    f"Póliza de seguro ({td}). Deducible ${ded:,.0f}, cubre {cob}% del exceso, "
+                    f"límite por ocurrencia ${lim_oc:,.0f} y límite agregado anual ${lim_ag:,.0f}."
+                )
+            elif tipo_modelo == "estocastico":
+                f_out["confiabilidad_pct"] = f.get("confiabilidad", 100)
+                f_out["reduccion_efectiva_pct"] = f.get("reduccion_efectiva", 0)
+                f_out["reduccion_fallo_pct"] = f.get("reduccion_fallo", 0)
+                f_out["reduccion_severidad_efectiva_pct"] = f.get("reduccion_severidad_efectiva", 0)
+                f_out["reduccion_severidad_fallo_pct"] = f.get("reduccion_severidad_fallo", 0)
+                f_out["explicacion"] = (
+                    f"Control estocástico con {f_out['confiabilidad_pct']}% de confiabilidad. "
+                    f"Si funciona: reduce {f_out['reduccion_efectiva_pct']}% la frecuencia y "
+                    f"{f_out['reduccion_severidad_efectiva_pct']}% la severidad. "
+                    f"Si falla: aplica {f_out['reduccion_fallo_pct']}% (frec) y "
+                    f"{f_out['reduccion_severidad_fallo_pct']}% (sev). "
+                    "Mismo sorteo determina ambos efectos simultáneamente."
+                )
+            else:
+                f_out["impacto_porcentual"] = f.get("impacto_porcentual", 0)
+                f_out["impacto_severidad_pct"] = f.get("impacto_severidad_pct", 0)
+                f_out["explicacion"] = (
+                    f"Factor estático: aplica {f_out['impacto_porcentual']}% de impacto en "
+                    f"frecuencia y {f_out['impacto_severidad_pct']}% en severidad SIEMPRE "
+                    "(sin probabilidad de fallo)."
+                )
+            factores_decodificados.append(f_out)
+        out["factores_ajuste"] = factores_decodificados
+
+        # ---- Vínculos (dependencias entre eventos) ----
+        vinculos_decodificados = []
+        for v in (evento.get("vinculos") or []):
+            tipo = v.get("tipo", "AND")
+            id_padre = v.get("id_padre")
+            nombre_padre = None
+            if mapa_nombres_por_id and id_padre in mapa_nombres_por_id:
+                nombre_padre = mapa_nombres_por_id[id_padre]
+            v_out = {
+                "id_padre": id_padre,
+                "nombre_padre": nombre_padre,
+                "tipo": tipo,
+                "probabilidad_pct": v.get("probabilidad", 100),
+                "factor_severidad": v.get("factor_severidad", 1.0),
+                "umbral_severidad": v.get("umbral_severidad", 0)
+            }
+            if tipo == "AND":
+                logica = "Solo ocurre SI el padre ocurrió Y se activa el vínculo"
+            elif tipo == "OR":
+                logica = "Puede ocurrir si AL MENOS UN padre OR ocurrió y se activó"
+            else:  # EXCLUYE
+                logica = "Solo ocurre si los padres EXCLUYE NO ocurrieron"
+            v_out["explicacion"] = (
+                f"Vínculo {tipo} con padre '{nombre_padre or id_padre}': {logica}. "
+                f"Probabilidad de activación {v_out['probabilidad_pct']}%, "
+                f"factor severidad {v_out['factor_severidad']}x, "
+                f"umbral pérdida del padre ${v_out['umbral_severidad']:,.0f}."
+            )
+            vinculos_decodificados.append(v_out)
+        out["vinculos"] = vinculos_decodificados
+
+        return out
+
+    @staticmethod
+    def _calc_distribucion_frecuencia_completa(arr):
+        """Para arrays enteros pequeños, devuelve frecuencia de cada valor único."""
+        try:
+            arr = np.asarray(arr)
+            if arr.size == 0:
+                return {"valores_unicos": [], "conteos": []}
+            max_v = int(np.max(arr))
+            if max_v <= 100000:
+                conteos = np.bincount(arr.astype(np.int64))
+                valores = np.arange(len(conteos))
+                # Filtrar solo valores con conteo > 0 para no saturar el JSON
+                mask = conteos > 0
+                return {
+                    "valores_unicos": [int(v) for v in valores[mask]],
+                    "conteos": [int(c) for c in conteos[mask]]
+                }
+            else:
+                # Datos muy dispersos: usar histograma
+                return {"valores_unicos": [], "conteos": [], "_nota": "rango muy amplio, ver histograma"}
+        except Exception:
+            return {"valores_unicos": [], "conteos": []}
+
+    @staticmethod
+    def _json_default(obj):
+        """Serializador para tipos numpy y otros."""
+        try:
+            import numpy as _np
+            if isinstance(obj, _np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (_np.integer,)):
+                return int(obj)
+            if isinstance(obj, (_np.floating,)):
+                v = float(obj)
+                if v != v:  # NaN
+                    return None
+                if v == float("inf"):
+                    return "inf"
+                if v == float("-inf"):
+                    return "-inf"
+                return v
+            if isinstance(obj, (_np.bool_,)):
+                return bool(obj)
+        except Exception:
+            pass
+        try:
+            return float(obj)
+        except Exception:
+            return str(obj)
 
     def guardar_configuracion(self):
         if not self.eventos_riesgo and not self.scenarios:

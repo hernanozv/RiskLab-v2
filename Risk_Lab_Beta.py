@@ -2178,6 +2178,34 @@ def _samplear_frecuencia_estocastica_vec(evento, factores_subset, rng):
         return np.where(valid, nb_samples, ps_samples).astype(np.int32)
 
     if freq_opcion == 5:  # Beta + Bernoulli
+        # Si el evento fue importado con beta_alpha/beta_beta directos (sin
+        # min/mode/max), usar esa parametrizacion. Misma logica que el fix
+        # bug #9 para PG: cuando hay parametros directos, los usamos como
+        # base y aplicamos el factor en la escala de probabilidad media.
+        beta_alpha_dir = evento.get('beta_alpha')
+        beta_beta_dir = evento.get('beta_beta')
+        usa_beta_directos = (
+            beta_alpha_dir is not None and beta_beta_dir is not None
+            and float(beta_alpha_dir) > 0 and float(beta_beta_dir) > 0
+            and evento.get('beta_mas_probable') is None
+        )
+        if usa_beta_directos:
+            alpha_b = float(beta_alpha_dir)
+            beta_b = float(beta_beta_dir)
+            mas_prob_base = alpha_b / (alpha_b + beta_b)
+            probs_aj = aplicar_factor_a_probabilidad_vec(mas_prob_base, factores_subset)
+            probs_aj = np.clip(probs_aj, 1e-4, 1 - 1e-4)
+            # Escalar alpha/beta para mantener varianza relativa
+            ab_sum = alpha_b + beta_b
+            alphas = probs_aj * ab_sum
+            betas = (1.0 - probs_aj) * ab_sum
+            valid = (alphas > 0) & (betas > 0)
+            alphas_safe = np.where(valid, alphas, 1.0)
+            betas_safe = np.where(valid, betas, 1.0)
+            p_sampled = rng.beta(alphas_safe, betas_safe)
+            p_final = np.where(valid, p_sampled, probs_aj)
+            return (rng.random(n) < p_final).astype(np.int32)
+
         mas_prob = evento.get('beta_mas_probable', 50) / 100.0
         minimo = evento.get('beta_minimo', 0) / 100.0
         maximo = evento.get('beta_maximo', 100) / 100.0
@@ -3144,76 +3172,81 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 # APLICAR SEGUROS POR OCURRENCIA a pérdidas mitigadas
                 # DESPUÉS de aplicar factor de severidad
                 # =====================================================
-                seguros_por_ocurrencia = [s for s in evento.get('_seguros_aplicables', []) 
+                seguros_por_ocurrencia = [s for s in evento.get('_seguros_aplicables', [])
                                           if s.get('tipo_deducible') == 'por_ocurrencia']
-                
-                # Guardar pagos del seguro por ocurrencia para aplicar límite agregado después
-                pagos_seguro_por_ocurrencia = np.zeros_like(total_perdidas_del_evento_concatenadas)
-                info_seguros_ocurrencia = []  # Para debug y aplicar límite agregado
-                
+
+                # Fix bug #14: el limite agregado anual debe aplicarse POR ASEGURADORA,
+                # no a la suma de pagos de TODAS las aseguradoras. Antes el codigo sumaba
+                # los pagos de todas las aseguradoras en un unico array y luego aplicaba
+                # cada limite a esa suma, lo que reducia incorrectamente el pago total.
+                # Ahora computamos el pago por aseguradora por simulacion, aplicamos el
+                # limite agregado de ESA aseguradora a SUS propios pagos, y solo despues
+                # los acumulamos.
+                pagos_por_aseguradora = []  # lista de dicts: {'pago_por_ocurrencia': np.ndarray, 'limite_agregado': float, 'seguro': dict}
+
                 for seguro in seguros_por_ocurrencia:
                     deducible = seguro['deducible']
                     cobertura_pct = seguro['cobertura_pct']
                     limite_ocurr = seguro.get('limite_ocurrencia', 0)
-                    limite_agregado = seguro.get('limite', 0)  # Límite agregado anual
-                    
-                    # Calcular pago del seguro para cada pérdida individual (ya mitigada)
+                    limite_agregado = seguro.get('limite', 0)  # Limite agregado anual de ESTA aseguradora
+
+                    # Calcular pago del seguro para cada perdida individual (ya mitigada)
                     exceso = np.maximum(total_perdidas_del_evento_concatenadas - deducible, 0)
                     pago_seguro = exceso * cobertura_pct
                     if limite_ocurr > 0:
                         pago_seguro = np.minimum(pago_seguro, limite_ocurr)
-                    
-                    # Guardar info para aplicar límite agregado después de sumar por simulación
-                    # (Optimización: se eliminó la copia de 'pago_por_ocurrencia' porque solo
-                    # se lee 'limite_agregado' más adelante.)
-                    info_seguros_ocurrencia.append({
+
+                    pagos_por_aseguradora.append({
                         'seguro': seguro,
-                        'limite_agregado': limite_agregado
+                        'limite_agregado': limite_agregado,
+                        'pago_por_ocurrencia': pago_seguro
                     })
 
-                    # Acumular pagos (se restará después de verificar límite agregado)
-                    pagos_seguro_por_ocurrencia += pago_seguro
-                    
                     nombre_evento = evento.get('nombre', evento_id)
                     _dbg(f"[DEBUG SEGURO POR OCURRENCIA] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
                           f"(Ded=${deducible:,.0f}/ocurr, Cob={cobertura_pct*100:.0f}%, LímOcurr=${limite_ocurr:,.0f}, LímAnual=${limite_agregado:,.0f})")
 
-                # Asignar pérdidas BRUTAS a las simulaciones (sin restar seguro aún)
+                # Asignar perdidas BRUTAS a las simulaciones (sin restar seguro aun)
                 indices_con_ocurrencias = np.flatnonzero(final_event_frequencies > 0)
                 frecuencias_en_esas_simulaciones = final_event_frequencies[indices_con_ocurrencias]
 
                 if total_perdidas_del_evento_concatenadas.size > 0 and frecuencias_en_esas_simulaciones.size > 0:
                     idx_rep = np.repeat(indices_con_ocurrencias, frecuencias_en_esas_simulaciones)
-                    
-                    # Pérdidas brutas por simulación
+
+                    # Perdidas brutas por simulacion
                     perdidas_brutas_por_sim = np.bincount(
                         idx_rep,
                         weights=total_perdidas_del_evento_concatenadas,
                         minlength=num_simulaciones
                     )
-                    
-                    # Pagos del seguro por simulación (antes de aplicar límite agregado)
-                    pagos_seguro_por_sim = np.bincount(
-                        idx_rep,
-                        weights=pagos_seguro_por_ocurrencia,
-                        minlength=num_simulaciones
-                    )
-                    
-                    # Aplicar límite agregado anual si existe
-                    for info in info_seguros_ocurrencia:
-                        limite_agregado = info['limite_agregado']
-                        if limite_agregado > 0:
-                            # Si el pago total del año excede el límite, ajustar
-                            exceso_sobre_limite = np.maximum(pagos_seguro_por_sim - limite_agregado, 0)
-                            pagos_seguro_por_sim = np.minimum(pagos_seguro_por_sim, limite_agregado)
-                            
-                            # Debug: mostrar cuántas simulaciones excedieron el límite
-                            num_excedidas = np.sum(exceso_sobre_limite > 0)
+
+                    # Fix bug #14: por cada aseguradora, computar su pago por simulacion,
+                    # aplicar SU limite agregado, y solo despues acumular en el total.
+                    pagos_seguro_por_sim = np.zeros(num_simulaciones)
+                    info_seguros_ocurrencia = []  # solo para debug downstream
+                    for info_pa in pagos_por_aseguradora:
+                        pago_esta_aseg_por_sim = np.bincount(
+                            idx_rep,
+                            weights=info_pa['pago_por_ocurrencia'],
+                            minlength=num_simulaciones
+                        )
+                        limite_agregado_aseg = info_pa['limite_agregado']
+                        if limite_agregado_aseg > 0:
+                            num_excedidas = int(np.sum(pago_esta_aseg_por_sim > limite_agregado_aseg))
+                            pago_esta_aseg_por_sim = np.minimum(pago_esta_aseg_por_sim, limite_agregado_aseg)
                             if num_excedidas > 0:
                                 nombre_evento = evento.get('nombre', evento_id)
-                                _dbg(f"[DEBUG SEGURO POR OCURRENCIA]   Límite agregado ${limite_agregado:,.0f}/año aplicado en {num_excedidas} simulaciones")
-                    
-                    # Pérdidas netas = brutas - pago del seguro (respetando límite agregado)
+                                _dbg(f"[DEBUG SEGURO POR OCURRENCIA] Evento '{nombre_evento}': "
+                                      f"Seguro '{info_pa['seguro'].get('nombre')}': "
+                                      f"limite agregado ${limite_agregado_aseg:,.0f}/anio aplicado en {num_excedidas} simulaciones")
+                        pagos_seguro_por_sim += pago_esta_aseg_por_sim
+                        info_seguros_ocurrencia.append({
+                            'seguro': info_pa['seguro'],
+                            'limite_agregado': limite_agregado_aseg
+                        })
+
+                    # Perdidas netas = brutas - pago del seguro (respetando limite agregado)
+                    # (el limite agregado ya fue aplicado por aseguradora en el bucle anterior)
                     perdidas_para_este_evento = perdidas_brutas_por_sim - pagos_seguro_por_sim
                     np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)
                     

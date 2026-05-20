@@ -1,0 +1,143 @@
+name: Build Executables
+
+on:
+  push:
+    branches:
+      - 'claude/pyinstaller-executable-*'
+    tags:
+      - 'v*.*.*'
+    paths:
+      - '.github/build-trigger.json'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - windows
+          - macos
+          - all
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      build_windows: ${{ steps.check.outputs.build_windows }}
+      build_macos: ${{ steps.check.outputs.build_macos }}
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine build targets
+        id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            PLATFORM="${{ github.event.inputs.platform }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            PLATFORM="all"
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            PLATFORM=$(python3 -c "import json; d=json.load(open('.github/build-trigger.json')); print(d.get('platform','all'))")
+          fi
+
+          echo "is_release=${IS_RELEASE:-false}" >> $GITHUB_OUTPUT
+
+          if [[ "$PLATFORM" == "windows" || "$PLATFORM" == "all" ]]; then
+            echo "build_windows=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_windows=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [[ "$PLATFORM" == "macos" || "$PLATFORM" == "all" ]]; then
+            echo "build_macos=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_macos=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-windows:
+    needs: setup
+    if: needs.setup.outputs.build_windows == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller Risk_Lab_Beta.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: RiskLab-Windows
+          path: dist\Risk_Lab_Beta\
+          retention-days: 7
+
+  build-macos:
+    needs: setup
+    if: needs.setup.outputs.build_macos == 'true'
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller Risk_Lab_Beta_mac.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: RiskLab-macOS
+          path: "dist/Risk Lab Beta/"
+          retention-days: 7
+
+  release:
+    needs: [setup, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.is_release == 'true'
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: RiskLab-Windows
+          path: RiskLab-Windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: RiskLab-macOS
+          path: RiskLab-macOS
+
+      - name: Package artifacts for release
+        run: |
+          cd RiskLab-Windows && zip -r ../RiskLab-Windows.zip . && cd ..
+          cd RiskLab-macOS && zip -r ../RiskLab-macOS.zip . && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.6.1
+        with:
+          files: |
+            RiskLab-Windows.zip
+            RiskLab-macOS.zip
+          generate_release_notes: true

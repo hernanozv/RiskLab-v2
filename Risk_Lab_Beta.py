@@ -53,6 +53,40 @@ def _dbg(*args, **kwargs):
 
 
 # ==========================================================================
+# Categoria custom de warning para señalar que el motor aplicó un cap a la
+# frecuencia generada. El cap se aplica como salvaguarda de memoria (la
+# severidad se materializa como un array de tamaño sum(frecuencias)), pero
+# distorsiona la media de pérdidas. La UI puede capturar este warning para
+# avisar al usuario; los tests pueden assert que NO se emite cuando la
+# configuración está dentro del rango operativo.
+# ==========================================================================
+class RiskLabFrequencyCapWarning(UserWarning):
+    """Se emite cuando el motor reescala frecuencias por exceder el límite
+    de memoria. Si aparece, los resultados subestiman pérdidas."""
+    pass
+
+
+class RiskLabRejectionFallbackWarning(UserWarning):
+    """Se emite cuando el rejection sampling para aplicar un limite (freq_cap
+    o sev_cap) se queda corto y el motor cae al fallback de clamping. El
+    clamping fuerza al cap los valores que no se pudieron remuestrear, lo que
+    crea una masa puntual artificial en el cap. Indica que el cap es muy
+    restrictivo para la distribucion subyacente."""
+    pass
+
+
+# Limite absoluto de eventos individuales generados por evento por chunk de
+# simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
+# eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
+# para num_simulaciones=10K), distorsionando severamente cualquier modelo de
+# alta frecuencia (logistica, fraude, etc.). Lo subimos a 500M para cubrir el
+# rango realista (modelos con E[N] hasta ~500K/yr y 10K sims/chunk). Si aun se
+# excede, se emite RiskLabFrequencyCapWarning y se marca el evento para que la
+# UI y el export adviertan al usuario sobre la distorsion.
+MAX_EVENTOS_POR_EVENTO_POR_CHUNK = 500_000_000
+
+
+# ==========================================================================
 # Constantes para el feature "Exportar para Análisis (IA)"
 # (descripciones SIEMPRE en español)
 # ==========================================================================
@@ -1502,8 +1536,11 @@ def generar_distribucion_frecuencia(opcion, tasa=None, num_eventos_posibles=None
             if poisson_gamma_params is None or len(poisson_gamma_params) != 2:
                 raise ValueError("Se requieren los parámetros (alpha, beta) para la distribución Poisson-Gamma.")
             alpha, beta = poisson_gamma_params
-            if alpha <= 1 or beta <= 0:
-                raise ValueError("Los parámetros alpha y beta deben ser positivos, y alpha > 1.")
+            # Fix bug #8: la restriccion alpha > 1 era matematicamente incorrecta.
+            # Una Gamma con shape <= 1 es perfectamente valida (modela sobre-dispersion
+            # alta, util para eventos raros en racimo). Solo exigimos alpha > 0.
+            if alpha <= 0 or beta <= 0:
+                raise ValueError("Los parámetros alpha y beta deben ser positivos.")
             distribucion_frecuencia = PoissonGammaDistribution(alpha=alpha, beta=beta)
         elif opcion == 5:  # Beta para probabilidad anual
             if beta_params is None or len(beta_params) != 2:
@@ -2097,6 +2134,27 @@ def _samplear_frecuencia_estocastica_vec(evento, factores_subset, rng):
         return (rng.random(n) < probs_aj).astype(np.int32)
 
     if freq_opcion == 4:  # Poisson-Gamma (Negative Binomial)
+        # Fix bug #9: si el evento fue importado con pg_alpha/pg_beta directos
+        # (sin min/mode/max), usar esa parametrizacion y escalar la media via
+        # factores_subset preservando alpha (forma) y ajustando beta.
+        # Mean(Gamma) = alpha/beta. Para escalar la media por f, mantenemos
+        # alpha y usamos beta' = beta / f. La p de la NB queda beta'/(1+beta').
+        pg_alpha_dir = evento.get('pg_alpha')
+        pg_beta_dir = evento.get('pg_beta')
+        usa_param_directos = (
+            pg_alpha_dir is not None and pg_beta_dir is not None
+            and float(pg_alpha_dir) > 0 and float(pg_beta_dir) > 0
+            and evento.get('pg_mas_probable') is None
+        )
+        if usa_param_directos:
+            alpha_base = float(pg_alpha_dir)
+            beta_base = float(pg_beta_dir)
+            factores_safe = np.maximum(factores_subset, 1e-9)
+            betas_vec = beta_base / factores_safe
+            ps_vec = np.clip(betas_vec / (betas_vec + 1.0), 1e-12, 1 - 1e-12)
+            alphas_vec = np.full_like(ps_vec, alpha_base, dtype=np.float64)
+            return rng.negative_binomial(alphas_vec, ps_vec).astype(np.int32)
+
         mas_prob = evento.get('pg_mas_probable', 1.0)
         minimo = evento.get('pg_minimo', 0)
         maximo = evento.get('pg_maximo', mas_prob * 2)
@@ -2624,8 +2682,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 mask = muestras_frecuencia_simuladas > freq_cap
                                 intentos += 1
                             if np.any(mask):
+                                _n_clamp = int(np.sum(mask))
+                                warnings.warn(
+                                    f"[Risk Lab] Evento '{evento.get('nombre', evento_id)}': "
+                                    f"rejection sampling no convergio para freq_limite_superior={freq_cap} "
+                                    f"({_n_clamp} valor(es) forzado(s) al cap). El cap puede ser muy bajo para "
+                                    f"la distribucion subyacente; los resultados muestran una masa puntual artificial en {freq_cap}.",
+                                    RiskLabRejectionFallbackWarning, stacklevel=2)
                                 muestras_frecuencia_simuladas[mask] = freq_cap
-                    
+
                     # Asegurar que sean valores no negativos y enteros
                     muestras_frecuencia_simuladas = np.clip(muestras_frecuencia_simuladas, 0, np.iinfo(np.int32).max)
                     muestras_frecuencia_simuladas = muestras_frecuencia_simuladas.astype(np.int32)
@@ -2704,6 +2769,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     mask = muestras_frecuencia_simuladas > freq_cap
                                     intentos += 1
                                 if np.any(mask):
+                                    _n_clamp = int(np.sum(mask))
+                                    warnings.warn(
+                                        f"[Risk Lab] Evento '{evento.get('nombre', evento_id)}': "
+                                        f"rejection sampling no convergio para freq_limite_superior={freq_cap} "
+                                        f"({_n_clamp} valor(es) forzado(s) al cap). El cap puede ser muy bajo para "
+                                        f"la distribucion subyacente; los resultados muestran una masa puntual artificial en {freq_cap}.",
+                                        RiskLabRejectionFallbackWarning, stacklevel=2)
                                     muestras_frecuencia_simuladas[mask] = freq_cap
                         
                         # Asegurar que sean valores no negativos y enteros
@@ -2759,6 +2831,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                 mask = muestras_frecuencia > freq_cap
                                 intentos += 1
                             if np.any(mask):
+                                _n_clamp = int(np.sum(mask))
+                                warnings.warn(
+                                    f"[Risk Lab] Evento '{evento.get('nombre', evento_id)}': "
+                                    f"rejection sampling no convergio para freq_limite_superior={freq_cap} "
+                                    f"({_n_clamp} valor(es) forzado(s) al cap). El cap puede ser muy bajo para "
+                                    f"la distribucion subyacente; los resultados muestran una masa puntual artificial en {freq_cap}.",
+                                    RiskLabRejectionFallbackWarning, stacklevel=2)
                                 muestras_frecuencia[mask] = freq_cap
                     # Asegurar que sean valores no negativos y enteros con límite superior
                     muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
@@ -2809,6 +2888,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             mask = muestras_frecuencia > freq_cap
                             intentos += 1
                         if np.any(mask):
+                            _n_clamp = int(np.sum(mask))
+                            warnings.warn(
+                                f"[Risk Lab] Evento '{evento.get('nombre', evento_id)}': "
+                                f"rejection sampling no convergio para freq_limite_superior={freq_cap} "
+                                f"({_n_clamp} valor(es) forzado(s) al cap). El cap puede ser muy bajo para "
+                                f"la distribucion subyacente; los resultados muestran una masa puntual artificial en {freq_cap}.",
+                                RiskLabRejectionFallbackWarning, stacklevel=2)
                             muestras_frecuencia[mask] = freq_cap
                 # Asegurar que sean valores no negativos y enteros con límite superior
                 muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
@@ -2833,11 +2919,35 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         
         final_event_frequencies = muestras_frecuencia
         sum_final_event_frequencies = int(final_event_frequencies.sum())
-        max_eventos_simulacion = 10000000 # Límite definido anteriormente
+        max_eventos_simulacion = MAX_EVENTOS_POR_EVENTO_POR_CHUNK
 
         if sum_final_event_frequencies > max_eventos_simulacion:
-            print(f"Advertencia: El número total de eventos ({sum_final_event_frequencies}) para el evento {evento_id} excede el límite de {max_eventos_simulacion}. Se reescalará.")
+            # Fix bug #1: emitir warning visible (RiskLabFrequencyCapWarning) y dejar
+            # huella en el dict del evento para que el export y la UI puedan advertir.
+            # ATENCION: cuando esto se dispara los resultados subestiman perdidas porque
+            # las frecuencias se reescalan multiplicativamente (preservan CV pero
+            # comprimen la media). Idealmente debería implementarse muestreo de severidad
+            # por bloques de simulaciones para evitar el cap completamente.
             factor = max_eventos_simulacion / sum_final_event_frequencies
+            media_original = sum_final_event_frequencies / max(num_simulaciones, 1)
+            media_capeada = max_eventos_simulacion / max(num_simulaciones, 1)
+            nombre_evento_warn = evento.get('nombre', evento_id)
+            mensaje_cap = (
+                f"[Risk Lab] Evento '{nombre_evento_warn}': la suma de frecuencias "
+                f"({sum_final_event_frequencies:,}) excede el limite del motor "
+                f"({max_eventos_simulacion:,}). Se reescalan las frecuencias por un "
+                f"factor de {factor:.6f}. Esto SUBESTIMA las perdidas porque la media "
+                f"se comprime de {media_original:,.1f} a ~{media_capeada:,.1f} eventos/sim. "
+                f"Reduzca num_simulaciones o revise los parametros de frecuencia."
+            )
+            warnings.warn(mensaje_cap, RiskLabFrequencyCapWarning, stacklevel=2)
+            # Marcar el evento para que el export/UI puedan reportar la distorsion.
+            evento['_cap_frecuencia_aplicado'] = True
+            evento['_cap_frecuencia_factor'] = float(factor)
+            evento['_cap_frecuencia_suma_original'] = int(sum_final_event_frequencies)
+            evento['_cap_frecuencia_suma_capeada'] = int(max_eventos_simulacion)
+            evento['_cap_frecuencia_media_original'] = float(media_original)
+            evento['_cap_frecuencia_media_capeada'] = float(media_capeada)
             # Escalar y aplicar redondeo estocástico sin sesgo, preservando la suma exacta al tope
             scaled = final_event_frequencies.astype(np.float64) * factor
             floored = np.floor(scaled).astype(np.int32)
@@ -2904,6 +3014,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         mask = total_perdidas_del_evento_concatenadas > sev_cap
                         intentos += 1
                     if np.any(mask):
+                        _n_clamp = int(np.sum(mask))
+                        warnings.warn(
+                            f"[Risk Lab] Evento '{evento.get('nombre', evento_id)}': "
+                            f"rejection sampling no convergio para sev_limite_superior={sev_cap} "
+                            f"({_n_clamp} valor(es) forzado(s) al cap). El cap puede ser muy bajo para "
+                            f"la severidad subyacente; los resultados muestran una masa puntual artificial en {sev_cap}.",
+                            RiskLabRejectionFallbackWarning, stacklevel=2)
                         total_perdidas_del_evento_concatenadas[mask] = sev_cap
                 
                 # =====================================================
@@ -11451,70 +11568,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
             print(f"[DEBUG EJECUTAR V2] Número de eventos originales: {len(eventos)}")
             print(f"[DEBUG EJECUTAR V2] Número de eventos activos: {len(eventos_activos)}")
             
-            # Preparar la lista de eventos para la simulación utilizando los eventos activos
+            # Preparar la lista de eventos para la simulación utilizando los eventos activos.
+            # Fix bug #2: copiamos TODOS los campos del evento (shallow copy) para no perder
+            # sev_opcion, sev_input_method, sev_params_direct, sev_minimo/mas_probable/maximo,
+            # pg_alpha/beta, beta_alpha/beta, activo, etc. Antes se reconstruia un dict con
+            # un subconjunto de campos, lo que provocaba que el export IA usara defaults
+            # (sev_opcion=3 PERT) en lugar de la configuracion real del evento.
             eventos_simulacion = []
             for evento_data in eventos_activos:
-                evento = {
-                    'id': evento_data['id'],
-                    'nombre': evento_data['nombre'],
-                    'dist_severidad': evento_data['dist_severidad'],
-                    'dist_frecuencia': evento_data['dist_frecuencia']
-                }
+                evento = {**evento_data}
 
-                # Incluir vínculos si existen
-                if 'vinculos' in evento_data:
-                    evento['vinculos'] = evento_data['vinculos']
-
-                # Para compatibilidad con formato antiguo
-                elif 'eventos_padres' in evento_data:
-                    evento['eventos_padres'] = evento_data['eventos_padres']
-                    evento['tipo_dependencia'] = evento_data.get('tipo_dependencia', 'AND')
-                
-                # IMPORTANTE: Incluir factores de ajuste si existen
-                if 'factores_ajuste' in evento_data:
+                # factores_ajuste: deep copy para no mutar el modelo original durante la sim
+                if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
                     evento['factores_ajuste'] = copy.deepcopy(evento_data['factores_ajuste'])
-                    print(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': copiando {len(evento_data['factores_ajuste'])} factores")
+                    _dbg(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': copiando {len(evento_data['factores_ajuste'])} factores")
                     for f in evento_data['factores_ajuste']:
-                        print(f"[DEBUG EJECUTAR V2]     - {f.get('nombre')}: tipo={f.get('tipo_modelo')}")
+                        _dbg(f"[DEBUG EJECUTAR V2]     - {f.get('nombre')}: tipo={f.get('tipo_modelo')}")
                 else:
-                    print(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': SIN factores_ajuste")
-                
-                # Incluir todos los parámetros de frecuencia necesarios para el ajuste
-                if 'freq_opcion' in evento_data:
-                    evento['freq_opcion'] = evento_data['freq_opcion']
-                if 'tasa' in evento_data:
-                    evento['tasa'] = evento_data['tasa']
-                if 'prob_exito' in evento_data:
-                    evento['prob_exito'] = evento_data['prob_exito']
-                if 'num_eventos' in evento_data:
-                    evento['num_eventos'] = evento_data['num_eventos']
-                if 'pg_mas_probable' in evento_data:
-                    evento['pg_mas_probable'] = evento_data['pg_mas_probable']
-                if 'pg_minimo' in evento_data:
-                    evento['pg_minimo'] = evento_data['pg_minimo']
-                if 'pg_maximo' in evento_data:
-                    evento['pg_maximo'] = evento_data['pg_maximo']
-                if 'pg_confianza' in evento_data:
-                    evento['pg_confianza'] = evento_data['pg_confianza']
-                if 'beta_mas_probable' in evento_data:
-                    evento['beta_mas_probable'] = evento_data['beta_mas_probable']
-                if 'beta_minimo' in evento_data:
-                    evento['beta_minimo'] = evento_data['beta_minimo']
-                if 'beta_maximo' in evento_data:
-                    evento['beta_maximo'] = evento_data['beta_maximo']
-                if 'beta_confianza' in evento_data:
-                    evento['beta_confianza'] = evento_data['beta_confianza']
-
-                # Copiar configuración de escalamiento severidad-frecuencia
-                for key in evento_data:
-                    if key.startswith('sev_freq_'):
-                        evento[key] = evento_data[key]
-
-                # Copiar límites superiores opcionales
-                if 'sev_limite_superior' in evento_data:
-                    evento['sev_limite_superior'] = evento_data['sev_limite_superior']
-                if 'freq_limite_superior' in evento_data:
-                    evento['freq_limite_superior'] = evento_data['freq_limite_superior']
+                    _dbg(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': SIN factores_ajuste")
 
                 eventos_simulacion.append(evento)
 
@@ -17789,12 +17860,42 @@ class RiskLabApp(QtWidgets.QMainWindow):
         except Exception:
             topological_order = []
 
+        # ---- Engine limits y eventos con cap aplicado ----
+        # Reportar limites internos del motor y si algun evento fue reescalado
+        # silenciosamente (bug #1). Si 'eventos_con_cap' no esta vacio, las
+        # perdidas reportadas SUBESTIMAN la realidad.
+        eventos_con_cap = []
+        for ev in eventos:
+            if ev.get('_cap_frecuencia_aplicado'):
+                eventos_con_cap.append({
+                    "event_id": ev.get("id"),
+                    "event_name": ev.get("nombre"),
+                    "factor_reescalado": ev.get('_cap_frecuencia_factor'),
+                    "suma_frecuencias_original": ev.get('_cap_frecuencia_suma_original'),
+                    "suma_frecuencias_capeada": ev.get('_cap_frecuencia_suma_capeada'),
+                    "media_por_simulacion_original": ev.get('_cap_frecuencia_media_original'),
+                    "media_por_simulacion_capeada": ev.get('_cap_frecuencia_media_capeada')
+                })
+
         payload["execution_metadata"] = {
             "executed_at": payload["$generated_at"],
             "engine": {
                 "rng": "PCG64 (numpy.random.default_rng)",
                 "scipy_version": scipy_v,
                 "numpy_version": np_v
+            },
+            "engine_limits": {
+                "max_eventos_por_evento_por_chunk": MAX_EVENTOS_POR_EVENTO_POR_CHUNK,
+                "descripcion": (
+                    "Limite absoluto del motor: cantidad maxima de ocurrencias "
+                    "individuales generadas por evento dentro de un chunk de "
+                    "simulacion. Si la suma de frecuencias generadas excede este "
+                    "limite, el motor reescala las frecuencias multiplicativamente, "
+                    "lo que preserva el CV pero SUBESTIMA la media de perdidas. "
+                    "Si 'eventos_con_cap_aplicado' no esta vacio, los resultados "
+                    "estan distorsionados."
+                ),
+                "eventos_con_cap_aplicado": eventos_con_cap
             },
             "active_events_count": sum(1 for e in eventos if e.get("activo", True)),
             "total_events_count": len(eventos),

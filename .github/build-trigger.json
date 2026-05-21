@@ -1,0 +1,6 @@
+{
+  "platform": "all",
+  "trigger_timestamp": "2026-05-21T15:00:00Z",
+  "trigger_reason": "Build de produccion con todos los fixes de PRs #3 a #8 (158 tests pasando)",
+  "main_sha": "5651ce1496b467926144d381ae87a3b2ec3fa92b"
+}

@@ -532,7 +532,6 @@ def obtener_parametros_lognormal(minimo, mas_probable, maximo):
         if result_alt.success:
             mu_alt, sigma_alt = result_alt.x
             # Usar resultado alternativo y emitir warning
-            import warnings
             warnings.warn(
                 f"Distribución LogNormal ajustada usando 'más probable' como MEDIANA (no moda) "
                 f"debido a alta dispersión (σ={sigma_alt:.2f} > 1.0). "
@@ -625,7 +624,6 @@ def obtener_parametros_gpd(minimo, mas_probable, maximo):
     if xi < 0:
         max_support = mu - beta / xi
         if maximo > max_support * 0.95:  # Margen de seguridad del 5%
-            import warnings
             warnings.warn(
                 f"GPD con cola finita (ξ={xi:.3f}). Soporte teórico máximo: {max_support:.2f}. "
                 f"El máximo ingresado ({maximo:.2f}) está cerca o excede este límite.",
@@ -1063,7 +1061,6 @@ class BetaFrequencyDistribution:
             
         except Exception as e:
             # En caso de error crítico, emitir advertencia visible
-            import warnings
             warnings.warn(
                 f"Error al generar muestras de frecuencia Beta-Bernoulli: {str(e)}. "
                 f"Retornando ceros como fallback, pero esto puede afectar los resultados de la simulación.",
@@ -1119,7 +1116,6 @@ class BetaFrequencyDistribution:
                 
                 return result
         except Exception as e:
-            import warnings
             warnings.warn(
                 f"Error al calcular PMF de Beta-Bernoulli: {str(e)}. Retornando ceros.",
                 RuntimeWarning,
@@ -1156,7 +1152,6 @@ class BetaFrequencyDistribution:
                 
                 return result
         except Exception as e:
-            import warnings
             warnings.warn(
                 f"Error al calcular CDF de Beta-Bernoulli: {str(e)}. Retornando fallback.",
                 RuntimeWarning,
@@ -1418,7 +1413,6 @@ def generar_distribucion_severidad(opcion, minimo, mas_probable, maximo,
                 if c < 0:
                     # Cola finita: soporte es [loc, loc - scale/c]
                     max_support = loc - scale / c
-                    import warnings
                     warnings.warn(
                         f"GPD con cola finita (c={c:.3f}). "
                         f"Soporte: [{loc:.2f}, {max_support:.2f}]. "
@@ -1426,7 +1420,6 @@ def generar_distribucion_severidad(opcion, minimo, mas_probable, maximo,
                         UserWarning
                     )
                 elif c > 0.5:
-                    import warnings
                     warnings.warn(
                         f"GPD con cola muy pesada (c={c:.3f}). "
                         f"La media solo existe si c < 1, la varianza si c < 0.5.",
@@ -2565,7 +2558,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 pass
             except Exception as e:
                 # En caso de error, usar distribución original y continuar
-                import warnings
                 warnings.warn(
                     f"Error al aplicar ajustes de probabilidad para evento '{evento.get('nombre', evento_id)}': {str(e)}. "
                     f"Se usará la distribución original.",
@@ -2727,7 +2719,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     muestras_frecuencia[indices_a_simular] = muestras_frecuencia_simuladas
                     
                 except Exception as e:
-                    import warnings
                     nombre_evento = evento.get('nombre', evento_id)
                     warnings.warn(
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}': {str(e)}. "
@@ -2813,7 +2804,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # Asignar a las posiciones correspondientes
                         muestras_frecuencia[indices_a_simular] = muestras_frecuencia_simuladas
                     except Exception as e:
-                        import warnings
                         nombre_evento = evento.get('nombre', evento_id)
                         warnings.warn(
                             f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (formato antiguo): {str(e)}. "
@@ -2871,7 +2861,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
                     muestras_frecuencia = muestras_frecuencia.astype(np.int32)
                 except Exception as e:
-                    import warnings
                     nombre_evento = evento.get('nombre', evento_id)
                     warnings.warn(
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin padres): {str(e)}. "
@@ -2928,7 +2917,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 muestras_frecuencia = np.clip(muestras_frecuencia, 0, np.iinfo(np.int32).max)
                 muestras_frecuencia = muestras_frecuencia.astype(np.int32)
             except Exception as e:
-                import warnings
                 nombre_evento = evento.get('nombre', evento_id)
                 warnings.warn(
                     f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin dependencias): {str(e)}. "
@@ -3259,7 +3247,6 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     perdidas_para_este_evento = np.zeros(num_simulaciones)
 
             except Exception as e:
-                import warnings
                 nombre_evento = evento.get('nombre', evento_id)
                 warnings.warn(
                     f"Error INESPERADO al generar/asignar severidad para evento '{nombre_evento}': {str(e)}. "

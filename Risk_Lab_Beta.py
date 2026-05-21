@@ -2354,8 +2354,12 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     tipo_sev = f.get('tipo_severidad', 'porcentual')
                                     if tipo_sev == 'seguro':
                                         # Guardar seguro para aplicar después
+                                        # Fix bug #19: 'or 100' convertia silenciosamente
+                                        # cobertura_pct=0 a 100 (porque 0 es falsy en Python).
+                                        # Ahora usamos check explicito de None.
                                         ded_val = float(f.get('seguro_deducible', 0) or 0)
-                                        cob_val = float(f.get('seguro_cobertura_pct', 100) or 100)
+                                        _cob_raw = f.get('seguro_cobertura_pct', 100)
+                                        cob_val = float(100 if _cob_raw is None else _cob_raw)
                                         lim_val = float(f.get('seguro_limite', 0) or 0)
                                         tipo_ded = f.get('seguro_tipo_deducible', 'agregado')
                                         lim_ocurr = float(f.get('seguro_limite_ocurrencia', 0) or 0)
@@ -2412,9 +2416,12 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             if f.get('afecta_severidad', False):
                                 tipo_sev = f.get('tipo_severidad', 'porcentual')
                                 if tipo_sev == 'seguro':
-                                    # Guardar seguro para aplicar después
+                                    # Guardar seguro para aplicar despues
+                                    # Fix bug #19: 'or 100' convertia silenciosamente
+                                    # cobertura_pct=0 a 100 (0 es falsy en Python).
                                     ded_val_s = float(f.get('seguro_deducible', 0) or 0)
-                                    cob_val_s = float(f.get('seguro_cobertura_pct', 100) or 100)
+                                    _cob_raw_s = f.get('seguro_cobertura_pct', 100)
+                                    cob_val_s = float(100 if _cob_raw_s is None else _cob_raw_s)
                                     lim_val_s = float(f.get('seguro_limite', 0) or 0)
                                     tipo_ded_s = f.get('seguro_tipo_deducible', 'agregado')
                                     lim_ocurr_s = float(f.get('seguro_limite_ocurrencia', 0) or 0)
@@ -12753,7 +12760,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 try:
                                     tipo_ded = factor.get('seguro_tipo_deducible', 'agregado')
                                     ded = float(factor.get('seguro_deducible', 0) or 0)
-                                    cob = float(factor.get('seguro_cobertura_pct', 100) or 100)
+                                    # Fix bug #19: usar None check explicito (0 es falsy)
+                                    _cob_raw = factor.get('seguro_cobertura_pct', 100)
+                                    cob = float(100 if _cob_raw is None else _cob_raw)
                                     lim = float(factor.get('seguro_limite', 0) or 0)
                                     lim_ocurr = float(factor.get('seguro_limite_ocurrencia', 0) or 0)
                                     ded_str = f"${ded:,.0f}" if ded > 0 else "$0"

@@ -254,6 +254,25 @@ sns.set(style="whitegrid")
 # Ignoramos advertencias de runtime
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+def media_cola_condicional(arr, umbral):
+    """Media condicional E[X | X > umbral] usada para CVaR/Expected Shortfall
+    y análisis de cola (tail_mean).
+
+    Usa comparación estrictamente mayor (`>`) en vez de `>=`. Esto es crítico
+    cuando `umbral` es un percentil que cae en una zona de masa puntual (p.ej.
+    VaR99=0 porque >=99% de las simulaciones no tienen pérdida): con `>=` la
+    "cola" terminaría incluyendo TODA la distribución (ya que las pérdidas
+    nunca son negativas) y la media condicional colapsaría a la media
+    incondicional, subestimando el riesgo real de forma severa. Con `>`
+    estricta, solo las simulaciones que efectivamente superan el umbral
+    entran en el cálculo. Si ninguna lo supera, se retorna `umbral` como
+    mejor estimación disponible (degenerado: toda la masa de la cola está
+    en el propio umbral).
+    """
+    arr = np.asarray(arr)
+    cola = arr[arr > umbral]
+    return float(cola.mean()) if cola.size > 0 else float(umbral)
+
 # Función para formatear números en formato contable personalizado
 def currency_format(value):
     """Formatea un número en formato monetario con separador de miles y decimales personalizados."""
@@ -2550,8 +2569,17 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         
                                         if alpha_ajustado > 0 and beta_ajustado > 0:
                                             # Usar Beta para generar p, luego Bernoulli
-                                            # En simulación, samplear de Beta y luego usar ese p
-                                            dist_freq = beta(a=alpha_ajustado, b=beta_ajustado)
+                                            # En simulación, samplear de Beta y luego usar ese p.
+                                            # NOTA: usar la clase BetaFrequencyDistribution en vez de
+                                            # llamar a `beta(...)` (scipy.stats.beta importado a nivel
+                                            # de módulo). Dentro de esta misma función, la rama
+                                            # freq_opcion==4 asigna `beta = mu / (sigma ** 2)` como
+                                            # variable local; por las reglas de scope de Python eso
+                                            # vuelve local el nombre `beta` en TODA la función, así
+                                            # que `beta(...)` aquí lanzaba UnboundLocalError (enmascarado
+                                            # por el except genérico de abajo, cayendo a un Bernoulli de
+                                            # p fijo en vez del Beta-Bernoulli con incertidumbre sobre p).
+                                            dist_freq = BetaFrequencyDistribution(alpha=alpha_ajustado, beta=beta_ajustado)
                                             _dbg(f"[DEBUG]   Beta: p más probable {prob_original:.4f} → {prob_ajustada:.4f}")
                                         else:
                                             _dbg(f"[DEBUG]   Beta: Parámetros inválidos, usando Bernoulli simple")
@@ -11837,7 +11865,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # llamar a np.percentile dos veces más (90 y 99 ya están en percentiles_valores).
         var_90 = float(percentiles[percentiles_valores.index(90)])
         opvar_99 = float(percentiles[percentiles_valores.index(99)])
-        opvar = perdidas_totales[perdidas_totales >= opvar_99].mean()
+        opvar = media_cola_condicional(perdidas_totales, opvar_99)
         texto_resultados += obtener_resumen_ejecutivo_texto(media, desviacion_estandar, var_90, opvar_99, opvar,
                                                             min_freq_total, mode_freq_total, max_freq_total)
 
@@ -14114,9 +14142,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
         fig8.tight_layout()
         figuras.append(fig8)
 
-        # Cálculo de perdidas_cola
+        # Cálculo de perdidas_cola (estrictamente > para no colapsar la cola a
+        # toda la distribución cuando percentil_80 cae en una masa puntual,
+        # p.ej. eventos raros donde >=80% de las simulaciones no tienen pérdida)
         percentil_80 = np.percentile(perdidas_totales, 80)
-        perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
+        perdidas_cola = perdidas_totales[perdidas_totales > percentil_80]
+        if perdidas_cola.size == 0:
+            perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure()
@@ -15600,9 +15632,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Cálculo de perdidas_cola
+        # Cálculo de perdidas_cola (estrictamente > para no colapsar la cola a
+        # toda la distribución cuando percentil_80 cae en una masa puntual,
+        # p.ej. eventos raros donde >=80% de las simulaciones no tienen pérdida)
         percentil_80 = np.percentile(perdidas_totales, 80)
-        perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
+        perdidas_cola = perdidas_totales[perdidas_totales > percentil_80]
+        if perdidas_cola.size == 0:
+            perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure(figsize=(8, 5))
@@ -16373,9 +16409,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
         canvas_calendario = InteractiveFigureCanvas(fig_calendario)
         ax_calendario = fig_calendario.add_subplot(111)
 
-        # Calcular frecuencia promedio de eventos
-        eventos_por_año = np.mean(frecuencias_totales)
-
         # Usar los mismos 4 umbrales que en otros gráficos (Termómetro, Semáforo)
         umbral_bajo = 3_000_000
         umbral_moderado = 32_000_000
@@ -16394,9 +16427,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
         for umbral, nombre, color in niveles:
             prob_exceder = len(perdidas_totales[perdidas_totales > umbral]) / len(perdidas_totales)
             prob_anual = prob_exceder * 100  # Probabilidad anual en %
-            
-            if prob_exceder > 0 and eventos_por_año > 0:
-                periodo_retorno = 1 / (prob_exceder * eventos_por_año)
+
+            # NOTA: prob_exceder ya es una probabilidad anual (cada simulación
+            # representa un año agregado), por lo que el período de retorno es
+            # simplemente su inverso. No debe multiplicarse por eventos_por_año.
+            if prob_exceder > 0:
+                periodo_retorno = 1 / prob_exceder
             else:
                 periodo_retorno = float('inf')
             
@@ -16702,7 +16738,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # llamar a np.percentile dos veces más (90 y 99 ya están en percentiles_valores).
         var_90 = float(percentiles[percentiles_valores.index(90)])
         opvar_99 = float(percentiles[percentiles_valores.index(99)])
-        opvar = perdidas_totales[perdidas_totales >= opvar_99].mean()
+        opvar = media_cola_condicional(perdidas_totales, opvar_99)
         texto_resultados += obtener_resumen_ejecutivo_texto(media, desviacion_estandar, var_90, opvar_99, opvar,
                                                             min_freq_total, mode_freq_total, max_freq_total)
 
@@ -17000,8 +17036,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             var_90 = float(np.percentile(arr, 90))
             var_95 = float(np.percentile(arr, 95))
             var_99 = float(np.percentile(arr, 99))
-            cola = arr[arr >= var_99]
-            es_99 = float(np.mean(cola)) if cola.size > 0 else None
+            es_99 = media_cola_condicional(arr, var_99)
             return {
                 "VaR_90": var_90,
                 "VaR_95": var_95,
@@ -17167,8 +17202,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
             for nombre, umbral in [("BAJO", ub), ("MODERADO", um), ("ALTO", ua), ("CRITICO", uc)]:
                 p_exc = float(np.mean(perdidas_totales > umbral))
                 prob_anual_pct = round(p_exc * 100, 4)
-                if p_exc > 0 and eventos_por_año > 0:
-                    periodo = 1.0 / (p_exc * eventos_por_año)
+                # p_exc ya es una probabilidad anual (cada simulación = un año
+                # agregado), por lo que el período de retorno es su inverso directo.
+                if p_exc > 0:
+                    periodo = 1.0 / p_exc
                 else:
                     periodo = float("inf")
                 # Etiqueta humana
@@ -17427,8 +17464,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         try:
             media = float(np.mean(perdidas_totales)) if perdidas_totales.size > 0 else 0.0
             var_99 = float(np.percentile(perdidas_totales, 99)) if perdidas_totales.size > 0 else 0.0
-            cola = perdidas_totales[perdidas_totales >= var_99]
-            es_99 = float(np.mean(cola)) if cola.size > 0 else 0.0
+            es_99 = media_cola_condicional(perdidas_totales, var_99) if perdidas_totales.size > 0 else 0.0
             try:
                 curt = float(stats.kurtosis(perdidas_totales))
                 asim = float(stats.skew(perdidas_totales))
@@ -17755,7 +17791,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
         try:
             if perdidas_totales.size > 0:
                 p80 = float(np.percentile(perdidas_totales, 80))
-                cola = perdidas_totales[perdidas_totales >= p80]
+                # Estrictamente > para no colapsar la cola a toda la distribución
+                # cuando p80 cae en una masa puntual (ver media_cola_condicional).
+                cola = perdidas_totales[perdidas_totales > p80]
+                if cola.size == 0:
+                    cola = perdidas_totales[perdidas_totales >= p80]
                 top10 = sorted(perdidas_totales, reverse=True)[:10]
                 results["tail_analysis"] = {
                     "tail_threshold_p80": p80,
@@ -18826,8 +18866,7 @@ class ResultReport:
         
         # OpVaR: Pérdida esperada más allá del P99
         opvar_99 = stats_dict['percentiles'][99]
-        perdidas_extremas = self.perdidas_totales[self.perdidas_totales >= opvar_99]
-        stats_dict['opvar'] = float(np.mean(perdidas_extremas)) if len(perdidas_extremas) > 0 else opvar_99
+        stats_dict['opvar'] = media_cola_condicional(self.perdidas_totales, opvar_99)
         
         # Estadísticas de frecuencias agregadas
         stats_dict['freq_min'] = int(np.min(self.frecuencias_totales))

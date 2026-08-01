@@ -2120,6 +2120,19 @@ def _samplear_frecuencia_estocastica_vec(evento, factores_subset, rng):
         np.ndarray int32 con las muestras de frecuencia, o None si la
         distribución (freq_opcion) no soporta vectorización (caller debe usar
         dist_freq.rvs como fallback).
+
+    NOTA — semántica distinta de `factores_subset` según freq_opcion (conocida
+    y documentada, no es un bug):
+      - Poisson (1) y Poisson-Gamma (4): el factor escala λ/μ de forma
+        multiplicativa exacta (factor=0.7 ⇒ reducción exacta del 30%).
+      - Binomial (2), Bernoulli (3) y Beta (5, ver rama más abajo): el factor
+        se aplica vía `aplicar_factor_a_probabilidad_vec`, que hace un shift
+        aditivo en escala log-odds. El efecto REAL sobre la probabilidad
+        depende de prob_original y normalmente NO coincide con el "factor"
+        nominal (ver docstring de log_odds_utils.py). Esto significa que el
+        mismo "factor=0.7" (nominal "-30%") reduce λ en Poisson exactamente
+        30%, pero reduce p en Bernoulli/Binomial en un % distinto (varía con
+        p base). Es una decisión de diseño existente, no corregida aquí.
     """
     freq_opcion = evento.get('freq_opcion', 3)
     n = factores_subset.size
@@ -2366,6 +2379,17 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     impacto_pct = f.get('impacto_porcentual', 0)
                                     # VALIDACIÓN: Clipear impacto para evitar factores <= 0
                                     impacto_pct = max(impacto_pct, -99)
+                                    # LIMITACIÓN CONOCIDA (no corregida): para Bernoulli/Binomial/Beta,
+                                    # los factores estáticos aquí se acumulan MULTIPLICATIVAMENTE en
+                                    # factores_vector y luego aplicar_factor_a_probabilidad_vec hace
+                                    # shift = producto(factores) - 1. En cambio, cuando TODOS los
+                                    # factores del evento son estáticos (rama pura, ver
+                                    # ajustar_probabilidad_por_factores en log_odds_utils.py), los
+                                    # shifts se acumulan ADITIVAMENTE. Σ(fi-1) ≠ Π(fi)-1 para N>1
+                                    # factores, así que el mismo conjunto de factores estáticos da un
+                                    # resultado distinto según haya o no OTRO factor estocástico en el
+                                    # mismo evento. Para Poisson/Poisson-Gamma esto no afecta el
+                                    # resultado (ambas formas de acumular coinciden al multiplicar λ).
                                     factores_vector *= (1 + impacto_pct / 100.0)
                                 
                                 # Severidad: solo si afecta_severidad es True
@@ -2477,6 +2501,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # ===== SOLO PARA ESTÁTICO: Ajustar dist_freq una vez =====
                         # Para estocástico, dist_freq se mantiene original y se ajusta al samplear
                         # Aplicar ajuste según el tipo de distribución
+                        #
+                        # NOTA (conocida, no es un bug): Poisson/Poisson-Gamma ajustan λ/μ de
+                        # forma multiplicativa exacta (factor_multiplicativo=0.7 ⇒ -30% exacto).
+                        # Binomial/Bernoulli/Beta ajustan la probabilidad vía
+                        # ajustar_probabilidad_por_factores (shift aditivo en log-odds), cuyo
+                        # efecto REAL depende de la probabilidad base y no coincide exactamente
+                        # con el "factor_multiplicativo" nominal (ver log_odds_utils.py). Por lo
+                        # tanto, el mismo "-30%" nominal reduce λ en Poisson exactamente 30% pero
+                        # reduce p en Bernoulli/Binomial/Beta en un % distinto según el caso.
                         if freq_opcion == 1:  # Poisson (λ = frecuencia esperada)
                             tasa_original = evento.get('tasa')
                             if tasa_original is not None and tasa_original > 0:
@@ -2490,7 +2523,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             prob_original = evento.get('prob_exito')
                             n = evento.get('num_eventos', 1)
                             if prob_original is not None and 0 < prob_original < 1:
-                                # Para probabilidades, usar log-odds
+                                # Para probabilidades, usar log-odds. Esta rama (TODOS los factores
+                                # son estáticos) acumula los shifts log-odds ADITIVAMENTE dentro de
+                                # ajustar_probabilidad_por_factores. Ver nota de "LIMITACIÓN CONOCIDA"
+                                # más arriba (rama estocástica mixta): si el mismo evento tuviera
+                                # además un factor estocástico, esta acumulación aditiva no coincide
+                                # con la acumulación multiplicativa que usaría esa otra rama para los
+                                # mismos factores estáticos.
                                 prob_ajustada, _ = ajustar_probabilidad_por_factores(prob_original, evento['factores_ajuste'])
                                 prob_ajustada = min(max(prob_ajustada, 0.0001), 0.9999)
                                 dist_freq = binom(n=n, p=prob_ajustada)
@@ -9541,9 +9580,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         # Explicación simple para el usuario
         explicacion_ajustes = QtWidgets.QLabel(
-            "💡 Los <b>controles</b> reducen el riesgo (valores positivos, ej: 30% = reduce 30%). "
-            "Los <b>factores de riesgo</b> lo aumentan (valores negativos, ej: -50% = aumenta 50%). "
-            "Puede afectar la <b>frecuencia</b> (probabilidad de ocurrencia), la <b>severidad</b> (impacto económico), o ambas."
+            "💡 Los <b>controles</b> reducen el riesgo (valores positivos). "
+            "Los <b>factores de riesgo</b> lo aumentan (valores negativos). "
+            "Puede afectar la <b>frecuencia</b> (probabilidad de ocurrencia), la <b>severidad</b> (impacto económico), o ambas. "
+            "Sobre la <b>severidad</b> el % ingresado es exacto (ej: 30% = reduce el impacto económico en 30%). "
+            "Sobre la <b>frecuencia</b>, el % es exacto para eventos Poisson/Poisson-Gamma; para eventos de "
+            "probabilidad (Bernoulli, Binomial, Beta) es un ajuste aproximado en escala log-odds cuyo efecto "
+            "real depende de la probabilidad base — revise la vista previa para ver el valor exacto resultante."
         )
         explicacion_ajustes.setWordWrap(True)
         explicacion_ajustes.setStyleSheet("background-color: #e8f4f8; padding: 8px; border-radius: 3px; font-size: {UI_FONT_BODY}pt;")
@@ -9780,7 +9823,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
             impacto_var.setRange(-200, 99)  # Positivo reduce (máx 99%), negativo aumenta
             impacto_var.setValue(30)  # Por defecto 30% reducción
             impacto_var.setSuffix("%")
-            impacto_var.setToolTip("Positivo reduce la frecuencia (0-99%), negativo la aumenta")
+            impacto_var.setToolTip(
+                "Positivo reduce la frecuencia, negativo la aumenta. Exacto para eventos "
+                "Poisson/Poisson-Gamma; para eventos de probabilidad (Bernoulli, Binomial, "
+                "Beta) es un ajuste aproximado en escala log-odds — vea la vista previa "
+                "para el valor real."
+            )
             estatico_layout.addRow("   Reducción frecuencia (%):", impacto_var)
             
             # Conectar checkbox para habilitar/deshabilitar campo de frecuencia
@@ -10157,7 +10205,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 
                 item_config = QtWidgets.QTableWidgetItem(conf_text)
                 item_config.setFlags(item_config.flags() & ~QtCore.Qt.ItemIsEditable)
-                item_config.setToolTip("F=Frecuencia, S=Severidad. Positivo=reducción. Doble click para editar")
+                item_config.setToolTip(
+                    "F=Frecuencia, S=Severidad. Positivo=reducción, negativo=aumento. "
+                    "El % de F es exacto para Poisson/Poisson-Gamma; para eventos de "
+                    "probabilidad (Bernoulli/Binomial/Beta) es aproximado (escala log-odds). "
+                    "Doble click para editar"
+                )
                 ajustes_table.setItem(idx, 3, item_config)
                 
                 # Botón eliminar
@@ -10273,7 +10326,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
             # Invertir signo al cargar: internamente negativo = reducción, UI positivo = reducción
             impacto_var.setValue(-factor_actual.get('impacto_porcentual', -30))  # Pre-cargar valor invertido
             impacto_var.setSuffix("%")
-            impacto_var.setToolTip("Positivo reduce la frecuencia (0-99%), negativo la aumenta")
+            impacto_var.setToolTip(
+                "Positivo reduce la frecuencia, negativo la aumenta. Exacto para eventos "
+                "Poisson/Poisson-Gamma; para eventos de probabilidad (Bernoulli, Binomial, "
+                "Beta) es un ajuste aproximado en escala log-odds — vea la vista previa "
+                "para el valor real."
+            )
             impacto_var.setEnabled(afecta_frecuencia_default)  # Habilitar según estado
             estatico_layout.addRow("   Reducción frecuencia (%):", impacto_var)
             

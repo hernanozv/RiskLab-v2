@@ -6,6 +6,22 @@ Módulo de utilidades para ajuste de probabilidades en Risk Lab.
 Este módulo usa transformaciones log-odds internamente para combinar
 efectos de múltiples controles y factores de riesgo de forma aditiva.
 
+IMPORTANTE — semántica de 'impacto_porcentual' / 'factor_multiplicativo':
+El número que el usuario ingresa (p.ej. -30 para "reduce 30%") NO se aplica
+como un porcentaje literal sobre la probabilidad. Se convierte en un shift
+ADITIVO en la escala log-odds (impacto_pct * 0.01), y luego se vuelve a
+transformar a probabilidad con la función logística. Esto permite combinar
+varios factores sumando sus shifts, pero como consecuencia la reducción/
+aumento REAL de la probabilidad depende del valor de la probabilidad base:
+    - Para p_base=10%, un "-30%" produce una reducción real de ~24% (p final ≈7.6%)
+    - Para p_base=50%, un "-30%" produce una reducción real de ~15% (p final ≈42.6%)
+El "-30%" nominal y la reducción real coinciden solo aproximadamente para
+probabilidades base pequeñas. Esta es una decisión de diseño deliberada
+(la escala log-odds es lo que permite sumar varios controles de forma
+consistente), pero cualquier UI o reporte que muestre este valor debe
+aclarar que es un "impacto nominal en escala log-odds", no un porcentaje
+de reducción exacto de la probabilidad.
+
 Autor: Risk Lab Team
 Versión: 1.0
 """
@@ -20,36 +36,51 @@ def ajustar_probabilidad_por_factores(
 ) -> Tuple[float, str]:
     """
     Ajusta una probabilidad base aplicando múltiples factores de control/riesgo.
-    
+
     Los factores se combinan usando la escala log-odds, lo que permite:
     - Combinar efectos independientes de forma aditiva
     - Mantener probabilidades en el rango válido (0, 1)
     - Modelar tanto controles (reducen riesgo) como factores (aumentan riesgo)
-    
+
+    ATENCIÓN — 'impacto_porcentual' NO es un porcentaje literal de reducción/
+    aumento de la probabilidad: es un shift aditivo en escala log-odds
+    (impacto_pct * 0.01). El efecto real sobre la probabilidad depende de
+    probabilidad_base y normalmente será DISTINTO al número nominal (ver
+    ejemplo abajo: -30% nominal produce ~24% de reducción real para p=10%).
+    Esto es intencional (permite sumar varios factores de forma consistente
+    en escala log-odds), pero cualquier texto/UI que muestre
+    'impacto_porcentual' debe aclarar que es un impacto nominal, no un
+    porcentaje exacto.
+
     Args:
         probabilidad_base: Probabilidad inicial, debe estar en el rango (0, 1)
         factores: Lista de diccionarios con las siguientes claves:
             - 'nombre': str, descripción del factor
-            - 'impacto_porcentual': float, impacto en % (+aumenta, -reduce)
+            - 'impacto_porcentual': float, shift nominal en escala log-odds,
+              expresado como si fuera un % (+aumenta, -reduce). NO es el %
+              de cambio real de la probabilidad (ver nota ATENCIÓN arriba).
             - 'activo': bool, si el factor está actualmente activo
-    
+
     Returns:
         Tupla de (probabilidad_ajustada, explicación_texto)
-        
+
     Ejemplos:
         >>> factores = [
         ...     {'nombre': 'Firewall', 'impacto_porcentual': -30, 'activo': True},
         ...     {'nombre': 'Auditoría', 'impacto_porcentual': -20, 'activo': False}
         ... ]
         >>> p_ajustada, explicacion = ajustar_probabilidad_por_factores(0.10, factores)
-        >>> print(f"{p_ajustada:.1%}")  # ~7.4%
-        7.4%
-    
+        >>> print(f"{p_ajustada:.1%}")  # 7.6% (reducción REAL ~24%, no 30%)
+        7.6%
+
     Notas:
         - Valores negativos reducen la probabilidad (controles)
         - Valores positivos aumentan la probabilidad (factores de riesgo)
         - Solo los factores con 'activo'=True se aplican
         - Si la probabilidad_base no está en (0,1), se devuelve sin cambios
+        - El % de cambio REAL de la probabilidad no es igual al
+          'impacto_porcentual' nominal; varía según probabilidad_base
+          (ver docstring del módulo)
     """
     # Validar probabilidad base
     if not isinstance(probabilidad_base, (int, float)):
@@ -90,9 +121,12 @@ def ajustar_probabilidad_por_factores(
         if not isinstance(impacto_pct, (int, float)) or impacto_pct == 0:
             continue
         
-        # Convertir porcentaje a ajuste en escala log-odds
-        # Escala: 10% de impacto ≈ 0.1 en log-odds
-        # Esta es una escala intuitiva que permite combinar efectos aditivamente
+        # Convertir el "impacto nominal" a un shift en escala log-odds.
+        # NOTA: esto NO es un porcentaje literal de la probabilidad — es un
+        # shift aditivo (impacto_pct/100) en log-odds que permite combinar
+        # varios factores sumando. El % de cambio REAL sobre la probabilidad
+        # depende de probabilidad_base (ver docstring del módulo y de esta
+        # función para el detalle numérico).
         ajuste_log_odds = impacto_pct * 0.01
         
         log_odds += ajuste_log_odds
@@ -174,27 +208,37 @@ def aplicar_factor_a_probabilidad_vec(probabilidad_base: float, factores_vector)
 
 def aplicar_factor_a_probabilidad(probabilidad_base: float, factor_multiplicativo: float) -> float:
     """
-    Aplica un factor multiplicativo a una probabilidad usando log-odds.
-    
+    Aplica un factor multiplicativo "nominal" a una probabilidad usando log-odds.
+
     Esta función es útil para modelos estocásticos donde el factor puede variar
     en cada iteración de Monte Carlo.
-    
+
+    ATENCIÓN: `factor_multiplicativo` NO se aplica como un multiplicador
+    literal sobre probabilidad_base (no es `p_ajustada = p_base * factor`).
+    Internamente se convierte a un shift log-odds equivalente a
+    `(factor_multiplicativo - 1) * 100` puntos de "impacto nominal" (ver
+    `ajustar_probabilidad_por_factores`), por lo que el cambio REAL de la
+    probabilidad depende de probabilidad_base y normalmente NO coincide con
+    el "factor - 1" nominal (ver ejemplos abajo).
+
     Args:
         probabilidad_base: Probabilidad inicial en (0, 1)
-        factor_multiplicativo: Factor a aplicar. 
-            - factor < 1: Reduce probabilidad (ej: 0.5 = reducción del 50%)
+        factor_multiplicativo: Factor nominal a aplicar (en escala log-odds).
+            - factor < 1: Reduce probabilidad (ej nominal: 0.5 ⇒ "-50%" nominal,
+              pero la reducción REAL de la probabilidad es distinta, ver ejemplo)
             - factor = 1: Sin cambio
-            - factor > 1: Aumenta probabilidad (ej: 1.5 = aumento del 50%)
-    
+            - factor > 1: Aumenta probabilidad (ej nominal: 1.5 ⇒ "+50%" nominal,
+              reducción/aumento REAL distinto al nominal, ver ejemplo)
+
     Returns:
         Probabilidad ajustada, clipeada a rango (0.0001, 0.9999)
-    
-    Ejemplos:
-        >>> aplicar_factor_a_probabilidad(0.10, 0.5)  # Reducir 50%
-        0.0526  # Aproximadamente 5.3%
-        
-        >>> aplicar_factor_a_probabilidad(0.10, 1.5)  # Aumentar 50%
-        0.1538  # Aproximadamente 15.4%
+
+    Ejemplos (valores verificados numéricamente):
+        >>> aplicar_factor_a_probabilidad(0.10, 0.5)  # "-50%" nominal
+        0.063137  # Reducción REAL: ~36.9% (no 50%)
+
+        >>> aplicar_factor_a_probabilidad(0.10, 1.5)  # "+50%" nominal
+        0.154828  # Aumento REAL: ~54.8% (no 50%)
     """
     # Validar entrada
     if not (0 < probabilidad_base < 1):

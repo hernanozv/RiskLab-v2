@@ -14246,6 +14246,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
             figuras.append(fig2)
 
         # Gráfico 3: Curva de Excedencia
+        # NOTA (hallazgo bajo, documentado sin fix): esta es la curva de
+        # excedencia del PDF "legacy" (generar_figuras, usada por
+        # generar_resultados cuando generar_reporte=True). Usa ejes
+        # (X=Pérdida, Y=Probabilidad) y la función de supervivencia empírica
+        # completa (1 - rank/n sobre TODOS los datos ordenados). La pestaña
+        # interactiva "Excedencia" (dentro de graficar_resultados, más abajo
+        # en este archivo) usa ejes INVERTIDOS (X=Probabilidad, Y=Pérdida) y
+        # un grid de percentiles 1-99 interpolado (np.percentile), no la
+        # supervivencia empírica completa. Ambas son representaciones válidas
+        # de la misma curva, pero un usuario que compare el PDF con la pestaña
+        # interactiva para la misma corrida verá gráficos visualmente
+        # distintos. Unificarlas es una decisión de diseño (qué convención de
+        # ejes/método estadístico volver canónica) que excede el alcance de
+        # un fix puntual; se deja documentado para una futura consolidación.
         fig3 = Figure()
         ax3 = fig3.add_subplot(111)
         sorted_losses = np.sort(perdidas_totales)
@@ -14752,6 +14766,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 pass
 
         # Gráfico 3: Curva de Excedencia (con Probabilidad de Excedencia en eje X)
+        # NOTA (hallazgo bajo, documentado sin fix): esta es la curva de
+        # excedencia INTERACTIVA (pestaña "Excedencia"). Usa ejes invertidos
+        # respecto de la versión del PDF legacy (generar_figuras, más arriba
+        # en este archivo): aquí X=Probabilidad, Y=Pérdida; y se calcula sobre
+        # un grid interpolado de percentiles 1-99 (np.percentile), no la
+        # función de supervivencia empírica completa. Ver la nota espejo en
+        # generar_figuras para el detalle completo de la inconsistencia.
         fig3 = Figure(figsize=(8, 5.5))
         canvas3 = InteractiveFigureCanvas(fig3)
         ax3 = fig3.add_subplot(111)
@@ -18610,7 +18631,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
                             fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
                             umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                            vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'], 'probabilidad': prob, 'factor_severidad': fsev, 'umbral_severidad': umbral})
+                            # Fix bug #39: partir de una copia del vinculo original (no
+                            # de un dict nuevo con solo 5 claves fijas) para preservar
+                            # cualquier clave desconocida/futura que el archivo pudiera
+                            # traer, en vez de descartarla silenciosamente en cada
+                            # ciclo de guardar/cargar.
+                            vinculo_actualizado = dict(vinculo)
+                            vinculo_actualizado.update({
+                                'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
+                                'probabilidad': prob, 'factor_severidad': fsev,
+                                'umbral_severidad': umbral
+                            })
+                            vinculos_actualizados.append(vinculo_actualizado)
                         evento_data['vinculos'] = vinculos_actualizados
 
                 # Cargar escenarios
@@ -18745,7 +18777,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
                                 fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
                                 umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                                vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'], 'probabilidad': prob, 'factor_severidad': fsev, 'umbral_severidad': umbral})
+                                # Fix bug #39: preservar claves desconocidas/futuras del
+                                # vinculo original (ver mismo fix en la lista principal).
+                                vinculo_actualizado = dict(vinculo)
+                                vinculo_actualizado.update({
+                                    'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
+                                    'probabilidad': prob, 'factor_severidad': fsev,
+                                    'umbral_severidad': umbral
+                                })
+                                vinculos_actualizados.append(vinculo_actualizado)
                             evento_data['vinculos'] = vinculos_actualizados
 
                 # Fix bug #21: validar ciclos de dependencia (vinculos) ANTES de

@@ -154,13 +154,13 @@ Risk Lab maneja errores de forma **asimétrica** durante la importación:
 
 | Tipo de error | Comportamiento | Consecuencia |
 |---------------|----------------|--------------|
-| **Severidad inválida** (parámetros incorrectos) | En eventos principales: el evento se **omite** y se muestra advertencia. En escenarios: el evento se agrega con severidad nula (puede fallar en simulación) | Los demás eventos se importan correctamente |
+| **Severidad inválida** (parámetros incorrectos) | El evento se **omite** y se muestra advertencia, tanto en eventos principales como en eventos dentro de escenarios (mismo comportamiento en ambos casos) | Los demás eventos se importan correctamente |
 | **Frecuencia inválida** (parámetros faltantes o fuera de rango) | **CRASH TOTAL** de la importación | No se importa ningún evento |
 | **Campo obligatorio faltante** (`id`, `nombre`, `sev_opcion`, `freq_opcion`) | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **`sev_minimo`/`sev_mas_probable`/`sev_maximo` faltantes** | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **JSON sintácticamente inválido** | **CRASH TOTAL** | Error de parseo |
 
-**CONSECUENCIA PARA EL AGENTE**: Es más seguro equivocarse en la severidad (el evento se omite pero el resto carga) que en la frecuencia o campos estructurales (nada se importa). Sin embargo, en eventos dentro de **escenarios**, un error de severidad NO omite el evento sino que lo agrega con severidad nula, lo cual puede causar errores al simular. Por lo tanto, asegurar parámetros de severidad válidos siempre.
+**CONSECUENCIA PARA EL AGENTE**: Es más seguro equivocarse en la severidad (el evento se omite pero el resto carga) que en la frecuencia o campos estructurales (nada se importa). Este comportamiento es el mismo tanto para eventos principales como para eventos dentro de **escenarios**: en ambos casos, un error de severidad omite el evento afectado (se reporta al usuario) y el resto de la importación continúa con normalidad. Aun así, asegurar parámetros de severidad válidos siempre, para no perder eventos silenciosamente del modelo importado.
 
 ### I) Tabla de referencia rápida: campos por evento
 

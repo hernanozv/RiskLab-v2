@@ -391,7 +391,7 @@ Lista por evento con estadísticas, boxplot, contribución y comportamiento obse
 ]
 ```
 
-### `correlations`
+### `correlation`
 
 ```json
 {
@@ -399,6 +399,9 @@ Lista por evento con estadísticas, boxplot, contribución y comportamiento obse
   "_explicacion": "Correlación de Pearson..."
 }
 ```
+
+Nota: el campo es singular (`correlation`, no `correlations`) porque
+reporta un único valor de correlación (frecuencia vs. pérdida total).
 
 ### `exceedance_curve`
 

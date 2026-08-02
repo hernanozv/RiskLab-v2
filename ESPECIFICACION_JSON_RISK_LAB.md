@@ -851,6 +851,27 @@ Cuando se define un límite superior, Risk Lab **no** recorta los valores al top
 
 ---
 
+## Límites Prácticos (Eventos, Escenarios y Tamaño del Archivo)
+
+Risk Lab **no impone un límite duro** en la cantidad de `eventos_riesgo`, la
+cantidad de `scenarios`, ni el tamaño del archivo JSON en sí. Sin embargo,
+para generar (o revisar) un archivo, es útil conocer las guías prácticas
+que sí existen:
+
+| Aspecto | Guía práctica |
+|---|---|
+| Cantidad de eventos (`eventos_riesgo`) | Sin límite duro. La UI (tabla de eventos, validación de ciclos en cada guardado) está pensada para decenas de eventos; cientos siguen siendo manejables, pero miles pueden volver la interfaz notablemente más lenta. |
+| Cantidad de escenarios (`scenarios`) | Sin límite duro. Misma consideración que eventos: decenas a bajas centenas es el uso típico. |
+| `num_simulaciones` | Mínimo 1, típico 10.000, máximo recomendado 100.000 (ver más arriba). |
+| Ocurrencias totales estimadas (`num_simulaciones` × suma de tasas/frecuencias esperadas de todos los eventos activos) | Por encima de **15.000.000** de ocurrencias estimadas, la app muestra una confirmación explícita antes de simular (riesgo real de quedarse sin memoria RAM). Por encima de **500.000.000** de ocurrencias para un solo evento dentro de un mismo chunk, el motor reescala las frecuencias automáticamente (con una advertencia de que los resultados quedan distorsionados) en vez de intentar generarlas todas. |
+| Tamaño del archivo JSON | Sin límite impuesto por la app; archivos muy grandes (muchos eventos/escenarios, o resultados de simulación embebidos) simplemente tardan más en cargarse/parsearse. |
+
+En la práctica, un archivo con **decenas de eventos y escenarios** y
+`num_simulaciones` dentro del rango recomendado es el caso de uso normal
+y no presenta ningún problema de rendimiento.
+
+---
+
 ## Vínculos (Dependencias entre Eventos)
 
 Los vínculos permiten que la ocurrencia de un evento dependa de otros, con probabilidad de activación, factor de severidad condicional y umbral de severidad del padre configurables:

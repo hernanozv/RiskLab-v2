@@ -311,7 +311,18 @@ _CAMPOS_INTERNOS_SIMULACION = (
 # (descripciones SIEMPRE en español)
 # ==========================================================================
 
-EXPORT_SCHEMA_VERSION = "1.0"
+# R4 bajo #1: incrementada de "1.0" a "1.1". Desde que se fijó en "1.0"
+# se agregaron secciones/campos nuevos (ai_agent_briefing, engine_limits,
+# _meaning en scenario_impacts, activo en factores_ajuste,
+# input_events_omitidos/input_scenarios_omitidos, etc.) y al menos un
+# cambio de significado sobre un campo YA existente sin renombrarlo
+# (risk_map.importancia_score cambió de fórmula en R3 crítico #4, de
+# "ImpactoP90 x FrecuenciaModo" a "ImpactoMedio") -- un consumidor que
+# dependiera del significado viejo del mismo nombre de campo se
+# rompería en silencio. Ninguno de estos cambios había incrementado la
+# versión del schema, dejando a cualquier agente/integración sin forma
+# de detectar que el formato cambió.
+EXPORT_SCHEMA_VERSION = "1.1"
 
 _FREQ_DIST_NAMES = {
     1: "Poisson",
@@ -794,10 +805,20 @@ def obtener_parametros_lognormal(minimo, mas_probable, maximo):
         
         if result_alt.success:
             mu_alt, sigma_alt = result_alt.x
-            # Usar resultado alternativo y emitir warning
+            # R4 bajo #5: el mensaje citaba sigma_alt (el sigma del ajuste
+            # ALTERNATIVO, basado en mediana) como la razón por la que se
+            # activó este branch -- pero la condición que realmente dispara
+            # el cambio de método (más arriba, "if result.success and sigma
+            # > 1.0") evalúa el sigma del ajuste ORIGINAL (basado en moda).
+            # sigma_alt es un valor de un sistema de ecuaciones totalmente
+            # distinto y puede terminar <= 1.0 sin problema, haciendo que el
+            # mensaje se auto-contradiga (ej. "alta dispersión (σ=0.85 >
+            # 1.0)", una afirmación falsa). Se usa 'sigma' (el valor que
+            # efectivamente disparó el cambio) para que el mensaje sea
+            # siempre consistente con su propia condición.
             warnings.warn(
                 f"Distribución LogNormal ajustada usando 'más probable' como MEDIANA (no moda) "
-                f"debido a alta dispersión (σ={sigma_alt:.2f} > 1.0). "
+                f"debido a alta dispersión (σ={sigma:.2f} > 1.0). "
                 f"Esto es normal para distribuciones muy asimétricas.",
                 UserWarning
             )
@@ -5328,81 +5349,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Mostrar el diálogo
         about_dialog.exec_()
         
-    def verificar_graficos_interactivos(self):
-        """
-        Verifica que todos los gráficos en la aplicación estén utilizando
-        InteractiveFigureCanvas en lugar de FigureCanvas estándar.
-        """
-        try:
-            # Importar el validador de gráficos
-            import chart_validator
-            
-            # Mostrar diálogo de información inicial
-            QtWidgets.QMessageBox.information(
-                self,
-                "Verificación de Gráficos Interactivos",
-                "A continuación se realizará una verificación de todos los gráficos\n"
-                "para asegurar que utilizan la versión interactiva con tooltips.\n\n"
-                "Los resultados se mostrarán en un informe detallado."
-            )
-            
-            # Crear y mostrar un diálogo de progreso
-            progress_dialog = QtWidgets.QProgressDialog(
-                "Verificando gráficos interactivos...", 
-                None, 0, 0, self
-            )
-            progress_dialog.setWindowTitle("Verificando Gráficos")
-            progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
-            progress_dialog.show()
-            QtWidgets.QApplication.processEvents()
-            
-            # Ejecutar la validación
-            validator = chart_validator.ChartValidator()
-            
-            # Validar widgets en esta aplicación
-            for widget in self.findChildren(QtWidgets.QWidget):
-                validator.validate_widget(widget)
-                QtWidgets.QApplication.processEvents()  # Mantener la UI responsiva
-                
-            # Cerrar diálogo de progreso
-            progress_dialog.close()
-            
-            # Generar texto de resultados
-            if validator.static_canvases == 0:
-                mensaje_principal = "✅ ÉXITO: ¡Todos los gráficos utilizan InteractiveFigureCanvas!"
-                titulo = "Verificación Exitosa"
-                icono = QtWidgets.QMessageBox.Information
-            else:
-                mensaje_principal = f"⚠️ ATENCIÓN: Se encontraron {validator.static_canvases} gráficos que aún usan FigureCanvas estándar"
-                titulo = "Verificación con Advertencias"
-                icono = QtWidgets.QMessageBox.Warning
-            
-            # Crear mensaje detallado
-            mensaje_detallado = f"""
-            Resultados de la verificación:
-            ----------------------------------------
-            Total de canvas encontrados: {validator.total_canvases}
-            Canvas interactivos: {validator.interactive_canvases}
-            Canvas estáticos: {validator.static_canvases}
-            """
-            
-            # Mostrar resultados en un diálogo
-            result_dialog = QtWidgets.QMessageBox(self)
-            result_dialog.setWindowTitle(titulo)
-            result_dialog.setText(mensaje_principal)
-            result_dialog.setDetailedText(mensaje_detallado)
-            result_dialog.setIcon(icono)
-            result_dialog.setStandardButtons(QtWidgets.QMessageBox.Ok)
-            result_dialog.exec_()
-            
-        except Exception as e:
-            # Manejar errores durante la validación
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Error en Verificación",
-                f"Ocurrió un error durante la verificación de gráficos:\n{str(e)}"
-            )
-
     def aplicar_estilo_boton_primario(self, button):
         """Aplica estilo de botón primario (acciones principales) con paleta MercadoLibre.
         
@@ -13354,7 +13300,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.scenarios_table.setHorizontalHeaderLabels(["Nombre del Escenario", "Descripción"])
         self.scenarios_table.horizontalHeader().setStretchLastSection(True)
         self.scenarios_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.scenarios_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        # R4 bajo #6: eliminar_scenario() siempre estuvo escrito para borrado
+        # múltiple (confirma la cantidad seleccionada, itera sobre todas las
+        # filas seleccionadas en orden descendente), pero SingleSelection
+        # hacía ese código inalcanzable -- nunca podía haber más de una fila
+        # seleccionada a la vez. eventos_table (con el mismo patrón de
+        # eliminar_evento) ya usa MultiSelection; se alinea scenarios_table
+        # con ese mismo precedente para que la funcionalidad ya escrita
+        # funcione de verdad. duplicar_scenario()/guardar_scenario() ya
+        # manejan con gracia el caso de más de una fila seleccionada
+        # (avisan "seleccione solo un escenario"), así que esto no rompe
+        # esos flujos.
+        self.scenarios_table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         self.scenarios_table.setToolTip("Lista de escenarios disponibles. Doble clic para seleccionar.")
         self.scenarios_table.setAlternatingRowColors(False)  # Desactivar alternancia (se usará hover)
         self.scenarios_table.verticalHeader().setVisible(False)  # Ocultar cabecera vertical

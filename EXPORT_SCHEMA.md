@@ -1,6 +1,6 @@
 # Especificación del Formato `Exportar para Análisis (IA)` — Risk Lab
 
-**Versión del schema:** `1.0`
+**Versión del schema:** `1.1`
 **Extensión:** `.risklab.json` (o `.risklab.json.gz` si está comprimido)
 **Idioma de descripciones:** Español (siempre)
 
@@ -21,7 +21,7 @@ A diferencia del export PDF, este formato:
 
 ```
 {
-  "$schema_version": "1.0",
+  "$schema_version": "1.1",
   "$schema_url": "...",
   "$generated_at": "2026-05-01T...Z",
   "$generator": { ... },
@@ -58,7 +58,7 @@ sepa qué espera del formato.
 
 ```json
 {
-  "$schema_version": "1.0",
+  "$schema_version": "1.1",
   "$generated_at": "2026-05-01T22:00:00Z",
   "$generator": {
     "tool": "Risk Lab",

@@ -2531,12 +2531,31 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     if tiene_estocasticos:
                         # ===== MODELO ESTOCÁSTICO: Generar vector de factores por simulación =====
                         _dbg(f"[DEBUG ESTOCASTICO] Evento '{nombre_evento}' tiene factores estocásticos")
-                        
+
                         # Generar vector de factores multiplicativos (uno por simulación)
                         factores_vector = np.ones(num_simulaciones)
                         factores_severidad_vector = np.ones(num_simulaciones)  # NUEVO: vector para severidad
                         seguros_aplicables = []  # Lista de seguros a aplicar (independiente del modelo)
-                        
+
+                        # Fix bug medio #15 (QA ronda 2): para Binomial/Bernoulli/Beta
+                        # (freq_opcion 2/3/5), el factor de frecuencia se aplica más
+                        # abajo vía aplicar_factor_a_probabilidad_vec, que interpreta
+                        # el factor como un shift ADITIVO en escala log-odds
+                        # (shift = factor-1). Cuando TODOS los factores de un evento
+                        # son estáticos (rama pura, ajustar_probabilidad_por_factores
+                        # en log_odds_utils.py), esos shifts se acumulan ADITIVAMENTE
+                        # entre sí. Antes, en esta rama (evento con al menos un factor
+                        # estocástico presente), los factores estáticos se acumulaban
+                        # MULTIPLICATIVAMENTE en factores_vector junto con el
+                        # estocástico, y Σ(fi-1) ≠ Π(fi)-1 para 2+ factores estáticos:
+                        # el mismo conjunto de controles daba un resultado distinto
+                        # según hubiera o no otro factor estocástico en el evento. Para
+                        # Poisson/Poisson-Gamma (freq_opcion 1/4) el factor escala λ
+                        # directamente por multiplicación, así que ahí la acumulación
+                        # multiplicativa sigue siendo la correcta (sin cambios).
+                        freq_es_probabilidad = freq_opcion in (2, 3, 5)
+                        estatico_shift_freq = 0.0
+
                         for f in factores_activos:
                             tipo_modelo = f.get('tipo_modelo', 'estatico')
                             
@@ -2579,18 +2598,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     impacto_pct = f.get('impacto_porcentual', 0)
                                     # VALIDACIÓN: Clipear impacto para evitar factores <= 0
                                     impacto_pct = max(impacto_pct, -99)
-                                    # LIMITACIÓN CONOCIDA (no corregida): para Bernoulli/Binomial/Beta,
-                                    # los factores estáticos aquí se acumulan MULTIPLICATIVAMENTE en
-                                    # factores_vector y luego aplicar_factor_a_probabilidad_vec hace
-                                    # shift = producto(factores) - 1. En cambio, cuando TODOS los
-                                    # factores del evento son estáticos (rama pura, ver
-                                    # ajustar_probabilidad_por_factores en log_odds_utils.py), los
-                                    # shifts se acumulan ADITIVAMENTE. Σ(fi-1) ≠ Π(fi)-1 para N>1
-                                    # factores, así que el mismo conjunto de factores estáticos da un
-                                    # resultado distinto según haya o no OTRO factor estocástico en el
-                                    # mismo evento. Para Poisson/Poisson-Gamma esto no afecta el
-                                    # resultado (ambas formas de acumular coinciden al multiplicar λ).
-                                    factores_vector *= (1 + impacto_pct / 100.0)
+                                    # Fix bug medio #15: ver explicación completa arriba, junto a
+                                    # freq_es_probabilidad. Para Binomial/Bernoulli/Beta acumulamos
+                                    # el shift ADITIVAMENTE (igual que la rama pura estática);
+                                    # para Poisson/Poisson-Gamma seguimos acumulando
+                                    # multiplicativamente en factores_vector (correcto ahí).
+                                    if freq_es_probabilidad:
+                                        estatico_shift_freq += impacto_pct / 100.0
+                                    else:
+                                        factores_vector *= (1 + impacto_pct / 100.0)
                                 
                                 # Severidad: solo si afecta_severidad es True
                                 if f.get('afecta_severidad', False):
@@ -2628,8 +2644,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         impacto_sev = max(impacto_sev, -99)
                                         factores_severidad_vector *= (1 + impacto_sev / 100.0)
                         
-                        # VALIDACIÓN FINAL: Asegurar vectores en rango razonable [0.01, inf)
-                        factores_vector = np.maximum(factores_vector, 0.01)
+                        # VALIDACIÓN FINAL
+                        if freq_es_probabilidad:
+                            # Fix bug medio #15: combinar el shift aditivo de los
+                            # factores estáticos con el factor multiplicativo
+                            # estocástico. aplicar_factor_a_probabilidad_vec calcula
+                            # shift = factor-1, así que sumar el shift estático acá
+                            # (factor_efectivo = factor_estocastico + shift_estatico)
+                            # produce shift = (factor_estocastico-1) + shift_estatico,
+                            # exactamente la suma aditiva de ambos efectos en escala
+                            # log-odds. No se aplica un piso de 0.01 acá (no es un
+                            # multiplicador de tasa): la probabilidad final ya queda
+                            # acotada a [0.0001, 0.9999] más abajo, igual que en la
+                            # rama pura estática (ajustar_probabilidad_por_factores).
+                            factores_vector = factores_vector + estatico_shift_freq
+                        else:
+                            # Asegurar vector en rango razonable [0.01, inf) — es un
+                            # multiplicador directo de tasa (Poisson/Poisson-Gamma).
+                            factores_vector = np.maximum(factores_vector, 0.01)
                         factores_severidad_vector = np.maximum(factores_severidad_vector, 0.01)
                         
                         _dbg(f"[DEBUG ESTOCASTICO]   Factor frecuencia: min={factores_vector.min():.4f}, "

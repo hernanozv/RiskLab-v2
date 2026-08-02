@@ -8206,7 +8206,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     umbral_superior = np.percentile(perdidas_totales, margen_superior)
                     mascara = (perdidas_totales >= umbral_inferior) & (perdidas_totales <= umbral_superior)
                     indices_percentil = np.where(mascara)[0]
-                
+
+                # Fix bug alto #8 (QA ronda 2): misma recurrencia del bug de
+                # CVaR/media_cola_condicional ya corregida en
+                # _build_marginal_contribution (export IA, Ronda 1). Cuando hay
+                # una masa puntual grande en 0 (la mayoría de los años sin
+                # pérdida), el límite inferior de la ventana puede caer dentro
+                # de esa masa, haciendo que la máscara incluya TODAS las
+                # simulaciones en cero (no solo las cercanas al percentil
+                # objetivo) y colapsando la "contribución en P99" a la
+                # contribución promedio general. Si el percentil objetivo es
+                # estrictamente positivo, excluimos del rango las simulaciones
+                # en cero (no son parte de la cola real).
+                if valor_percentil > 0:
+                    indices_percentil = indices_percentil[perdidas_totales[indices_percentil] > 0]
+
                 # 4. Calcular contribución promedio de cada evento en esas simulaciones
                 for idx, perdidas_evento in enumerate(perdidas_por_evento):
                     if len(indices_percentil) > 0:

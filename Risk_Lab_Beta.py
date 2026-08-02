@@ -17929,10 +17929,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             porc_ceros = float(np.mean(perdidas_totales == 0) * 100.0) if perdidas_totales.size > 0 else 0.0
 
+            # Fix bug medio #20 (QA ronda 2): usar currency_format() (formato
+            # "$1.234.567", consistente con el resto de la app/PDF) en vez de
+            # un f-string crudo "${:,.0f}" que produce el formato inverso en
+            # inglés ("$1,234,567") — mismo antipatrón ya corregido en la
+            # descripción de vínculos del PDF (fix bug #38).
             findings = [
-                f"Pérdida media esperada: ${media:,.0f} anuales",
-                f"Con 99% de confianza, las pérdidas no superarán ${var_99:,.0f} (VaR 99%)",
-                f"Si se supera el VaR 99%, la pérdida esperada es ${es_99:,.0f} (Expected Shortfall)",
+                f"Pérdida media esperada: {currency_format(media)} anuales",
+                f"Con 99% de confianza, las pérdidas no superarán {currency_format(var_99)} (VaR 99%)",
+                f"Si se supera el VaR 99%, la pérdida esperada es {currency_format(es_99)} (Expected Shortfall)",
                 f"El evento '{top_evento}' contribuye {top_pct}% al riesgo agregado medio",
                 f"{porc_ceros:.1f}% de los años no presentan pérdida alguna",
                 f"Cola: kurtosis={curt:.2f}, asimetría={asim:.2f}",
@@ -17956,8 +17961,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             return {
                 "headline": (
-                    f"Pérdida agregada media de ${media:,.0f} con VaR 99% de "
-                    f"${var_99:,.0f}. Cartera en zona {zona_media} (media) / "
+                    f"Pérdida agregada media de {currency_format(media)} con VaR 99% de "
+                    f"{currency_format(var_99)}. Cartera en zona {zona_media} (media) / "
                     f"{zona_p99} (P99)."
                 ),
                 "key_findings": findings,

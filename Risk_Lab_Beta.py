@@ -89,6 +89,17 @@ class RiskLabFallbackWarning(UserWarning):
     pass
 
 
+class RiskLabAjusteImperfectoWarning(UserWarning):
+    """Fix bug #44 (QA ronda 2): se emite en obtener_parametros_gamma_para_poisson
+    y obtener_parametros_beta_frecuencia cuando el ajuste encontrado, aunque
+    válido, no reproduce con precisión el mínimo/más probable/máximo pedidos.
+    Esto es matemáticamente esperable: son 3 objetivos (moda + 2 cuantiles)
+    para solo 2 parámetros libres (forma/tasa), un sistema sobre-determinado
+    que en general no tiene solución exacta. La alerta es informativa, no
+    bloquea la simulación."""
+    pass
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -810,43 +821,112 @@ def obtener_parametros_gamma_para_poisson(minimo, mas_probable, maximo, confianz
     
     # Convertir la confianza a percentiles para los extremos
     tail_prob = (1 - confianza) / 2
-    
-    # Función objetivo para optimización
+
+    # Función objetivo para optimización.
+    # Fix bug #44 (QA ronda 2): los términos de error se normalizan por el
+    # valor objetivo (error relativo al cuadrado, no absoluto). Antes, cuando
+    # maximo >> mas_probable (caso común: p.ej. frecuencia mínima 0.2, moda
+    # 0.5, máximo 50/año), el término max_error dominaba numéricamente por
+    # pura escala y el optimizador ignoraba la moda pedida por el usuario.
     def objective(params):
         alpha, beta = params
         if alpha <= 1 or beta <= 0:  # Restricciones para asegurar que la moda exista y sea positiva
             return 1e10
-        
+
         # La moda de Gamma es (alpha-1)/beta cuando alpha > 1
         estimated_mode = (alpha - 1) / beta
-        mode_error = (estimated_mode - mas_probable)**2
-        
+        mode_error = ((estimated_mode - mas_probable) / mas_probable)**2
+
         # Calcular los cuantiles teóricos para los extremos
         q_min = stats.gamma.ppf(tail_prob, a=alpha, scale=1/beta)
         q_max = stats.gamma.ppf(1-tail_prob, a=alpha, scale=1/beta)
-        
-        # Error en los cuantiles
-        min_error = (q_min - minimo)**2
-        max_error = (q_max - maximo)**2
-        
+
+        # Error en los cuantiles (relativo)
+        min_error = ((q_min - minimo) / minimo)**2
+        max_error = ((q_max - maximo) / maximo)**2
+
         return mode_error + min_error + max_error
-    
+
     # Estimación inicial: usar método de momentos
     mean_est = (minimo + 4*mas_probable + maximo) / 6  # Estimación de la media usando regla de PERT
     var_est = ((maximo - minimo) / 6)**2  # Estimación de la varianza
-    
+
     # Para Gamma: alpha = mean²/var, beta = mean/var
-    alpha_init = mean_est**2 / var_est if var_est > 0 else 2.0
-    beta_init = mean_est / var_est if var_est > 0 else 1.0
-    
-    # Asegurar que alpha > 1 para que la moda exista
-    alpha_init = max(alpha_init, 1.1)
-    
-    # Optimización para encontrar mejores parámetros
-    result = minimize(objective, [alpha_init, beta_init], method='Nelder-Mead', 
-                     bounds=[(1.001, None), (1e-6, None)])
-    
+    alpha_init_momentos = mean_est**2 / var_est if var_est > 0 else 2.0
+
+    # Fix bug #44: multi-arranque. Con un solo punto de partida, Nelder-Mead
+    # podía quedar atrapado en el límite inferior del bound (alpha≈1.001) sin
+    # explorar el resto del espacio de parámetros, incluso con el objetivo ya
+    # normalizado. Se prueban varios alpha_init en distintos órdenes de
+    # magnitud (cada uno con su beta_init derivado analíticamente de la moda
+    # pedida) y se conserva el resultado con menor error total.
+    candidatos_alpha_init = sorted({round(max(alpha_init_momentos, 1.1), 6), 1.1, 1.5, 2.0, 3.0, 5.0, 10.0})
+    mejor_resultado = None
+    for alpha_init in candidatos_alpha_init:
+        beta_init = max((alpha_init - 1) / mas_probable, 1e-6)
+        resultado_intento = minimize(
+            objective, [alpha_init, beta_init], method='Nelder-Mead',
+            bounds=[(1.001, None), (1e-9, None)],
+            options={'xatol': 1e-10, 'fatol': 1e-12, 'maxiter': 5000}
+        )
+        if mejor_resultado is None or resultado_intento.fun < mejor_resultado.fun:
+            mejor_resultado = resultado_intento
+    result = mejor_resultado
+
     alpha, beta = result.x
+
+    # Fix bug #44: validación de calidad del ajuste (a diferencia de
+    # obtener_parametros_lognormal/obtener_parametros_gpd, esta función nunca
+    # validaba result.success ni la calidad real del fit). Con 3 objetivos
+    # (moda + 2 cuantiles) y solo 2 parámetros libres, el sistema está
+    # sobre-determinado: un ajuste perfecto en los 3 frentes simultáneamente
+    # no siempre existe, así que el criterio de "fit razonable" no puede ser
+    # un único error muy estricto sobre la moda (eso rechazaba, en pruebas,
+    # prácticamente cualquier entrada realista). En cambio: se calcula el
+    # peor error relativo entre los 3 objetivos (recalculado a partir de los
+    # alpha/beta realmente devueltos, no del flag `result.success`: Nelder-Mead
+    # puede reportar "no convergió" por tolerancias de paso muy finas incluso
+    # cuando el punto encontrado ya es prácticamente exacto, sobre todo en
+    # escalas numéricas grandes; el error real medido sobre el resultado es
+    # una señal mucho más confiable). Solo se rechaza cuando ese peor error
+    # satura cerca del 100%, señal de que ninguna Gamma razonable puede
+    # aproximar lo pedido. Un desajuste moderado, esperable dado el
+    # sobre-ajuste, se informa con un warning en vez de bloquear al usuario.
+    moda_ajustada = (alpha - 1) / beta
+    error_relativo_moda = abs(moda_ajustada - mas_probable) / mas_probable
+    q_min_ajustado = stats.gamma.ppf(tail_prob, a=alpha, scale=1/beta)
+    q_max_ajustado = stats.gamma.ppf(1 - tail_prob, a=alpha, scale=1/beta)
+    error_relativo_min = abs(q_min_ajustado - minimo) / minimo
+    error_relativo_max = abs(q_max_ajustado - maximo) / maximo
+    peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
+
+    if peor_error > 0.98:
+        raise ValueError(
+            f"No se pudo ajustar una distribución Gamma razonable para "
+            f"mínimo={minimo:.4g}, más probable={mas_probable:.4g}, "
+            f"máximo={maximo:.4g} (confianza={confianza:.2f}). "
+            f"El mejor ajuste encontrado difiere {peor_error:.0%} del peor "
+            f"de los valores pedidos (moda: {error_relativo_moda:.0%}, "
+            f"percentil inferior: {error_relativo_min:.0%}, percentil "
+            f"superior: {error_relativo_max:.0%}). "
+            f"Verifique que los valores sean consistentes entre sí, o "
+            f"reduzca la amplitud del rango mínimo-máximo."
+        )
+
+    if peor_error > 0.30:
+        warnings.warn(
+            f"El ajuste de la distribución Gamma no reproduce con "
+            f"precisión los valores pedidos (mínimo={minimo:.4g}, más "
+            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+            f"confianza={confianza:.2f}): diferencia relativa de "
+            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+            f"en el percentil inferior y {error_relativo_max:.0%} en el "
+            f"superior. Esto ocurre porque los 3 valores son difíciles de "
+            f"conciliar simultáneamente con una distribución Gamma; "
+            f"verifique que sean coherentes entre sí.",
+            RiskLabAjusteImperfectoWarning
+        )
+
     return alpha, beta
 
 def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0.8):
@@ -882,52 +962,108 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
     factor_confianza = 1.0 / confianza if confianza > 0 else 1.25
     varianza = (rango / 6.0)**2 * factor_confianza
     
-    # Función objetivo para optimización
+    # Función objetivo para optimización.
+    # Fix bug #44 (QA ronda 2): términos de error normalizados (relativos al
+    # cuadrado) por la misma razón que en obtener_parametros_gamma_para_poisson
+    # (evitar que un término domine numéricamente solo por su escala).
     def objective(params):
         alpha, beta = params
         if alpha <= 1 or beta <= 1:  # Restricciones para asegurar que la moda exista y esté entre 0 y 1
             return 1e10
-        
+
         # La moda de Beta es (alpha-1)/(alpha+beta-2) cuando alpha, beta > 1
         estimated_mode = (alpha - 1) / (alpha + beta - 2)
-        mode_error = (estimated_mode - mas_probable)**2
-        
+        mode_error = ((estimated_mode - mas_probable) / mas_probable)**2
+
         # Calcular los cuantiles teóricos para los extremos
         q_min = stats.beta.ppf(tail_prob, alpha, beta)
         q_max = stats.beta.ppf(1-tail_prob, alpha, beta)
-        
-        # Error en los cuantiles
-        min_error = (q_min - minimo)**2
-        max_error = (q_max - maximo)**2
-        
+
+        # Error en los cuantiles (relativo; minimo puede ser 0, se usa un
+        # denominador seguro para ese caso límite documentado)
+        min_error = ((q_min - minimo) / minimo)**2 if minimo > 0 else (q_min - minimo)**2
+        max_error = ((q_max - maximo) / maximo)**2
+
         # Penalizar si los parámetros llevan a una media muy diferente de la esperada
         mean_est = alpha / (alpha + beta)
-        mean_error = (mean_est - media)**2
-        
+        mean_error = ((mean_est - media) / media)**2 if media > 0 else (mean_est - media)**2
+
         return mode_error + min_error + max_error + mean_error
-    
+
     # Estimación inicial basada en momentos
     if varianza <= 0 or not (0 < media < 1):
         # Valores por defecto razonables si los cálculos iniciales no son válidos
-        alpha_init = 2.0
-        beta_init = 2.0 * (1 - mas_probable) / mas_probable if mas_probable > 0 else 2.0
+        alpha_init_momentos = 2.0
     else:
-        # Fórmulas de momentos para Beta: 
+        # Fórmulas de momentos para Beta:
         # alpha = media * [(media*(1-media)/varianza) - 1]
-        # beta = (1-media) * [(media*(1-media)/varianza) - 1]
         temp = media * (1 - media) / varianza - 1
-        alpha_init = media * temp
-        beta_init = (1 - media) * temp
-    
-    # Asegurar que alpha, beta > 1 para que la moda exista
-    alpha_init = max(alpha_init, 1.1)
-    beta_init = max(beta_init, 1.1)
-    
-    # Optimización para encontrar mejores parámetros
-    result = minimize(objective, [alpha_init, beta_init], method='Nelder-Mead', 
-                     bounds=[(1.001, None), (1.001, None)])
-    
+        alpha_init_momentos = media * temp
+
+    # Fix bug #44: multi-arranque (ver mismo fix en la función Gamma). Cada
+    # alpha_init se combina con el beta_init que resuelve exactamente la moda
+    # pedida: mode = (a-1)/(a+b-2) => b = (a-1)/mode - a + 2.
+    candidatos_alpha_init = sorted({round(max(alpha_init_momentos, 1.1), 6), 1.1, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0})
+    mejor_resultado = None
+    for alpha_init in candidatos_alpha_init:
+        if 0 < mas_probable < 1:
+            beta_init = max((alpha_init - 1) / mas_probable - alpha_init + 2, 1.1)
+        else:
+            beta_init = 2.0
+        resultado_intento = minimize(
+            objective, [alpha_init, beta_init], method='Nelder-Mead',
+            bounds=[(1.001, None), (1.001, None)],
+            options={'xatol': 1e-10, 'fatol': 1e-12, 'maxiter': 5000}
+        )
+        if mejor_resultado is None or resultado_intento.fun < mejor_resultado.fun:
+            mejor_resultado = resultado_intento
+    result = mejor_resultado
+
     alpha, beta = result.x
+
+    # Fix bug #44: validación de calidad del ajuste (ver mismo razonamiento
+    # que en obtener_parametros_gamma_para_poisson: 3 objetivos, 2 parámetros
+    # libres, sistema sobre-determinado. Se calcula el peor error relativo,
+    # recalculado sobre los alpha/beta realmente devueltos en vez de confiar
+    # en `result.success` — ver por qué en el comentario equivalente de la
+    # función Gamma —, y solo se rechaza cuando el ajuste está realmente
+    # roto; un desajuste moderado se informa con un warning).
+    moda_ajustada = (alpha - 1) / (alpha + beta - 2)
+    error_relativo_moda = abs(moda_ajustada - mas_probable) / mas_probable
+    q_min_ajustado = stats.beta.ppf(tail_prob, alpha, beta)
+    q_max_ajustado = stats.beta.ppf(1 - tail_prob, alpha, beta)
+    error_relativo_min = (abs(q_min_ajustado - minimo) / minimo if minimo > 0
+                           else abs(q_min_ajustado - minimo))
+    error_relativo_max = abs(q_max_ajustado - maximo) / maximo
+    peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
+
+    if peor_error > 0.98:
+        raise ValueError(
+            f"No se pudo ajustar una distribución Beta razonable para "
+            f"mínimo={minimo:.4g}, más probable={mas_probable:.4g}, "
+            f"máximo={maximo:.4g} (confianza={confianza:.2f}). "
+            f"El mejor ajuste encontrado difiere {peor_error:.0%} del peor "
+            f"de los valores pedidos (moda: {error_relativo_moda:.0%}, "
+            f"percentil inferior: {error_relativo_min:.0%}, percentil "
+            f"superior: {error_relativo_max:.0%}). "
+            f"Verifique que los valores sean consistentes entre sí, o "
+            f"reduzca la amplitud del rango mínimo-máximo."
+        )
+
+    if peor_error > 0.30:
+        warnings.warn(
+            f"El ajuste de la distribución Beta no reproduce con precisión "
+            f"los valores pedidos (mínimo={minimo:.4g}, más "
+            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+            f"confianza={confianza:.2f}): diferencia relativa de "
+            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+            f"en el percentil inferior y {error_relativo_max:.0%} en el "
+            f"superior. Esto ocurre porque los 3 valores son difíciles de "
+            f"conciliar simultáneamente con una distribución Beta; "
+            f"verifique que sean coherentes entre sí.",
+            RiskLabAjusteImperfectoWarning
+        )
+
     return alpha, beta
 
 class TruncatedGPD:

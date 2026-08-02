@@ -396,6 +396,15 @@ def media_cola_condicional(arr, umbral):
     cola = arr[arr > umbral]
     return float(cola.mean()) if cola.size > 0 else float(umbral)
 
+# R3 alto #11: helper para leer campos numéricos opcionales del export IA.
+# dict.get(clave, default) SOLO aplica el default si la clave está AUSENTE;
+# si el valor es un None EXPLÍCITO (posible vía import de JSON externo con
+# 'null' literal en un campo numérico), .get() devuelve None igual, y un
+# f-string con formato numérico (p.ej. f"{v:,.0f}") revienta con TypeError.
+def _valor_o_default(valor, default):
+    return default if valor is None else valor
+
+
 # Función para formatear números en formato contable personalizado
 def currency_format(value):
     """Formatea un número en formato monetario con separador de miles y decimales personalizados."""
@@ -1533,6 +1542,19 @@ def normalizar_factor_global(factor):
     # NUEVO: Tipo de deducible - 'agregado' (default, backward compat) o 'por_ocurrencia'
     if 'seguro_tipo_deducible' not in factor_norm:
         factor_norm['seguro_tipo_deducible'] = 'agregado'
+    else:
+        # R3 alto #10: el motor filtra pólizas comparando este valor con "==
+        # 'por_ocurrencia'"/"== 'agregado'" EXACTOS (sin normalizar mayúsculas
+        # ni espacios). Un valor como "Agregado" o "POR_OCURRENCIA" (posible
+        # vía import de JSON externo, p.ej. generado por el skill
+        # risk-lab-modeler) no calzaba con NINGUNO de los dos filtros y la
+        # póliza se descartaba en silencio, sin reducir la pérdida ni avisar
+        # al usuario. Se normaliza aquí (único punto canónico) para que
+        # cualquier grafía razonable resuelva al valor exacto esperado.
+        _tipo_ded_raw = str(factor_norm.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+        factor_norm['seguro_tipo_deducible'] = (
+            'por_ocurrencia' if _tipo_ded_raw == 'por_ocurrencia' else 'agregado'
+        )
     
     # NUEVO: Límite por ocurrencia (0 = sin límite por ocurrencia)
     if 'seguro_limite_ocurrencia' not in factor_norm:
@@ -2534,6 +2556,12 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
     frecuencias_totales = np.zeros(num_simulaciones, dtype=np.int32)
     perdidas_por_evento = [np.zeros(num_simulaciones) for _ in range(num_eventos)]
     frecuencias_por_evento = [np.zeros(num_simulaciones, dtype=np.int32) for _ in range(num_eventos)]
+    # R3 alto #8: pérdida BRUTA por evento (antes de aplicar cualquier seguro),
+    # usada exclusivamente para evaluar 'umbral_severidad' de los vínculos. Un
+    # vínculo debe dispararse por la magnitud real del incidente del padre, no
+    # por su remanente contable tras el reaseguro (perdidas_por_evento SÍ queda
+    # neta de seguros, como corresponde para las estadísticas reportadas).
+    perdidas_brutas_por_evento = [np.zeros(num_simulaciones) for _ in range(num_eventos)]
     
     # DEBUG: Inspeccionar TODOS los eventos
     if _DEBUG_SIM:
@@ -2689,7 +2717,10 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         # de la perdida bruta en vez de reducirla.
                                         cob_val = max(0.0, min(100.0, float(100 if _cob_raw is None else _cob_raw)))
                                         lim_val = float(f.get('seguro_limite', 0) or 0)
-                                        tipo_ded = f.get('seguro_tipo_deducible', 'agregado')
+                                        # R3 alto #10: normalizar defensivamente en el propio
+                                        # motor (ver misma normalización en normalizar_factor_global).
+                                        tipo_ded = str(f.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+                                        tipo_ded = 'por_ocurrencia' if tipo_ded == 'por_ocurrencia' else 'agregado'
                                         lim_ocurr = float(f.get('seguro_limite_ocurrencia', 0) or 0)
                                         seguros_aplicables.append({
                                             'nombre': f.get('nombre', 'Seguro'),
@@ -2769,7 +2800,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     # path estocastico, arriba).
                                     cob_val_s = max(0.0, min(100.0, float(100 if _cob_raw_s is None else _cob_raw_s)))
                                     lim_val_s = float(f.get('seguro_limite', 0) or 0)
-                                    tipo_ded_s = f.get('seguro_tipo_deducible', 'agregado')
+                                    # R3 alto #10: mismo defensivo que en el path estocástico.
+                                    tipo_ded_s = str(f.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+                                    tipo_ded_s = 'por_ocurrencia' if tipo_ded_s == 'por_ocurrencia' else 'agregado'
                                     lim_ocurr_s = float(f.get('seguro_limite_ocurrencia', 0) or 0)
                                     seguros_aplicables.append({
                                         'nombre': f.get('nombre', 'Seguro'),
@@ -2977,9 +3010,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 padre_idx = id_a_index[id_padre]
                 padre_ocurrio = frecuencias_por_evento[padre_idx] > 0
 
-                # Aplicar umbral de severidad del padre si está configurado
+                # Aplicar umbral de severidad del padre si está configurado.
+                # R3 alto #8: se evalúa sobre la pérdida BRUTA del padre (antes
+                # de seguros), no sobre perdidas_por_evento (que ya es neta de
+                # seguros) — de lo contrario un incidente real siempre grave
+                # podía no disparar la cascada solo porque el seguro redujo el
+                # valor comparado contra el umbral.
                 if umbral > 0:
-                    padre_ocurrio = padre_ocurrio & (perdidas_por_evento[padre_idx] >= umbral)
+                    padre_ocurrio = padre_ocurrio & (perdidas_brutas_por_evento[padre_idx] >= umbral)
 
                 # Generar vector de activación probabilística
                 if prob >= 1.0:
@@ -3351,12 +3389,21 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
             )
             warnings.warn(mensaje_cap, RiskLabFrequencyCapWarning, stacklevel=2)
             # Marcar el evento para que el export/UI puedan reportar la distorsion.
-            evento['_cap_frecuencia_aplicado'] = True
-            evento['_cap_frecuencia_factor'] = float(factor)
-            evento['_cap_frecuencia_suma_original'] = int(sum_final_event_frequencies)
-            evento['_cap_frecuencia_suma_capeada'] = int(max_eventos_simulacion)
-            evento['_cap_frecuencia_media_original'] = float(media_original)
-            evento['_cap_frecuencia_media_capeada'] = float(media_capeada)
+            # R3 alto #14: SimulacionThread llama a este motor 10 veces (una por
+            # chunk) reutilizando el MISMO dict de evento. Antes, estos campos se
+            # sobreescribian en cada chunk sin acumular, por lo que al terminar la
+            # corrida completa solo quedaba el factor del ULTIMO chunk que disparo
+            # el cap -- pudiendo ocultar una distorsion mucho mas severa ocurrida
+            # en un chunk anterior. Ahora se conserva el PEOR caso (factor mas
+            # chico = mayor distorsion) de todos los chunks de la corrida.
+            factor_previo = evento.get('_cap_frecuencia_factor')
+            if factor_previo is None or factor < factor_previo:
+                evento['_cap_frecuencia_aplicado'] = True
+                evento['_cap_frecuencia_factor'] = float(factor)
+                evento['_cap_frecuencia_suma_original'] = int(sum_final_event_frequencies)
+                evento['_cap_frecuencia_suma_capeada'] = int(max_eventos_simulacion)
+                evento['_cap_frecuencia_media_original'] = float(media_original)
+                evento['_cap_frecuencia_media_capeada'] = float(media_capeada)
             # Escalar y aplicar redondeo estocástico sin sesgo, preservando la suma exacta al tope
             scaled = final_event_frequencies.astype(np.float64) * factor
             floored = np.floor(scaled).astype(np.int32)
@@ -3402,6 +3449,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         
         # PASO 2: Generar pérdidas basadas en las frecuencias finales.
         perdidas_para_este_evento = None  # Se asignará vectorizado si hay pérdidas; si no, será un vector de ceros
+        perdidas_brutas_este_evento = None  # R3 alto #8: pérdida bruta (pre-seguros), para vínculos
 
         if sum_final_event_frequencies > 0:
             try:
@@ -3645,6 +3693,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         weights=total_perdidas_del_evento_concatenadas,
                         minlength=num_simulaciones
                     )
+                    perdidas_brutas_este_evento = perdidas_brutas_por_sim
 
                     # Fix bug #14: por cada aseguradora, computar su pago por simulacion,
                     # aplicar SU limite agregado, y solo despues acumular en el total.
@@ -3671,6 +3720,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             'limite_agregado': limite_agregado_aseg
                         })
 
+                    # R3 alto #9: si el usuario configura pólizas superpuestas (misma
+                    # capa/deducible en más de una aseguradora), la suma de sus pagos
+                    # individuales puede superar la propia pérdida bruta del evento.
+                    # El resultado final ya quedaba protegido por el np.maximum(...,0)
+                    # de abajo, pero el pago combinado reportado (usado en el debug y
+                    # potencialmente en futuros reportes) resultaba económicamente
+                    # incoherente (más pagado que lo que efectivamente se perdió).
+                    np.minimum(pagos_seguro_por_sim, perdidas_brutas_por_sim, out=pagos_seguro_por_sim)
+
                     # Perdidas netas = brutas - pago del seguro (respetando limite agregado)
                     # (el limite agregado ya fue aplicado por aseguradora en el bucle anterior)
                     perdidas_para_este_evento = perdidas_brutas_por_sim - pagos_seguro_por_sim
@@ -3696,6 +3754,8 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
         if perdidas_para_este_evento is None:
             perdidas_para_este_evento = np.zeros(num_simulaciones)
+        if perdidas_brutas_este_evento is None:
+            perdidas_brutas_este_evento = np.zeros(num_simulaciones)
 
         _num_excedidas_cap_agregado = int(np.sum(perdidas_para_este_evento > 1e12))
         if _num_excedidas_cap_agregado > 0:
@@ -3754,10 +3814,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                   f"(Pago medio seguro: ${pago_seguro.mean():,.0f})")
 
         if seguros_agregados:
+            # R3 alto #9: mismo cap que en seguros por_ocurrencia, para pólizas
+            # agregadas superpuestas (misma capa en más de una aseguradora).
+            np.minimum(pago_seguro_agregado_total, perdidas_brutas_agregado, out=pago_seguro_agregado_total)
             perdidas_para_este_evento = perdidas_brutas_agregado - pago_seguro_agregado_total
             np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)  # No puede ser negativa
         
         perdidas_por_evento[idx] = perdidas_para_este_evento
+        perdidas_brutas_por_evento[idx] = perdidas_brutas_este_evento
 
         perdidas_totales += perdidas_para_este_evento
         # Optimización: acumular frecuencias_totales incrementalmente para evitar
@@ -8197,8 +8261,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             if getattr(self, 'ax_exceed_tol_label', None) is not None:
                                 ax = self.ax_exceed_tol_line.axes
                                 x_left, x_right = ax.get_xlim()
-                                x_range = max(1e-3, x_right - x_left)
-                                x_pos = x_left + 0.98 * x_range
+                                # R3 alto #13: la curva de Excedencia usa
+                                # ax.invert_xaxis(), por lo que x_left > x_right
+                                # y (x_right - x_left) es NEGATIVO. El anterior
+                                # max(1e-3, ...) pisaba ese negativo con el piso
+                                # positivo, pegando la etiqueta al borde
+                                # izquierdo en cada uso normal del control de
+                                # tolerancia. Se usa la MISMA fórmula que el
+                                # dibujo inicial (línea ~15404): 2% hacia
+                                # adentro desde x_left, con abs() para que
+                                # funcione igual con eje normal o invertido.
+                                x_pos = x_left - 0.02 * abs(x_right - x_left)
                                 self.ax_exceed_tol_label.set_position((x_pos, T))
                         except Exception:
                             pass
@@ -14627,17 +14700,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Advertencia", "Seleccione un escenario para simular.")
             return
         
-        # Actualizar el número de simulaciones con el valor ingresado en la pestaña "Escenarios"
+        # R3 alto #15: antes esto sobreescribía self.num_simulaciones_var (la
+        # pestaña "Simulación") de forma PERMANENTE, sin restaurarlo -- a
+        # diferencia de self.eventos_riesgo (que sí se restaura abajo). El
+        # usuario perdía silenciosamente el valor que tenía configurado en la
+        # pestaña Simulación cada vez que corría una simulación de escenario.
+        num_simulaciones_original = self.num_simulaciones_var.text()
         self.num_simulaciones_var.setText(self.num_simulaciones_var_escenarios.text())
-        
+
         # Sustituir temporalmente los eventos con los del escenario
         eventos_originales = self.eventos_riesgo
         try:
             self.eventos_riesgo = self.current_scenario.eventos_riesgo
             self.ejecutar_simulacion()
         finally:
-            # Restaurar siempre los eventos originales de la pestaña Simulación
+            # Restaurar siempre los eventos y el número de simulaciones originales
+            # de la pestaña Simulación.
             self.eventos_riesgo = eventos_originales
+            self.num_simulaciones_var.setText(num_simulaciones_original)
 
     def generar_figuras(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos_riesgo):
         """Genera las figuras de los gráficos para el reporte PDF."""
@@ -16212,6 +16292,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                        capprops=cap_props,
                        medianprops=median_props)
                        
+        # R3 alto #17: con showfliers=False, matplotlib autoescala el eje Y
+        # SIN considerar los outliers ocultos (solo mira cajas/bigotes). Para
+        # severidades sesgadas (la norma en riesgo operacional), el Máximo real
+        # y los percentiles P90/P95 -- registrados como tooltips más abajo --
+        # podían caer fuera del rango visible del eje, haciendo esos tooltips
+        # inalcanzables con el mouse aunque los datos existan. Se expande el
+        # ylim para cubrir el rango real (min/max) de todos los eventos,
+        # preservando el boxplot "limpio" (sin marcadores de outliers
+        # dibujados) pero garantizando que el área de hover cubra los puntos
+        # reales de interés.
+        try:
+            _valores_todos = np.concatenate([np.asarray(d) for d in datos_perdidas if len(d) > 0])
+            if _valores_todos.size > 0:
+                _y_min = float(np.min(_valores_todos))
+                _y_max = float(np.max(_valores_todos))
+                _y_pad = max(1e-9, (_y_max - _y_min) * 0.05)
+                ax8.set_ylim(_y_min - _y_pad, _y_max + _y_pad)
+        except Exception:
+            pass
+
         # Personalizar el color de cada caja con un gradiente de azul a amarillo
         for i, patch in enumerate(box['boxes']):
             # Degradado de color desde azul hasta amarillo
@@ -16957,8 +17057,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
         for marca in marcas_tiempo:
             ax_calendario.plot(marca, 0, '|', color='#666666', markersize=15, zorder=2)
 
-        # Posiciones verticales para los 4 niveles (alternando arriba/abajo)
-        y_positions = [1.5, -1.5, 1.5, -1.5]
+        # Posiciones verticales para los 4 niveles (alternando arriba/abajo).
+        # R3 alto #18: antes BAJO/ALTO compartian la fila 1.5 y MODERADO/CRITICO
+        # compartian -1.5. Como 'periodo' se capea a 100 años para la
+        # visualización (línea siguiente), dos niveles con la misma paridad de
+        # fila y periodo_real >= 100 años terminaban en el MISMO punto exacto
+        # (x=100, misma fila), ocultando uno detrás del otro. Ahora cada nivel
+        # tiene su propia fila (4 valores distintos), sin perder la alternancia
+        # visual arriba/abajo.
+        y_positions = [2.0, -2.0, 1.0, -1.0]
         
         # Dibujar cada nivel como un punto en la línea de tiempo
         for i, datos in enumerate(datos_calendario):
@@ -18556,13 +18663,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Incluye TODOS los eventos configurados (activos e inactivos): un
         # evento inactivo no se simuló (no tiene datos en 'results'), pero
         # sigue formando parte del modelo y el agente IA debe poder verlo.
-        payload["input_events"] = [
-            self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
-            for e in eventos_todos
-        ]
+        # R3 alto #12: antes, un solo evento que hiciera fallar
+        # _decodificar_evento_para_export (por cualquier motivo no previsto)
+        # abortaba la exportación COMPLETA, incluyendo eventos válidos. Ahora
+        # se aísla el error por evento (igual que ya hace 'input_scenarios'
+        # más abajo) y se deja constancia explícita de lo omitido, en vez de
+        # perder silenciosamente toda la exportación o todo un evento.
+        input_events_block = []
+        input_events_omitidos = []
+        for e in eventos_todos:
+            try:
+                input_events_block.append(
+                    self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
+                )
+            except Exception as ex:
+                input_events_omitidos.append({
+                    "event_id": e.get("id"), "event_name": e.get("nombre"),
+                    "error": str(ex)
+                })
+        payload["input_events"] = input_events_block
+        if input_events_omitidos:
+            payload["input_events_omitidos"] = input_events_omitidos
 
         # ---- Input scenarios ----
+        # R3 alto #12: antes, un escenario que fallara en cualquier punto se
+        # descartaba ENTERO y en silencio (except/continue), sin dejar
+        # ningún rastro en el payload. Un agente IA no tenía forma de saber
+        # que faltaban uno o más escenarios. Ahora se aísla el error por
+        # escenario (como ya se hace por evento en 'input_events_omitidos')
+        # y se deja constancia explícita en 'input_scenarios_omitidos'.
         scenarios_block = []
+        scenarios_omitidos = []
         for sc in (getattr(self, "scenarios", []) or []):
             try:
                 eventos_sc = sc.eventos_riesgo or []
@@ -18575,9 +18706,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         for e in eventos_sc
                     ]
                 })
-            except Exception:
-                continue
+            except Exception as ex:
+                scenarios_omitidos.append({
+                    "nombre": getattr(sc, "nombre", None), "error": str(ex)
+                })
         payload["input_scenarios"] = scenarios_block
+        if scenarios_omitidos:
+            payload["input_scenarios_omitidos"] = scenarios_omitidos
 
         # Las siguientes secciones se llenan paso a paso
         payload["results"] = self._build_results_section(
@@ -18627,7 +18762,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         }
 
         # ---- Distribución de Frecuencia ----
-        freq_op = int(evento.get("freq_opcion", 3))
+        freq_op = int(_valor_o_default(evento.get("freq_opcion"), 3))
         freq_dist_name = _FREQ_DIST_NAMES.get(freq_op, f"desconocida ({freq_op})")
         freq_block = {
             "distribucion": freq_dist_name,
@@ -18727,11 +18862,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if es_seguro:
                 f_out["tipo_severidad"] = "seguro"
                 f_out["seguro"] = {
-                    "tipo_deducible": f.get("seguro_tipo_deducible", "agregado"),
-                    "deducible": f.get("seguro_deducible", 0),
-                    "cobertura_pct": f.get("seguro_cobertura_pct", 0),
-                    "limite_ocurrencia": f.get("seguro_limite_ocurrencia", 0),
-                    "limite_agregado_anual": f.get("seguro_limite", 0)
+                    "tipo_deducible": _valor_o_default(f.get("seguro_tipo_deducible"), "agregado"),
+                    "deducible": _valor_o_default(f.get("seguro_deducible"), 0),
+                    "cobertura_pct": _valor_o_default(f.get("seguro_cobertura_pct"), 0),
+                    "limite_ocurrencia": _valor_o_default(f.get("seguro_limite_ocurrencia"), 0),
+                    "limite_agregado_anual": _valor_o_default(f.get("seguro_limite"), 0)
                 }
                 td = f_out["seguro"]["tipo_deducible"]
                 ded = f_out["seguro"]["deducible"]
@@ -18779,9 +18914,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 "id_padre": id_padre,
                 "nombre_padre": nombre_padre,
                 "tipo": tipo,
-                "probabilidad_pct": v.get("probabilidad", 100),
-                "factor_severidad": v.get("factor_severidad", 1.0),
-                "umbral_severidad": v.get("umbral_severidad", 0)
+                "probabilidad_pct": _valor_o_default(v.get("probabilidad"), 100),
+                "factor_severidad": _valor_o_default(v.get("factor_severidad"), 1.0),
+                "umbral_severidad": _valor_o_default(v.get("umbral_severidad"), 0)
             }
             if tipo == "AND":
                 logica = "Solo ocurre SI el padre ocurrió Y se activa el vínculo"
@@ -18863,8 +18998,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     num_sim_guardar = int(self.num_simulaciones_var.text())
                 except (ValueError, TypeError):
                     num_sim_guardar = 10000
+                # R3 alto #15: el número de simulaciones de la pestaña
+                # Escenarios nunca se persistía (solo el de "Simulación"),
+                # obligando a reconfigurarlo en cada sesión.
+                try:
+                    num_sim_escenarios_guardar = int(self.num_simulaciones_var_escenarios.text())
+                except (ValueError, TypeError):
+                    num_sim_escenarios_guardar = 10000
                 configuracion = {
                     'num_simulaciones': num_sim_guardar,
+                    'num_simulaciones_escenarios': num_sim_escenarios_guardar,
                     'eventos_riesgo': [],
                     'scenarios': [],
                     'current_scenario_name': getattr(getattr(self, 'current_scenario', None), 'nombre', None)
@@ -18999,6 +19142,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 eventos_riesgo_temp = []
                 scenarios_temp = []
                 num_simulaciones_temp = configuracion.get('num_simulaciones', 10000)
+                # R3 alto #15: restaurar también el número de simulaciones de la
+                # pestaña Escenarios (antes nunca se guardaba/cargaba).
+                num_simulaciones_escenarios_temp = configuracion.get('num_simulaciones_escenarios', 10000)
                 
                 # Diccionario para mapear IDs antiguos a nuevos (para evitar conflictos)
                 id_mapeo = {}
@@ -19015,165 +19161,35 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
                 # Cargar eventos de riesgo de la simulación principal a lista temporal
                 for evento_data in configuracion.get('eventos_riesgo', []):
-                    sev_opcion = evento_data['sev_opcion']
-                    sev_input_method = evento_data.get('sev_input_method', 'min_mode_max') # Lee o usa default
-                    sev_params_direct = evento_data.get('sev_params_direct', {}) # Lee o usa default
-                    sev_minimo = evento_data['sev_minimo']
-                    sev_mas_probable = evento_data['sev_mas_probable']
-                    sev_maximo = evento_data['sev_maximo']
-
+                    # R3 alto #16: aislar errores de CUALQUIER punto del procesamiento de
+                    # este evento (no solo generar_distribucion_severidad, ya cubierto por
+                    # el try/except interno de abajo), para que un solo campo faltante o
+                    # mal tipado (freq_opcion, un vinculo sin "tipo", etc.) no aborte TODA
+                    # la importacion -- solo se descarta este evento, igual que ya hacia
+                    # el caso de severidad.
                     try:
-                         dist_sev = generar_distribucion_severidad(
-                            sev_opcion,
-                            sev_minimo,
-                            sev_mas_probable,
-                            sev_maximo,
-                            input_method=sev_input_method,
-                            params_direct=sev_params_direct
-                        )
-                    except Exception as e:
-                          # Acumular error para reportar al usuario (con traducción)
-                          nombre_evento = evento_data.get('nombre', 'N/A')
-                          error_traducido = traducir_error(e)
-                          eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
-                          continue # Saltar al siguiente evento si hay error
-
-                    freq_opcion = evento_data['freq_opcion']
-                    tasa = evento_data.get('tasa', None)
-                    num_eventos = evento_data.get('num_eventos', None)
-                    prob_exito = evento_data.get('prob_exito', None)
-                    if tasa is not None:
-                        tasa = float(tasa)
-                    if num_eventos is not None:
-                        num_eventos = int(num_eventos)
-                    if prob_exito is not None:
-                        prob_exito = float(prob_exito)
-                    if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
-                        vinculos = []
-                        tipo = evento_data.get('tipo_dependencia', 'AND')
-                        for padre_id in evento_data['eventos_padres']:
-                            vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
-                        evento_data['vinculos'] = vinculos
-
-                    pg_params = None
-                    beta_params = None
-                    if freq_opcion == 4:
-                        alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
-                        beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
-                        if alpha is None or beta is None:
-                            try:
-                                pg_min = evento_data.get('pg_minimo')
-                                pg_mode = evento_data.get('pg_mas_probable')
-                                pg_max = evento_data.get('pg_maximo')
-                                pg_conf_pct = evento_data.get('pg_confianza')
-                                if None not in (pg_min, pg_mode, pg_max, pg_conf_pct):
-                                    alpha, beta = obtener_parametros_gamma_para_poisson(float(pg_min), float(pg_mode), float(pg_max), float(pg_conf_pct) / 100.0)
-                            except Exception:
-                                alpha, beta = None, None
-                        if alpha is not None and beta is not None:
-                            pg_params = (float(alpha), float(beta))
-                    elif freq_opcion == 5:
-                        alpha = evento_data.get('beta_alpha')
-                        beta = evento_data.get('beta_beta')
-                        if alpha is not None and beta is not None:
-                            beta_params = (float(alpha), float(beta))
-
-                    dist_freq = generar_distribucion_frecuencia(
-                        freq_opcion,
-                        tasa=tasa,
-                        num_eventos_posibles=num_eventos,
-                        probabilidad_exito=prob_exito,
-                        poisson_gamma_params=pg_params,
-                        beta_params=beta_params
-                    )
-                    evento_data['dist_severidad'] = dist_sev
-                    evento_data['dist_frecuencia'] = dist_freq
-                    
-                    # Normalizar factores_ajuste para backward compatibility
-                    if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
-                        evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
-                        print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' tiene {len(evento_data['factores_ajuste'])} factores (normalizados)")
-                    else:
-                        print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' NO tiene factores_ajuste")
-
-                    # Crear un nuevo ID para el evento y mapearlo
-                    antiguo_id = evento_data['id']
-                    nuevo_id = str(uuid.uuid4())
-                    id_mapeo[antiguo_id] = nuevo_id
-                    evento_data['id'] = nuevo_id
-
-                    # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal
-                    eventos_padres_actualizados = []
-                    for padre_id in evento_data.get('eventos_padres', []):
-                        eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
-                    evento_data['eventos_padres'] = eventos_padres_actualizados
-
-                    # Asegurar que tenga el campo 'activo' (backward compatibility con archivos antiguos)
-                    if 'activo' not in evento_data:
-                        evento_data['activo'] = True
-
-                    # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
-                    eventos_riesgo_temp.append(evento_data)
-
-                # Actualizar IDs en los vínculos después de procesar todos los eventos
-                for evento_data in eventos_riesgo_temp:
-                    if 'vinculos' in evento_data:
-                        vinculos_actualizados = []
-                        for vinculo in evento_data['vinculos']:
-                            id_padre_antiguo = vinculo['id_padre']
-                            if id_padre_antiguo not in id_mapeo:
-                                vinculos_huerfanos.append(
-                                    f"• {evento_data.get('nombre', 'N/A')}: vínculo hacia un evento "
-                                    f"con ID '{id_padre_antiguo}' que no existe en el archivo. "
-                                    f"El vínculo se ignorará (el evento se comportará como independiente)."
-                                )
-                            id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
-                            prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
-                            fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
-                            umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                            # Fix bug #39: partir de una copia del vinculo original (no
-                            # de un dict nuevo con solo 5 claves fijas) para preservar
-                            # cualquier clave desconocida/futura que el archivo pudiera
-                            # traer, en vez de descartarla silenciosamente en cada
-                            # ciclo de guardar/cargar.
-                            vinculo_actualizado = dict(vinculo)
-                            vinculo_actualizado.update({
-                                'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
-                                'probabilidad': prob, 'factor_severidad': fsev,
-                                'umbral_severidad': umbral
-                            })
-                            vinculos_actualizados.append(vinculo_actualizado)
-                        evento_data['vinculos'] = vinculos_actualizados
-
-                # Cargar escenarios
-                for escenario_data in configuracion.get('scenarios', []):
-                    scenario = Scenario(escenario_data['nombre'], escenario_data.get('descripcion', ''))
-                    scenario.eventos_riesgo = []
-
-                    # Nuevo diccionario de IDs para los eventos del escenario
-                    id_mapeo_scenario = {}
-
-                    for evento_data in escenario_data['eventos_riesgo']:
                         sev_opcion = evento_data['sev_opcion']
+                        sev_input_method = evento_data.get('sev_input_method', 'min_mode_max') # Lee o usa default
+                        sev_params_direct = evento_data.get('sev_params_direct', {}) # Lee o usa default
                         sev_minimo = evento_data['sev_minimo']
                         sev_mas_probable = evento_data['sev_mas_probable']
                         sev_maximo = evento_data['sev_maximo']
+
                         try:
-                            dist_sev_esc = generar_distribucion_severidad(
-                                evento_data['sev_opcion'],
-                                evento_data.get('sev_minimo'),
-                                evento_data.get('sev_mas_probable'),
-                                evento_data.get('sev_maximo'),
-                                input_method=evento_data.get('sev_input_method', 'min_mode_max'),
-                                params_direct=evento_data.get('sev_params_direct', {})
+                             dist_sev = generar_distribucion_severidad(
+                                sev_opcion,
+                                sev_minimo,
+                                sev_mas_probable,
+                                sev_maximo,
+                                input_method=sev_input_method,
+                                params_direct=sev_params_direct
                             )
                         except Exception as e:
-                            # Acumular error para reportar al usuario (con traducción)
-                            nombre_evento = evento_data.get('nombre', 'N/A')
-                            nombre_escenario = escenario_data['nombre']
-                            error_traducido = traducir_error(e)
-                            eventos_con_error.append(f"• {nombre_evento} (Escenario: {nombre_escenario}): {error_traducido}")
-                            continue  # Omitir evento con distribución de severidad inválida
+                              # Acumular error para reportar al usuario (con traducción)
+                              nombre_evento = evento_data.get('nombre', 'N/A')
+                              error_traducido = traducir_error(e)
+                              eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
+                              continue # Saltar al siguiente evento si hay error
 
                         freq_opcion = evento_data['freq_opcion']
                         tasa = evento_data.get('tasa', None)
@@ -19192,7 +19208,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
                             evento_data['vinculos'] = vinculos
 
-                        # Reconstruir distribución de frecuencia para eventos del escenario
                         pg_params = None
                         beta_params = None
                         if freq_opcion == 4:
@@ -19224,69 +19239,226 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             poisson_gamma_params=pg_params,
                             beta_params=beta_params
                         )
-                        evento_data['dist_severidad'] = dist_sev_esc
+                        evento_data['dist_severidad'] = dist_sev
                         evento_data['dist_frecuencia'] = dist_freq
-
+                    
                         # Normalizar factores_ajuste para backward compatibility
                         if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
                             evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
+                            print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' tiene {len(evento_data['factores_ajuste'])} factores (normalizados)")
+                        else:
+                            print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' NO tiene factores_ajuste")
 
                         # Crear un nuevo ID para el evento y mapearlo
                         antiguo_id = evento_data['id']
                         nuevo_id = str(uuid.uuid4())
-                        id_mapeo_scenario[antiguo_id] = nuevo_id
+                        id_mapeo[antiguo_id] = nuevo_id
                         evento_data['id'] = nuevo_id
 
-                        # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario
+                        # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal
                         eventos_padres_actualizados = []
                         for padre_id in evento_data.get('eventos_padres', []):
-                            if padre_id in id_mapeo_scenario:
-                                eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
-                            else:
-                                # Si el evento padre está en la simulación principal
-                                eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
+                            eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
                         evento_data['eventos_padres'] = eventos_padres_actualizados
 
-                        # Asegurar que tenga el campo 'activo' (backward compatibility)
+                        # Asegurar que tenga el campo 'activo' (backward compatibility con archivos antiguos)
                         if 'activo' not in evento_data:
                             evento_data['activo'] = True
 
-                        scenario.eventos_riesgo.append(evento_data)
+                        # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
+                        eventos_riesgo_temp.append(evento_data)
+                    except Exception as e:
+                        nombre_evento = evento_data.get("nombre", "N/A")
+                        error_traducido = traducir_error(e)
+                        eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
+                        continue
 
-                    # Agregar a lista temporal (NO modificar self.scenarios todavía)
-                    scenarios_temp.append(scenario)
+                # Actualizar IDs en los vínculos después de procesar todos los eventos
+                for evento_data in eventos_riesgo_temp:
+                    if 'vinculos' in evento_data:
+                        vinculos_actualizados = []
+                        for vinculo in evento_data['vinculos']:
+                            id_padre_antiguo = vinculo['id_padre']
+                            if id_padre_antiguo not in id_mapeo:
+                                vinculos_huerfanos.append(
+                                    f"• {evento_data.get('nombre', 'N/A')}: vínculo hacia un evento "
+                                    f"con ID '{id_padre_antiguo}' que no existe en el archivo. "
+                                    f"El vínculo se ignorará (el evento se comportará como independiente)."
+                                )
+                            id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
+                            prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                            fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                            umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                            # Fix bug #39: partir de una copia del vinculo original (no
+                            # de un dict nuevo con solo 5 claves fijas) para preservar
+                            # cualquier clave desconocida/futura que el archivo pudiera
+                            # traer, en vez de descartarla silenciosamente en cada
+                            # ciclo de guardar/cargar.
+                            vinculo_actualizado = dict(vinculo)
+                            vinculo_actualizado.update({
+                                'id_padre': id_padre_nuevo, 'tipo': vinculo.get('tipo', 'AND'),  # R3 alto #16: default en vez de KeyError
+                                'probabilidad': prob, 'factor_severidad': fsev,
+                                'umbral_severidad': umbral
+                            })
+                            vinculos_actualizados.append(vinculo_actualizado)
+                        evento_data['vinculos'] = vinculos_actualizados
 
-                    for evento_data in scenario.eventos_riesgo:
-                        if 'vinculos' in evento_data:
-                            vinculos_actualizados = []
-                            for vinculo in evento_data['vinculos']:
-                                id_padre_antiguo = vinculo['id_padre']
-                                # Primero buscar en el mapeo del escenario, luego en el mapeo general
-                                if id_padre_antiguo in id_mapeo_scenario:
-                                    id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
-                                elif id_padre_antiguo in id_mapeo:
-                                    id_padre_nuevo = id_mapeo[id_padre_antiguo]
+                # Cargar escenarios
+                for escenario_data in configuracion.get('scenarios', []):
+                    # R3 alto #16: aislar errores de un escenario completo (nombre/
+                    # eventos_riesgo faltante o mal tipado, o cualquier error durante
+                    # el procesamiento de sus eventos) para que UN escenario roto no
+                    # aborte la importacion de los demas escenarios ni de la simulacion
+                    # principal ya procesada.
+                    _scenarios_temp_len_antes = len(scenarios_temp)
+                    try:
+                        scenario = Scenario(escenario_data['nombre'], escenario_data.get('descripcion', ''))
+                        scenario.eventos_riesgo = []
+
+                        # Nuevo diccionario de IDs para los eventos del escenario
+                        id_mapeo_scenario = {}
+
+                        for evento_data in escenario_data['eventos_riesgo']:
+                            sev_opcion = evento_data['sev_opcion']
+                            sev_minimo = evento_data['sev_minimo']
+                            sev_mas_probable = evento_data['sev_mas_probable']
+                            sev_maximo = evento_data['sev_maximo']
+                            try:
+                                dist_sev_esc = generar_distribucion_severidad(
+                                    evento_data['sev_opcion'],
+                                    evento_data.get('sev_minimo'),
+                                    evento_data.get('sev_mas_probable'),
+                                    evento_data.get('sev_maximo'),
+                                    input_method=evento_data.get('sev_input_method', 'min_mode_max'),
+                                    params_direct=evento_data.get('sev_params_direct', {})
+                                )
+                            except Exception as e:
+                                # Acumular error para reportar al usuario (con traducción)
+                                nombre_evento = evento_data.get('nombre', 'N/A')
+                                nombre_escenario = escenario_data['nombre']
+                                error_traducido = traducir_error(e)
+                                eventos_con_error.append(f"• {nombre_evento} (Escenario: {nombre_escenario}): {error_traducido}")
+                                continue  # Omitir evento con distribución de severidad inválida
+
+                            freq_opcion = evento_data['freq_opcion']
+                            tasa = evento_data.get('tasa', None)
+                            num_eventos = evento_data.get('num_eventos', None)
+                            prob_exito = evento_data.get('prob_exito', None)
+                            if tasa is not None:
+                                tasa = float(tasa)
+                            if num_eventos is not None:
+                                num_eventos = int(num_eventos)
+                            if prob_exito is not None:
+                                prob_exito = float(prob_exito)
+                            if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
+                                vinculos = []
+                                tipo = evento_data.get('tipo_dependencia', 'AND')
+                                for padre_id in evento_data['eventos_padres']:
+                                    vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
+                                evento_data['vinculos'] = vinculos
+
+                            # Reconstruir distribución de frecuencia para eventos del escenario
+                            pg_params = None
+                            beta_params = None
+                            if freq_opcion == 4:
+                                alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
+                                beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
+                                if alpha is None or beta is None:
+                                    try:
+                                        pg_min = evento_data.get('pg_minimo')
+                                        pg_mode = evento_data.get('pg_mas_probable')
+                                        pg_max = evento_data.get('pg_maximo')
+                                        pg_conf_pct = evento_data.get('pg_confianza')
+                                        if None not in (pg_min, pg_mode, pg_max, pg_conf_pct):
+                                            alpha, beta = obtener_parametros_gamma_para_poisson(float(pg_min), float(pg_mode), float(pg_max), float(pg_conf_pct) / 100.0)
+                                    except Exception:
+                                        alpha, beta = None, None
+                                if alpha is not None and beta is not None:
+                                    pg_params = (float(alpha), float(beta))
+                            elif freq_opcion == 5:
+                                alpha = evento_data.get('beta_alpha')
+                                beta = evento_data.get('beta_beta')
+                                if alpha is not None and beta is not None:
+                                    beta_params = (float(alpha), float(beta))
+
+                            dist_freq = generar_distribucion_frecuencia(
+                                freq_opcion,
+                                tasa=tasa,
+                                num_eventos_posibles=num_eventos,
+                                probabilidad_exito=prob_exito,
+                                poisson_gamma_params=pg_params,
+                                beta_params=beta_params
+                            )
+                            evento_data['dist_severidad'] = dist_sev_esc
+                            evento_data['dist_frecuencia'] = dist_freq
+
+                            # Normalizar factores_ajuste para backward compatibility
+                            if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
+                                evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
+
+                            # Crear un nuevo ID para el evento y mapearlo
+                            antiguo_id = evento_data['id']
+                            nuevo_id = str(uuid.uuid4())
+                            id_mapeo_scenario[antiguo_id] = nuevo_id
+                            evento_data['id'] = nuevo_id
+
+                            # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario
+                            eventos_padres_actualizados = []
+                            for padre_id in evento_data.get('eventos_padres', []):
+                                if padre_id in id_mapeo_scenario:
+                                    eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
                                 else:
-                                    vinculos_huerfanos.append(
-                                        f"• {evento_data.get('nombre', 'N/A')} (Escenario: {scenario.nombre}): "
-                                        f"vínculo hacia un evento con ID '{id_padre_antiguo}' que no existe "
-                                        f"en el archivo. El vínculo se ignorará (el evento se comportará "
-                                        f"como independiente)."
-                                    )
-                                    id_padre_nuevo = id_padre_antiguo
-                                prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
-                                fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
-                                umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                                # Fix bug #39: preservar claves desconocidas/futuras del
-                                # vinculo original (ver mismo fix en la lista principal).
-                                vinculo_actualizado = dict(vinculo)
-                                vinculo_actualizado.update({
-                                    'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
-                                    'probabilidad': prob, 'factor_severidad': fsev,
-                                    'umbral_severidad': umbral
-                                })
-                                vinculos_actualizados.append(vinculo_actualizado)
-                            evento_data['vinculos'] = vinculos_actualizados
+                                    # Si el evento padre está en la simulación principal
+                                    eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
+                            evento_data['eventos_padres'] = eventos_padres_actualizados
+
+                            # Asegurar que tenga el campo 'activo' (backward compatibility)
+                            if 'activo' not in evento_data:
+                                evento_data['activo'] = True
+
+                            scenario.eventos_riesgo.append(evento_data)
+
+                        # Agregar a lista temporal (NO modificar self.scenarios todavía)
+                        scenarios_temp.append(scenario)
+
+                        for evento_data in scenario.eventos_riesgo:
+                            if 'vinculos' in evento_data:
+                                vinculos_actualizados = []
+                                for vinculo in evento_data['vinculos']:
+                                    id_padre_antiguo = vinculo['id_padre']
+                                    # Primero buscar en el mapeo del escenario, luego en el mapeo general
+                                    if id_padre_antiguo in id_mapeo_scenario:
+                                        id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
+                                    elif id_padre_antiguo in id_mapeo:
+                                        id_padre_nuevo = id_mapeo[id_padre_antiguo]
+                                    else:
+                                        vinculos_huerfanos.append(
+                                            f"• {evento_data.get('nombre', 'N/A')} (Escenario: {scenario.nombre}): "
+                                            f"vínculo hacia un evento con ID '{id_padre_antiguo}' que no existe "
+                                            f"en el archivo. El vínculo se ignorará (el evento se comportará "
+                                            f"como independiente)."
+                                        )
+                                        id_padre_nuevo = id_padre_antiguo
+                                    prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                                    fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                                    umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                                    # Fix bug #39: preservar claves desconocidas/futuras del
+                                    # vinculo original (ver mismo fix en la lista principal).
+                                    vinculo_actualizado = dict(vinculo)
+                                    vinculo_actualizado.update({
+                                        'id_padre': id_padre_nuevo, 'tipo': vinculo.get('tipo', 'AND'),  # R3 alto #16: default en vez de KeyError
+                                        'probabilidad': prob, 'factor_severidad': fsev,
+                                        'umbral_severidad': umbral
+                                    })
+                                    vinculos_actualizados.append(vinculo_actualizado)
+                                evento_data['vinculos'] = vinculos_actualizados
+                    except Exception as e:
+                        # Descartar cualquier escenario parcialmente agregado antes del error
+                        del scenarios_temp[_scenarios_temp_len_antes:]
+                        nombre_escenario_err = escenario_data.get("nombre", "N/A") if isinstance(escenario_data, dict) else "N/A"
+                        error_traducido = traducir_error(e)
+                        eventos_con_error.append(f"• Escenario '{nombre_escenario_err}': {error_traducido}")
+                        continue
 
                 # Fix bug #21: validar ciclos de dependencia (vinculos) ANTES de
                 # comprometer la transaccion. tiene_ciclo() ya existia pero solo
@@ -19351,7 +19523,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
                 # Aplicar la nueva configuración
                 self.num_simulaciones_var.setText(str(num_simulaciones_temp))
-                
+                if hasattr(self, 'num_simulaciones_var_escenarios'):
+                    self.num_simulaciones_var_escenarios.setText(str(num_simulaciones_escenarios_temp))
+
                 # Aplicar eventos de riesgo
                 self.eventos_riesgo = eventos_riesgo_temp
                 for evento_data in self.eventos_riesgo:

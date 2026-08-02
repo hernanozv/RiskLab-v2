@@ -2857,8 +2857,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         elif 'eventos_padres' in evento and evento['eventos_padres']:
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
             # Formato antiguo: usar tipo_dependencia único para todos los padres
-            eventos_padres = evento.get('eventos_padres', [])
+            eventos_padres_declarados = evento.get('eventos_padres', [])
             tipo_dependencia = evento.get('tipo_dependencia', 'AND')
+
+            # Fix bug #41 (QA ronda 2): a diferencia de la rama nueva ('vinculos',
+            # línea ~2720), esta rama legacy no filtraba id_padre inexistentes en
+            # id_a_index antes de indexar. Un vínculo legacy huérfano (p.ej. el
+            # padre fue borrado tras importar un JSON en formato antiguo, ya que
+            # la limpieza de huérfanos solo actualiza 'vinculos', no
+            # 'eventos_padres') hacía que id_a_index[padre_id] lanzara un
+            # KeyError sin capturar, abortando la simulación COMPLETA (no solo
+            # el evento afectado). Ahora se ignoran los padres inexistentes,
+            # igual que en la rama nueva.
+            eventos_padres = []
+            for padre_id in eventos_padres_declarados:
+                if padre_id not in id_a_index:
+                    _dbg(f"[DEBUG] eventos_padres (legacy): id_padre {padre_id} no encontrado en id_a_index, se ignora")
+                    continue
+                eventos_padres.append(padre_id)
 
             if eventos_padres:
                 # Verificar condiciones según tipo de dependencia
@@ -4934,6 +4950,19 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 evento['vinculos'] = [
                     v for v in evento['vinculos']
                     if v.get('id_padre') not in ids_eliminados
+                ]
+            # Fix bug #41 (QA ronda 2): esta limpieza solo cubría 'vinculos'
+            # (formato nuevo), nunca 'eventos_padres' (formato legacy, usado por
+            # eventos importados de JSON antiguo antes de la auto-conversión).
+            # Un evento legacy quedaba con un id_padre apuntando a un evento ya
+            # borrado, lo cual el motor de simulación no filtraba (ver fix en
+            # generar_lda_con_secuencialidad) y podía volver a producir un
+            # KeyError si esa protección llegara a fallar o cambiar. Se limpia
+            # aquí también, por consistencia y defensa en profundidad.
+            if 'eventos_padres' in evento and evento['eventos_padres']:
+                evento['eventos_padres'] = [
+                    padre_id for padre_id in evento['eventos_padres']
+                    if padre_id not in ids_eliminados
                 ]
 
     def reconstruir_checkboxes_eventos(self):

@@ -10100,7 +10100,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             umbral_sev_spinbox.setValue(0)
             umbral_sev_spinbox.setSingleStep(1000)
             umbral_sev_spinbox.setPrefix("$")
-            umbral_sev_spinbox.setToolTip("El vínculo solo se evalúa si la pérdida NETA del padre (post-controles y seguros) supera este monto. $0 = siempre evaluar.")
+            # R4 medio #10: la R3 alto #8 cambió el motor para evaluar este
+            # umbral contra la pérdida BRUTA del padre (perdidas_brutas_por_evento,
+            # antes de aplicar seguros), justamente para que un incidente
+            # realmente grave no dejara de disparar la cascada solo porque un
+            # seguro redujo el monto neto por debajo del umbral -- pero este
+            # tooltip nunca se actualizó y seguía describiendo la semántica
+            # vieja (NETA/post-seguros), contradiciendo el comportamiento real.
+            umbral_sev_spinbox.setToolTip("El vínculo solo se evalúa si la pérdida BRUTA del padre (antes de aplicar seguros) supera este monto. $0 = siempre evaluar.")
             sel_layout.addWidget(umbral_sev_spinbox)
 
             # Botones de aceptar/cancelar
@@ -10224,7 +10231,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 umbral_spin.setPrefix("$")
                 umbral_spin.setFixedHeight(30)
                 umbral_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
-                umbral_spin.setToolTip("Pérdida NETA mínima del padre (post-controles y seguros) para activar este vínculo. $0 = siempre evaluar.")
+                # R4 medio #10: ver comentario equivalente más arriba, junto
+                # al otro spinbox de umbral (diálogo "Agregar Vínculo").
+                umbral_spin.setToolTip("Pérdida BRUTA mínima del padre (antes de aplicar seguros) para activar este vínculo. $0 = siempre evaluar.")
                 umbral_spin.valueChanged.connect(lambda val, row=idx: actualizar_umbral_severidad_vinculo(row, val))
                 vinculos_table.setCellWidget(idx, 4, umbral_spin)
 
@@ -11569,12 +11578,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
                      vinculos_existentes, factores_ajuste_existentes=None,
                      sev_freq_config=None,
                      sev_limite_var=None, freq_limite_var=None):
+        # R4 medio #4: un doble-click (o Enter + click casi simultáneos)
+        # sobre el botón Guardar puede disparar la señal 'accepted' del
+        # QDialogButtonBox dos veces antes de que el diálogo termine de
+        # cerrarse, ejecutando guardar_evento() dos veces en secuencia. La
+        # primera invocación agrega el evento exitosamente; como 'new'
+        # sigue siendo True, la segunda invocación lo agrega OTRA VEZ,
+        # duplicando el evento. Se guarda un flag en el propio objeto
+        # 'dialog' (persiste entre ambas invocaciones, ya que es el mismo
+        # objeto) para que solo la primera llamada exitosa tenga efecto.
+        if getattr(dialog, '_risklab_guardado_ok', False):
+            return
         try:
             nombre_evento = nombre_var.text().strip()
             if not nombre_evento:
                 raise ValueError("El nombre del evento no puede estar vacío.")
             if len(nombre_evento) > 50:
                 raise ValueError("El nombre del evento no puede tener más de 50 caracteres.")
+
+            # R4 medio #8: sin esta validación, dos eventos podían tener el
+            # mismo nombre. Muchos reportes/gráficos (tornado, contribución,
+            # resumen ejecutivo del export IA, etc.) identifican eventos por
+            # NOMBRE al mostrarlos a un usuario o a un agente IA -- con dos
+            # eventos "Fraude" distintos, un lector no puede saber cuál de
+            # los dos contribuyó qué, aunque el motor los distinga
+            # correctamente por 'id' internamente. Mismo patrón ya usado
+            # para nombres de escenario (R3 medio #25, ver guardar_scenario).
+            for i, ev in enumerate(self.eventos_riesgo):
+                if (new or i != row) and ev.get('nombre') == nombre_evento:
+                    raise ValueError(
+                        f"Ya existe un evento llamado '{nombre_evento}'. "
+                        f"Elija un nombre único."
+                    )
 
             # Severidad
             # --- NUEVA LÓGICA PARA SEVERIDAD ---
@@ -11731,7 +11766,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
             elif freq_opcion == 2: # Binomial
                 if not num_eventos_var.text(): raise ValueError("El número de eventos posibles (n) no puede estar vacío.")
                 if not prob_exito_var.text(): raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
-                num_eventos = int(float(num_eventos_var.text()))
+                # R4 medio #3: int(float(...)) (en vez de int(...) crudo) maneja
+                # bien texto como "5.0", pero también TRUNCABA en silencio
+                # cualquier valor genuinamente fraccionario (ej. "10.7" -> 10)
+                # sin avisar al usuario -- "n" es un conteo de ensayos y debe
+                # ser un entero exacto, no un valor redondeado sin aviso.
+                num_eventos_float = float(num_eventos_var.text())
+                if abs(num_eventos_float - round(num_eventos_float)) > 1e-9:
+                    raise ValueError(
+                        f"El número de eventos posibles (n) debe ser un número entero "
+                        f"(se ingresó {num_eventos_var.text()})."
+                    )
+                num_eventos = int(round(num_eventos_float))
                 prob_exito = float(prob_exito_var.text())
                 if num_eventos <= 0: raise ValueError("El número de eventos posibles (n) debe ser mayor que cero.")
                 if not 0 <= prob_exito <= 1: raise ValueError("La probabilidad de éxito (p) debe estar entre 0 y 1.")
@@ -11937,6 +11983,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 
                 # Evento actualizado exitosamente
 
+            dialog._risklab_guardado_ok = True
             dialog.accept()
 
         except ValueError as ve:
@@ -12025,6 +12072,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             evento_original = self.eventos_riesgo[row]
             eventos_a_duplicar.append(evento_original)
 
+        # R4 medio #8: sin esta validación, duplicar el mismo evento dos
+        # veces (o duplicar un evento que ya se llamaba "X (Copia)") producía
+        # dos eventos con el nombre IDÉNTICO -- mismo problema ya corregido
+        # para escenarios en duplicar_scenario (R4 alto #6). Se rastrean los
+        # nombres ya usados (incluyendo los que se van agregando en este
+        # mismo lote) para garantizar unicidad.
+        nombres_existentes = {ev.get('nombre') for ev in self.eventos_riesgo}
+
         # Primero asignamos nuevos IDs
         for evento_original in eventos_a_duplicar:
             evento_nuevo = copy.deepcopy(evento_original)
@@ -12032,7 +12087,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             id_original_a_nuevo[evento_original['id']] = nuevo_id
             evento_nuevo['id'] = nuevo_id
             # Añadir un prefijo o sufijo al nombre para indicar que es una copia
-            evento_nuevo['nombre'] = evento_nuevo['nombre'] + " (Copia)"
+            nombre_base = evento_nuevo['nombre'] + " (Copia)"
+            nombre_candidato = nombre_base
+            contador = 2
+            while nombre_candidato in nombres_existentes:
+                nombre_candidato = f"{nombre_base} {contador}"
+                contador += 1
+            evento_nuevo['nombre'] = nombre_candidato
+            nombres_existentes.add(nombre_candidato)
             nuevos_eventos.append(evento_nuevo)
 
         # Actualizar las dependencias de los eventos duplicados
@@ -12714,6 +12776,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.set_interfaz_activa(True)
         # Continuar la barra para post-procesamiento a partir de 70-100
         self.actualizar_progreso_post(70, "Procesando resultados")
+
+        # R4 medio #1: frecuencias_totales/frecuencias_por_evento son arrays
+        # np.int32 por diseño (cuentan ocurrencias, nunca deberían ser
+        # negativas), pero si un NaN se genera en algún punto del pipeline
+        # antes del cast final a int32 (p.ej. un factor de ajuste con
+        # parámetros extremos), numpy lo convierte SILENCIOSAMENTE al
+        # asignarlo a un slot int32: no hay excepción ni warning, el valor
+        # queda como un entero centinela (INT32_MIN). Ese centinela luego
+        # corrompe min()/max()/bincount() de los gráficos de Frecuencia --
+        # incluyendo callbacks de hover interactivo que NO pasan por el
+        # try/except de más abajo -- ocultando o distorsionando el gráfico
+        # sin ningún aviso visible. Como una frecuencia nunca puede ser
+        # negativa legítimamente, se sanea acá (único punto de entrada de
+        # los resultados a la UI) clampeando a >= 0.
+        if frecuencias_totales is not None:
+            frecuencias_totales = np.maximum(frecuencias_totales, 0)
+        if frecuencias_por_evento is not None:
+            frecuencias_por_evento = [np.maximum(a, 0) for a in frecuencias_por_evento]
 
         # Guardar los resultados para uso posterior (exportación a PDF)
         self.resultados_simulacion = {
@@ -14681,7 +14761,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         # guardado como float (p.ej. 5.0), el texto queda "5.0"
                         # y int("5.0") lanza ValueError, mientras que
                         # int(float("5.0")) funciona correctamente.
-                        n = int(float(n_var.text()))
+                        # R4 medio #3: pero int(float(...)) también trunca en
+                        # silencio cualquier valor genuinamente fraccionario
+                        # (ej. "10.7" -> 10) sin avisar al usuario -- ver mismo
+                        # fix en el diálogo principal (guardar_evento).
+                        n_float = float(n_var.text())
+                        if abs(n_float - round(n_float)) > 1e-9:
+                            raise ValueError(
+                                f"El número de eventos (n) debe ser un número entero "
+                                f"(se ingresó {n_var.text()})."
+                            )
+                        n = int(round(n_float))
                         p = float(p_var.text())
                         if n <= 0:
                             raise ValueError("El número de eventos (n) debe ser mayor que cero.")
@@ -14995,6 +15085,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         dialog.exec_()
 
     def guardar_scenario(self, dialog, new, row, nombre_var, descripcion_var):
+        # R4 medio #4: mismo guard que guardar_evento -- un doble-click (o
+        # Enter + click casi simultáneos) sobre el botón Guardar puede
+        # disparar 'accepted' dos veces antes de que el diálogo cierre,
+        # ejecutando guardar_scenario() dos veces en secuencia y
+        # duplicando el escenario (la segunda invocación vuelve a pasar
+        # la validación de nombre único, ya que en ese punto el primer
+        # escenario ya se agregó exitosamente... salvo que ahora SÍ
+        # colisiona con el nombre recién agregado por la primera llamada,
+        # pero eso dependía de que la validación de nombre único llegara
+        # a tiempo; este guard lo evita de forma determinística).
+        if getattr(dialog, '_risklab_guardado_ok', False):
+            return
         try:
             nombre_scenario = nombre_var.text().strip()
             descripcion_scenario = descripcion_var.text().strip()
@@ -15056,6 +15158,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # escenario actual.
                 self.actualizar_vista_escenarios()
 
+            dialog._risklab_guardado_ok = True
             dialog.accept()
 
         except ValueError as ve:
@@ -18028,9 +18131,41 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if not filepath:
             return  # Usuario canceló
 
+        # R4 medio #5: _construir_export_payload_ia + _escribir_export_json
+        # corren de forma SÍNCRONA en el hilo principal (no hay un
+        # QThread como en la simulación), así que la interfaz queda sin
+        # responder durante toda la generación -- y con arrays raw
+        # incluidos, convertir arrays numpy a listas de Python nativas
+        # (necesario para serializar a JSON) puede usar varias veces la
+        # memoria del tamaño final del archivo (numpy float64 ~8 bytes/
+        # elemento vs. objetos float de Python ~28 bytes/elemento, más la
+        # cadena JSON completa en memoria antes de escribirla a disco).
+        # Se avisa explícitamente al usuario antes de bloquear la UI con
+        # una exportación grande, dándole la oportunidad de cancelar.
+        UMBRAL_MB_AVISO_EXPORT_IA = 50.0
+        if opciones.get("incluir_raw_arrays") and opciones.get("mb_raw_estimado", 0) > UMBRAL_MB_AVISO_EXPORT_IA:
+            respuesta = QtWidgets.QMessageBox.question(
+                self, "Exportación grande",
+                f"El archivo con arrays raw incluidos pesará aproximadamente "
+                f"{opciones['mb_raw_estimado']:.0f} MB. Generarlo puede tardar "
+                f"varios segundos y la aplicación quedará SIN RESPONDER durante "
+                f"ese tiempo (la exportación no corre en segundo plano). El uso "
+                f"de memoria durante la generación también puede ser varias "
+                f"veces mayor al tamaño final del archivo.\n\n¿Desea continuar?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if respuesta != QtWidgets.QMessageBox.Yes:
+                return
+
         # 3. Construir el payload y serializar
         try:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            # Forzar que el cursor de espera se pinte ANTES de bloquear el
+            # hilo principal con el trabajo pesado de abajo; sin esto, en
+            # exportaciones grandes el cursor podía no llegar a mostrarse
+            # nunca como "ocupado" antes de que la UI se congele, haciendo
+            # parecer que la aplicación colgó sin ningún indicio visual.
+            QtWidgets.QApplication.processEvents()
             payload = self._construir_export_payload_ia(opciones)
             self._escribir_export_json(filepath, payload, comprimir=opciones.get("comprimir", False))
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -18169,7 +18304,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
             "incluir_contribucion_marginal": cb_marginal.isChecked(),
             "incluir_text_snapshot": cb_text_snapshot.isChecked(),
             "incluir_raw_arrays": cb_raw.isChecked(),
-            "comprimir": cb_gzip.isChecked()
+            "comprimir": cb_gzip.isChecked(),
+            # R4 medio #5: se reutiliza esta estimación (ya calculada arriba
+            # para el label del checkbox) en exportar_para_ia() para avisar
+            # al usuario ANTES de bloquear la UI con una exportación grande.
+            "mb_raw_estimado": mb_raw,
         }
 
     @staticmethod
@@ -18778,15 +18917,41 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             porc_ceros = float(np.mean(perdidas_totales == 0) * 100.0) if perdidas_totales.size > 0 else 0.0
 
+            # R4 medio #7: si perdidas_totales (o algún perdidas_por_evento)
+            # trae un NaN aislado (posible por cualquier bug menor en un
+            # factor estocástico, ver R4 crítico #2), media/var_99/es_99/
+            # curt/asim/top_pct/top3_pct pueden quedar en NaN SIN lanzar
+            # ninguna excepción (numpy propaga NaN silenciosamente en mean/
+            # percentile/kurtosis/skew). El try/except de este método solo
+            # atrapa errores reales, así que un NaN aquí seguía adelante y
+            # currency_format()/f-strings lo formateaban como el texto
+            # literal "nan" (ej. "$nan"), incrustado en un resumen narrativo
+            # que se supone legible para un agente IA -- a diferencia de los
+            # campos NUMÉRICOS del payload (ya saneados recursivamente por
+            # _sanear_nan_inf_recursivo), este texto ya es un string por lo
+            # que ese saneo no lo alcanza. Se sanean estos valores ANTES de
+            # construir cualquier string narrativo.
+            def _texto_moneda_seguro(valor):
+                return currency_format(valor) if np.isfinite(valor) else "N/D (dato inválido)"
+
+            if not np.isfinite(curt):
+                curt = 0.0
+            if not np.isfinite(asim):
+                asim = 0.0
+            if not np.isfinite(top_pct):
+                top_pct = 0.0
+            if not np.isfinite(top3_pct):
+                top3_pct = 0.0
+
             # Fix bug medio #20 (QA ronda 2): usar currency_format() (formato
             # "$1.234.567", consistente con el resto de la app/PDF) en vez de
             # un f-string crudo "${:,.0f}" que produce el formato inverso en
             # inglés ("$1,234,567") — mismo antipatrón ya corregido en la
             # descripción de vínculos del PDF (fix bug #38).
             findings = [
-                f"Pérdida media esperada: {currency_format(media)} anuales",
-                f"Con 99% de confianza, las pérdidas no superarán {currency_format(var_99)} (VaR 99%)",
-                f"Si se supera el VaR 99%, la pérdida esperada es {currency_format(es_99)} (Expected Shortfall)",
+                f"Pérdida media esperada: {_texto_moneda_seguro(media)} anuales",
+                f"Con 99% de confianza, las pérdidas no superarán {_texto_moneda_seguro(var_99)} (VaR 99%)",
+                f"Si se supera el VaR 99%, la pérdida esperada es {_texto_moneda_seguro(es_99)} (Expected Shortfall)",
                 f"El evento '{top_evento}' contribuye {top_pct}% al riesgo agregado medio",
                 f"{porc_ceros:.1f}% de los años no presentan pérdida alguna",
                 f"Cola: kurtosis={curt:.2f}, asimetría={asim:.2f}",
@@ -18810,8 +18975,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             return {
                 "headline": (
-                    f"Pérdida agregada media de {currency_format(media)} con VaR 99% de "
-                    f"{currency_format(var_99)}. Cartera en zona {zona_media} (media) / "
+                    f"Pérdida agregada media de {_texto_moneda_seguro(media)} con VaR 99% de "
+                    f"{_texto_moneda_seguro(var_99)}. Cartera en zona {zona_media} (media) / "
                     f"{zona_p99} (P99)."
                 ),
                 "key_findings": findings,
@@ -19812,6 +19977,67 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         f"se encontró un {type(configuracion['scenarios']).__name__}."
                     )
 
+                # R4 medio #2: tanto id_a_index (en el motor de simulación) como
+                # id_mapeo (más abajo, en este mismo método) resuelven eventos
+                # por su campo 'id' usando un dict. Si el archivo trae dos
+                # eventos con el MISMO id (archivo editado a mano o generado
+                # externamente), el segundo pisa silenciosamente al primero en
+                # ese dict, y cualquier vínculo que apunte a ese id termina
+                # enlazado al evento equivocado -- sin ningún aviso. Se detecta
+                # esto ANTES de procesar (en los eventos principales y en cada
+                # escenario por separado, ya que cada lista es su propio
+                # espacio de ids) para poder advertir al usuario.
+                ids_duplicados_detectados = []
+
+                def _detectar_ids_duplicados_evento(lista_eventos, contexto):
+                    conteo_por_id = {}
+                    for ev in lista_eventos:
+                        if not isinstance(ev, dict):
+                            continue
+                        eid = ev.get('id')
+                        if eid is None:
+                            continue
+                        conteo_por_id.setdefault(eid, []).append(ev.get('nombre', 'N/A'))
+                    for eid, nombres in conteo_por_id.items():
+                        if len(nombres) > 1:
+                            ids_duplicados_detectados.append(
+                                f"• {contexto}: id '{eid}' compartido por {len(nombres)} eventos "
+                                f"({', '.join(nombres)})"
+                            )
+
+                _detectar_ids_duplicados_evento(configuracion.get('eventos_riesgo') or [], "Eventos principales")
+                for _sc in (configuracion.get('scenarios') or []):
+                    if isinstance(_sc, dict):
+                        _detectar_ids_duplicados_evento(
+                            _sc.get('eventos_riesgo') or [], f"Escenario '{_sc.get('nombre', 'N/A')}'"
+                        )
+
+                # R4 medio #11: guardar_scenario() valida nombre único al
+                # crear/editar un escenario a mano (R3 medio #25), pero
+                # cargar_configuracion nunca validaba lo mismo para los
+                # escenarios que vienen de un archivo JSON importado. Si el
+                # archivo trae dos escenarios con el mismo 'nombre', la
+                # restauración de 'current_scenario_name' (que empareja por
+                # nombre, primer match -- ver más abajo) selecciona
+                # ambiguamente cualquiera de los dos, no necesariamente el
+                # que estaba realmente seleccionado cuando se guardó el
+                # archivo.
+                nombres_escenario_duplicados_detectados = []
+                _conteo_nombres_escenario = {}
+                for _sc in (configuracion.get('scenarios') or []):
+                    if not isinstance(_sc, dict):
+                        continue
+                    _nombre_sc = _sc.get('nombre')
+                    if _nombre_sc is None:
+                        continue
+                    _conteo_nombres_escenario.setdefault(_nombre_sc, 0)
+                    _conteo_nombres_escenario[_nombre_sc] += 1
+                for _nombre_sc, _cantidad in _conteo_nombres_escenario.items():
+                    if _cantidad > 1:
+                        nombres_escenario_duplicados_detectados.append(
+                            f"• El nombre de escenario '{_nombre_sc}' aparece {_cantidad} veces en el archivo"
+                        )
+
                 # === INICIO DE TRANSACCIÓN: Procesar en variables temporales ===
                 # Si hay algún error durante el procesamiento, los datos originales quedan intactos
 
@@ -20376,7 +20602,57 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         f"Configuración cargada con {cantidad_huerfanos} vínculo(s) no restaurado(s)", 5000
                     )
 
-                if not eventos_con_error and not vinculos_huerfanos:
+                # R4 medio #2: reportar ids de evento duplicados detectados en el
+                # archivo (ver comentario completo donde se detectan, más
+                # arriba). Los eventos SÍ se cargaron (cada uno recibe un id
+                # nuevo al importarse), pero cualquier vínculo que apuntara al
+                # id duplicado original pudo resolverse al evento equivocado.
+                if ids_duplicados_detectados:
+                    cantidad_dup = len(ids_duplicados_detectados)
+                    mensaje_dup = (
+                        f"El archivo contiene {cantidad_dup} id de evento duplicado(s). Esto puede "
+                        f"hacer que algún vínculo se haya enlazado al evento equivocado:\n\n"
+                    )
+                    dup_a_mostrar = ids_duplicados_detectados[:10]
+                    mensaje_dup += "\n".join(dup_a_mostrar)
+                    if cantidad_dup > 10:
+                        mensaje_dup += f"\n\n... y {cantidad_dup - 10} caso(s) adicional(es)."
+                    mensaje_dup += (
+                        "\n\nVerifique los vínculos de los eventos involucrados y la "
+                        "configuración del archivo (posiblemente editado a mano o generado externamente)."
+                    )
+                    QtWidgets.QMessageBox.warning(self, "IDs de Evento Duplicados", mensaje_dup)
+                    self.statusBar().showMessage(
+                        f"Configuración cargada con {cantidad_dup} id(s) de evento duplicado(s)", 5000
+                    )
+
+                # R4 medio #11: reportar nombres de escenario duplicados
+                # detectados en el archivo (ver comentario completo donde se
+                # detectan, más arriba). Los escenarios SÍ se cargaron; el
+                # riesgo es que la restauración de 'current_scenario_name'
+                # (empareja por nombre, primer match) seleccione el
+                # escenario equivocado.
+                if nombres_escenario_duplicados_detectados:
+                    cantidad_dup_sc = len(nombres_escenario_duplicados_detectados)
+                    mensaje_dup_sc = (
+                        f"El archivo contiene {cantidad_dup_sc} nombre(s) de escenario duplicado(s). "
+                        f"Esto puede hacer que se restaure el escenario equivocado como "
+                        f"'escenario actual':\n\n"
+                    )
+                    mensaje_dup_sc += "\n".join(nombres_escenario_duplicados_detectados[:10])
+                    if cantidad_dup_sc > 10:
+                        mensaje_dup_sc += f"\n\n... y {cantidad_dup_sc - 10} caso(s) adicional(es)."
+                    mensaje_dup_sc += (
+                        "\n\nVerifique los nombres de escenario en la configuración del archivo "
+                        "(posiblemente editado a mano o generado externamente)."
+                    )
+                    QtWidgets.QMessageBox.warning(self, "Nombres de Escenario Duplicados", mensaje_dup_sc)
+                    self.statusBar().showMessage(
+                        f"Configuración cargada con {cantidad_dup_sc} nombre(s) de escenario duplicado(s)", 5000
+                    )
+
+                if (not eventos_con_error and not vinculos_huerfanos and not ids_duplicados_detectados
+                        and not nombres_escenario_duplicados_detectados):
                     self.statusBar().showMessage("La Simulación ha sido cargada exitosamente", 5000)
                 
                 # Refrescar layout si la ventana está maximizada (fix bug de alineación)

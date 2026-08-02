@@ -32,6 +32,8 @@ import io
 import traceback
 import uuid
 import copy
+import logging
+import logging.handlers
 from xml.sax.saxutils import escape as _xml_escape_pdf
 
 # Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
@@ -162,6 +164,58 @@ def _indice_actual_avisos_riesgo():
         return len(_riesgo_warnings_buffer)
 
 
+# ==========================================================================
+# R4 alto #7: logging a archivo + excepthook global.
+#
+# En una build empaquetada con la consola oculta (PyInstaller
+# --windowed/console=False), cualquier excepción no capturada en el hilo
+# principal (fuera de los try/except explícitos de la UI) simplemente
+# cierra la aplicación sin dejar NINGÚN rastro visible: no hay consola
+# donde leer el traceback, y sin este logging tampoco quedaría nada en
+# disco. Esto hace que un crash reportado por un usuario en producción sea
+# efectivamente indiagnosticable a distancia. Instalamos:
+#   1) un logger raíz que escribe a un archivo rotativo en el directorio
+#      de configuración del usuario (~/.risklab/risklab.log), y
+#   2) un sys.excepthook que registra cualquier excepción no capturada
+#      del hilo principal en ese archivo antes de continuar con el
+#      comportamiento por defecto de Python.
+# Si el archivo de log no se puede crear (permisos, disco de solo
+# lectura, etc.), la app debe seguir funcionando igual: el logging es una
+# ayuda de diagnóstico, nunca un requisito para operar.
+# ==========================================================================
+def _configurar_logging_archivo_y_excepthook():
+    try:
+        log_dir = os.path.join(os.path.expanduser('~'), '.risklab')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'risklab.log')
+        handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        ))
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(handler)
+    except Exception:
+        pass
+
+    def _excepthook_global(tipo, valor, tb):
+        try:
+            logging.getLogger('risklab.uncaught').critical(
+                "Excepción no capturada en el hilo principal",
+                exc_info=(tipo, valor, tb)
+            )
+        except Exception:
+            pass
+        sys.__excepthook__(tipo, valor, tb)
+
+    sys.excepthook = _excepthook_global
+
+
+_configurar_logging_archivo_y_excepthook()
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -240,6 +294,7 @@ _CAMPOS_INTERNOS_SIMULACION = (
     '_factor_severidad_vinculos',
     '_factor_severidad_vinculos_es_unidad',
     '_factores_severidad_vector_es_unidad',
+    '_condicion_vinculo_final',
     '_cap_frecuencia_aplicado',
     '_cap_frecuencia_factor',
     '_cap_frecuencia_suma_original',
@@ -340,7 +395,13 @@ _AI_BRIEFING_ES = {
         "Curtosis": "Kurtosis (exceso). > 0 colas más pesadas que la Normal, < 0 más ligeras",
         "Coeficiente_Variacion": "Desviación estándar dividida por la media. Volatilidad relativa",
         "Periodo_de_retorno": "1 dividido la probabilidad anual: cada cuántos años se espera ese nivel",
-        "Importancia_score": "Producto ImpactoP90 × FrecuenciaModo. Combina severidad y frecuencia para ranking"
+        # R4 alto #3: la fórmula anterior (ImpactoP90 x FrecuenciaModo)
+        # colapsaba a 0 para eventos de baja frecuencia/alta severidad y
+        # fue reemplazada por ImpactoMedio en R3 crítico #4 -- este
+        # glosario embebido (pensado justamente para que un agente IA no
+        # necesite contexto externo) seguía describiendo la fórmula vieja,
+        # contradiciendo el propio campo "importancia_formula" del payload.
+        "Importancia_score": "Pérdida media anual esperada del evento (ImpactoMedio, consistente con el resumen ejecutivo). Ver el campo 'importancia_formula' de cada evento en risk_map para la fórmula exacta usada"
     },
     "preguntas_que_un_agente_puede_responder": [
         "¿Cuál es la pérdida esperada anual y su volatilidad?",
@@ -765,6 +826,12 @@ def obtener_parametros_pert(minimo, mas_probable, maximo):
         raise ValueError("El valor máximo y mínimo no pueden ser iguales para la distribución PERT.")
     if not (minimo <= mas_probable <= maximo):
         raise ValueError("Los valores deben cumplir que mínimo <= más probable <= máximo.")
+    if maximo <= 0:
+        raise ValueError(
+            "El valor máximo de severidad debe ser mayor a 0. Con un rango completamente "
+            "negativo o cero, todas las pérdidas se truncarían a $0 y el evento nunca "
+            "generaría impacto real en la simulación (quedaría como un 'riesgo fantasma')."
+        )
     alpha = 1 + 4 * ((mas_probable - minimo) / (maximo - minimo))
     beta_param = 1 + 4 * ((maximo - mas_probable) / (maximo - minimo))
     return alpha, beta_param
@@ -838,6 +905,12 @@ def obtener_parametros_uniforme(minimo, maximo):
     """Configura los parámetros para la distribución Uniforme."""
     if minimo >= maximo:
         raise ValueError("El valor mínimo debe ser menor que el máximo.")
+    if maximo <= 0:
+        raise ValueError(
+            "El valor máximo de severidad debe ser mayor a 0. Con un rango completamente "
+            "negativo o cero, todas las pérdidas se truncarían a $0 y el evento nunca "
+            "generaría impacto real en la simulación (quedaría como un 'riesgo fantasma')."
+        )
     return minimo, maximo - minimo
 
 def traducir_error(mensaje_error):
@@ -3196,6 +3269,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
             if tiene_excluye:
                 condicion_final = condicion_final & condicion_excluye
 
+            # R4 alto #8: cache de la máscara de elegibilidad de este evento
+            # (simulaciones donde su(s) vínculo(s) de dependencia SÍ se
+            # cumplieron), para que el escalamiento sev_freq "sistémico" más
+            # abajo pueda excluir del cálculo de referencia (media/desvío)
+            # las simulaciones donde el evento fue puesto en 0 por estructura
+            # (vínculo no activado), no por su propia variabilidad estocástica.
+            evento['_condicion_vinculo_final'] = condicion_final
+
             # Calcular factor de severidad combinado para simulaciones activas
             if tiene_factor_sev:
                 factor_severidad_vinculos = np.ones(num_simulaciones)
@@ -3282,6 +3363,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
         elif 'eventos_padres' in evento and evento['eventos_padres']:
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
+            evento['_condicion_vinculo_final'] = None  # R4 alto #8: idem, se fija abajo si hay padres válidos
             # Formato antiguo: usar tipo_dependencia único para todos los padres
             eventos_padres_declarados = evento.get('eventos_padres', [])
             tipo_dependencia = evento.get('tipo_dependencia', 'AND')
@@ -3316,6 +3398,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     condicion_padres = ~np.any(ocurrencias_padres, axis=0)
                 else:
                     condicion_padres = np.ones(num_simulaciones, dtype=bool)
+
+                # R4 alto #8: mismo cache que en la rama 'vinculos' nueva.
+                evento['_condicion_vinculo_final'] = condicion_padres
 
                 muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
                 indices_a_simular = np.where(condicion_padres)[0]
@@ -3438,6 +3523,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         else:
             # Evento sin dependencias, simular normalmente
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
+            evento['_condicion_vinculo_final'] = None  # R4 alto #8: idem, sin vínculos no hay máscara que excluir
             try:
                 # ====================================================================
                 # Generar muestras con factores estocásticos si aplica
@@ -3704,9 +3790,31 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # importar la frecuencia real; factor_max negativo
                         # producía severidades negativas.
                         factor_max = max(1.0, float(evento.get('sev_freq_sistemico_factor_max', 3.0)))
-                        freq_mean = final_event_frequencies.mean()
-                        freq_std = final_event_frequencies.std()
-                        
+                        # R4 alto #8: si el evento depende de vínculos, las
+                        # simulaciones donde el vínculo NO se activó quedan en
+                        # frecuencia 0 por estructura (no por variabilidad
+                        # propia del evento). Incluirlas en el cálculo de
+                        # media/desvío de referencia infla artificialmente el
+                        # z-score de las simulaciones donde el evento sí
+                        # ocurrió (la referencia queda sesgada hacia abajo por
+                        # ceros que nunca fueron "posibles" resultados del
+                        # evento en sí). Se usa solo el subconjunto elegible
+                        # (máscara de vínculo) como referencia cuando existe;
+                        # si el evento no tiene vínculos, la máscara es None y
+                        # el comportamiento es idéntico al de antes.
+                        _mascara_elegible = evento.get('_condicion_vinculo_final')
+                        if _mascara_elegible is not None:
+                            _frecuencias_referencia = final_event_frequencies[_mascara_elegible]
+                        else:
+                            _frecuencias_referencia = final_event_frequencies
+
+                        if _frecuencias_referencia.size > 0:
+                            freq_mean = _frecuencias_referencia.mean()
+                            freq_std = _frecuencias_referencia.std()
+                        else:
+                            freq_mean = 0.0
+                            freq_std = 0.0
+
                         if freq_std > 0.01:
                             z = (final_event_frequencies - freq_mean) / freq_std
                             if solo_aumento:
@@ -5092,6 +5200,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.aplicar_estilo_inputs_modernos()
 
     def nueva_simulacion(self):
+        # R4 alto #4: set_interfaz_activa (guard de re-entrancy, fix #22)
+        # solo deshabilita las pestañas y widgets de Simulación/Escenarios,
+        # pero el menú "Archivo" nunca se deshabilita -- "Nueva Simulación"
+        # podía limpiar self.eventos_riesgo/self.scenarios in-place
+        # mientras una simulación seguía corriendo en background sobre una
+        # copia ya tomada, dejando la UI y los resultados mostrados
+        # desincronizados del modelo real sin ningún aviso.
+        hilo_actual = getattr(self, 'simulation_thread', None)
+        if hilo_actual is not None and hilo_actual.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación en curso",
+                "Hay una simulación en ejecución. Espere a que finalice antes "
+                "de iniciar una nueva simulación."
+            )
+            return
         respuesta = QtWidgets.QMessageBox.question(
             self,
             "Nueva Simulación",
@@ -14992,7 +15115,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         escenario_nuevo = copy.deepcopy(scenario_original)
 
         # Modificar el nombre y descripción del nuevo escenario
-        escenario_nuevo.nombre = escenario_nuevo.nombre + " (Copia)"
+        # R4 alto #6: a diferencia de guardar_scenario (que valida nombre
+        # único desde R3 medio #25), esta ruta agregaba "(Copia)" sin
+        # chequear colisiones -- duplicar dos veces el mismo escenario (o
+        # duplicar uno que ya se llamaba "X (Copia)") producía dos
+        # escenarios con el nombre idéntico, lo que hace ambigua la
+        # restauración de "escenario actual" al cargar un JSON (empareja
+        # por nombre, primer match).
+        nombre_base = escenario_nuevo.nombre + " (Copia)"
+        nombres_existentes = {sc.nombre for sc in self.scenarios}
+        nombre_candidato = nombre_base
+        contador = 2
+        while nombre_candidato in nombres_existentes:
+            nombre_candidato = f"{nombre_base} {contador}"
+            contador += 1
+        escenario_nuevo.nombre = nombre_candidato
         if escenario_nuevo.descripcion:
             escenario_nuevo.descripcion = escenario_nuevo.descripcion + " (Duplicado)"
         else:
@@ -19079,10 +19216,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         }
 
         # ---- Configuration ----
-        try:
-            num_sim_config = int(self.num_simulaciones_var.text())
-        except Exception:
-            num_sim_config = n_sim
+        # R4 alto #2: antes se leía self.num_simulaciones_var.text() (la
+        # pestaña "Simulación") como fuente de verdad. Pero
+        # ejecutar_simulacion_escenario() sincroniza ese campo temporalmente
+        # con el valor de la pestaña "Escenarios", lanza el hilo ASÍNCRONO,
+        # y en su `finally` restaura el valor original de "Simulación"
+        # ANTES de que el hilo termine -- para cuando el usuario exporta
+        # (con self.resultados_simulacion ya poblado), el campo ya volvió al
+        # valor de "Simulación", que puede no coincidir con el realmente
+        # usado. `n_sim` (arriba, = perdidas_totales.size) es el conteo
+        # REAL de simulaciones de esta corrida, siempre correcto sin
+        # importar desde qué pestaña se ejecutó.
+        num_sim_config = n_sim
         payload["configuration"] = {
             "num_simulaciones": num_sim_config,
             "moneda": "USD",
@@ -19608,6 +19753,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la Simulación: {e}")
 
     def cargar_configuracion(self):
+        # R4 alto #4: mismo guard que nueva_simulacion() -- "Cargar
+        # Simulación" reemplaza self.eventos_riesgo/self.scenarios
+        # COMPLETOS desde otro archivo; sin este chequeo, podía hacerse
+        # mientras una simulación seguía corriendo en background sobre el
+        # modelo anterior, desincronizando la UI de los resultados que
+        # esa simulación termine mostrando.
+        hilo_actual = getattr(self, 'simulation_thread', None)
+        if hilo_actual is not None and hilo_actual.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación en curso",
+                "Hay una simulación en ejecución. Espere a que finalice antes "
+                "de cargar una nueva configuración."
+            )
+            return
         options = QtWidgets.QFileDialog.Options()
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Cargar Simulación", "",
                                                             "JSON Files (*.json);;All Files (*)", options=options)
@@ -19625,9 +19784,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 with open(filepath, 'r', encoding='utf-8') as f:
                     configuracion = json.load(f)
 
+                # R4 alto #1: validar la ESTRUCTURA raíz del archivo ANTES de
+                # asumir que es un dict con listas en 'eventos_riesgo'/
+                # 'scenarios'. Un JSON sintácticamente válido pero mal
+                # formado (la raíz es un array/string, o 'eventos_riesgo' es
+                # un string/dict/null en vez de una lista) rompía el propio
+                # mecanismo de aislamiento de errores por-evento: al iterar
+                # un string carácter por carácter, `evento_data.get(...)`
+                # dentro del handler de excepción también fallaba
+                # (AttributeError), escapando hasta el catch-all genérico de
+                # más abajo, que mostraba un traceback crudo de Python al
+                # usuario.
+                if not isinstance(configuracion, dict):
+                    raise ValueError(
+                        "El archivo no tiene el formato esperado: se esperaba un "
+                        "objeto JSON (con 'eventos_riesgo', 'scenarios', etc.), "
+                        f"pero se encontró un {type(configuracion).__name__}."
+                    )
+                if 'eventos_riesgo' in configuracion and not isinstance(configuracion.get('eventos_riesgo'), (list, type(None))):
+                    raise ValueError(
+                        "El campo 'eventos_riesgo' del archivo debe ser una lista, pero "
+                        f"se encontró un {type(configuracion['eventos_riesgo']).__name__}."
+                    )
+                if 'scenarios' in configuracion and not isinstance(configuracion.get('scenarios'), (list, type(None))):
+                    raise ValueError(
+                        "El campo 'scenarios' del archivo debe ser una lista, pero "
+                        f"se encontró un {type(configuracion['scenarios']).__name__}."
+                    )
+
                 # === INICIO DE TRANSACCIÓN: Procesar en variables temporales ===
                 # Si hay algún error durante el procesamiento, los datos originales quedan intactos
-                
+
                 eventos_riesgo_temp = []
                 scenarios_temp = []
                 num_simulaciones_temp = configuracion.get('num_simulaciones', 10000)
@@ -19649,7 +19836,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_huerfanos = []
 
                 # Cargar eventos de riesgo de la simulación principal a lista temporal
-                for evento_data in configuracion.get('eventos_riesgo', []):
+                # (`or []` porque .get(clave, default) solo aplica el default si la
+                # clave está AUSENTE, no si su valor es explícitamente null/None)
+                for evento_data in (configuracion.get('eventos_riesgo') or []):
                     # R3 alto #16: aislar errores de CUALQUIER punto del procesamiento de
                     # este evento (no solo generar_distribucion_severidad, ya cubierto por
                     # el try/except interno de abajo), para que un solo campo faltante o
@@ -19690,6 +19879,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             num_eventos = int(num_eventos)
                         if prob_exito is not None:
                             prob_exito = float(prob_exito)
+                        # R4 alto #9: escribir los valores YA CASTEADOS de vuelta
+                        # en evento_data, no solo usarlos en variables locales
+                        # para construir dist_frecuencia. Si el JSON traía estos
+                        # campos como string (ej. "tasa": "5.0"), dist_frecuencia
+                        # quedaba bien construida (con el valor casteado local),
+                        # pero evento_data['tasa'] seguía siendo un string -- y
+                        # _samplear_frecuencia_estocastica_vec (usado cuando el
+                        # evento tiene factores estocásticos activos) lee
+                        # evento['tasa']/evento['num_eventos']/evento['prob_exito']
+                        # DIRECTAMENTE del dict sin castear, para multiplicar por
+                        # el vector de factores. Esa multiplicación con un string
+                        # lanza un TypeError, capturado por el except genérico de
+                        # la simulación, que fuerza la frecuencia del evento a 0
+                        # para TODAS las simulaciones sin que sea evidente la
+                        # causa raíz (JSON con tipos de dato inconsistentes).
+                        evento_data['tasa'] = tasa
+                        evento_data['num_eventos'] = num_eventos
+                        evento_data['prob_exito'] = prob_exito
                         if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
                             vinculos = []
                             tipo = evento_data.get('tipo_dependencia', 'AND')
@@ -19772,7 +19979,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
                         eventos_riesgo_temp.append(evento_data)
                     except Exception as e:
-                        nombre_evento = evento_data.get("nombre", "N/A")
+                        # R4 alto #1: si 'eventos_riesgo' es una lista pero alguno de
+                        # sus elementos NO es un dict (ej. un string, si el archivo
+                        # está mal formado), evento_data.get(...) aquí mismo
+                        # lanzaría un AttributeError -- el propio manejador de
+                        # aislamiento de errores se rompería a sí mismo.
+                        nombre_evento = evento_data.get("nombre", "N/A") if isinstance(evento_data, dict) else "N/A"
                         error_traducido = traducir_error(e)
                         eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
                         continue
@@ -19808,7 +20020,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         evento_data['vinculos'] = vinculos_actualizados
 
                 # Cargar escenarios
-                for escenario_data in configuracion.get('scenarios', []):
+                for escenario_data in (configuracion.get('scenarios') or []):
                     # R3 alto #16: aislar errores de un escenario completo (nombre/
                     # eventos_riesgo faltante o mal tipado, o cualquier error durante
                     # el procesamiento de sus eventos) para que UN escenario roto no
@@ -19854,6 +20066,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 num_eventos = int(num_eventos)
                             if prob_exito is not None:
                                 prob_exito = float(prob_exito)
+                            # R4 alto #9: ver comentario equivalente en el loop de
+                            # eventos principales, más arriba en este mismo método.
+                            evento_data['tasa'] = tasa
+                            evento_data['num_eventos'] = num_eventos
+                            evento_data['prob_exito'] = prob_exito
                             if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
                                 vinculos = []
                                 tipo = evento_data.get('tipo_dependencia', 'AND')
@@ -20165,8 +20382,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # Refrescar layout si la ventana está maximizada (fix bug de alineación)
                 self._refrescar_ventana_maximizada()
             except Exception as e:
-                error_message = traceback.format_exc()
-                QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo cargar la Simulación: {e}\n{error_message}")
+                # R4 alto #1: antes se mostraba traceback.format_exc() completo
+                # (rutas de archivo absolutas, números de línea, nombre interno
+                # de la excepción) directamente al usuario -- jerga técnica de
+                # Python inapropiada para un mensaje de error de aplicación, y
+                # una posible exposición menor de información interna. Se usa
+                # el mismo helper de traducción ya usado para errores
+                # por-evento/por-escenario en este mismo método.
+                QtWidgets.QMessageBox.critical(
+                    self, "Error",
+                    f"No se pudo cargar la Simulación: {traducir_error(e)}\n\n"
+                    f"Verifique que el archivo tenga el formato JSON esperado por Risk Lab."
+                )
 
 # Función principal
 def main():

@@ -453,13 +453,18 @@ Posicionamiento de eventos en el plano Impacto × Frecuencia.
       "impacto_p90": 2400000,
       "frecuencia_modo": 5,
       "frecuencia_media": 4.98,
-      "importancia_score": 12000000,
-      "importancia_formula": "ImpactoP90 x FrecuenciaModo",
+      "importancia_score": 850000,
+      "importancia_formula": "ImpactoMedio (pérdida esperada anual, consistente con el resumen ejecutivo)",
       "cuadrante": "Alto Impacto / Alta Frecuencia"
     }
   ]
 }
 ```
+
+Nota: `importancia_score` es la pérdida media anual esperada del evento
+(`impacto_medio`), no un producto de impacto y frecuencia -- usar
+siempre el campo `importancia_formula` (incluido en cada evento) como
+fuente de verdad de qué fórmula se aplicó, en vez de asumirla.
 
 ### `risk_classification`
 

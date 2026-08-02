@@ -11570,28 +11570,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_actualizados = []
                 for vinculo in evento_nuevo.get('vinculos', []):
                     padre_id = vinculo['id_padre']
-                    tipo = vinculo['tipo']
-                    prob = vinculo.get('probabilidad', 100)
-                    fsev = vinculo.get('factor_severidad', 1.0)
-                    umbral = vinculo.get('umbral_severidad', 0)
-                    # Si el evento padre fue duplicado, usamos el nuevo ID
-                    if padre_id in id_original_a_nuevo:
-                        vinculos_actualizados.append({
-                            'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
-                    else:
-                        # Si no, mantenemos el ID original
-                        vinculos_actualizados.append({
-                            'id_padre': padre_id,
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
+                    # Fix bug medio #14 (QA ronda 2): partir de una copia del
+                    # vínculo original (no de un dict nuevo con solo 5 claves
+                    # fijas) para preservar cualquier clave desconocida/futura,
+                    # igual que ya se corrigió para el import JSON (bug #39
+                    # de la Ronda 1) pero nunca se aplicó a esta ruta de
+                    # duplicación de eventos.
+                    nuevo_padre_id = id_original_a_nuevo.get(padre_id, padre_id)
+                    vinculo_actualizado = dict(vinculo)
+                    vinculo_actualizado['id_padre'] = nuevo_padre_id
+                    vinculos_actualizados.append(vinculo_actualizado)
                 evento_nuevo['vinculos'] = vinculos_actualizados
 
             # Compatibilidad con formato antiguo
@@ -14386,28 +14374,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_actualizados = []
                 for vinculo in evento.get('vinculos', []):
                     padre_id = vinculo['id_padre']
-                    tipo = vinculo['tipo']
-                    prob = vinculo.get('probabilidad', 100)
-                    fsev = vinculo.get('factor_severidad', 1.0)
-                    umbral = vinculo.get('umbral_severidad', 0)
-                    # Si el evento padre fue duplicado, usamos el nuevo ID
-                    if padre_id in id_original_a_nuevo:
-                        vinculos_actualizados.append({
-                            'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
-                    else:
-                        # Si no, mantenemos el ID original
-                        vinculos_actualizados.append({
-                            'id_padre': padre_id,
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
+                    # Fix bug medio #14 (QA ronda 2): ver mismo fix en
+                    # duplicar_eventos — copiar el vínculo original en vez de
+                    # reconstruirlo con solo 5 claves fijas, para no
+                    # descartar claves desconocidas/futuras.
+                    nuevo_padre_id = id_original_a_nuevo.get(padre_id, padre_id)
+                    vinculo_actualizado = dict(vinculo)
+                    vinculo_actualizado['id_padre'] = nuevo_padre_id
+                    vinculos_actualizados.append(vinculo_actualizado)
                 evento['vinculos'] = vinculos_actualizados
 
             # Compatibilidad con formato antiguo

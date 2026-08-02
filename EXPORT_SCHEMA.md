@@ -497,10 +497,22 @@ Período de retorno (cada cuántos años se espera cada nivel).
       "periodo_retorno_años": 3.13,
       "etiqueta": "Cada 3.1 años"
     },
+    {
+      "nivel": "CRITICO",
+      "umbral": 110000000,
+      "prob_anual_pct": 0.0,
+      "periodo_retorno_años": null,
+      "etiqueta": ">100 años"
+    },
     ...
   ]
 }
 ```
+
+`periodo_retorno_años` es siempre `number` o `null` (nunca un string) --
+es `null` cuando ninguna simulación superó el umbral (probabilidad de
+excedencia anual = 0, período de retorno no acotado por los datos
+observados); en ese caso `etiqueta` indica `">100 años"`.
 
 ### `marginal_contribution_per_percentile`
 

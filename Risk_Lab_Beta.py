@@ -2161,12 +2161,16 @@ def _crear_seccion_escalamiento_ui(parent_layout, evento_data):
         modo_idx_val = modo_combo.currentIndex()
         try:
             if modo_idx_val == 0:  # Lineal
-                p = float(paso_var.text())
-                fm = float(factor_max_lineal_var.text())
+                # R3 medio #19: aplicar los mismos pisos que el motor
+                # (generar_lda_con_secuencialidad), para que la vista previa
+                # muestre lo que realmente va a calcular la simulación, no una
+                # curva decreciente/negativa que en la práctica nunca ocurre.
+                p = max(0.0, float(paso_var.text()))
+                fm = max(1.0, float(factor_max_lineal_var.text()))
                 mults = [min(1 + p * (n - 1), fm) for n in range(1, 8)]
             elif modo_idx_val == 1:  # Exponencial
-                b = float(base_var.text())
-                fm = float(factor_max_exp_var.text())
+                b = max(1.0, float(base_var.text()))
+                fm = max(1.0, float(factor_max_exp_var.text()))
                 mults = [min(b ** (n - 1), fm) for n in range(1, 8)]
             else:  # Tabla
                 mults = []
@@ -2596,6 +2600,27 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         
         # Procesando evento para aplicar factores de ajuste si existen
         
+        # R3 medio #21: el motor no era idempotente sobre el MISMO dict de
+        # evento reutilizado entre llamadas. Los campos '_seguros_aplicables'/
+        # '_factores_vector'/etc. solo se (re)calculaban dentro del bloque de
+        # abajo, que no se ejecuta si el evento ya no tiene factores activos
+        # (lista vacía o todos con 'activo': False). Si una llamada anterior
+        # SÍ tenía factores activos sobre este mismo dict, esos campos
+        # quedaban "fantasma" y se seguían aplicando en la llamada siguiente
+        # aunque ya no correspondiera. Se limpian explícitamente antes de
+        # decidir si hay factores activos, para que el resultado de esta
+        # llamada nunca dependa de una llamada previa sobre el mismo dict.
+        # (Mitigado hoy en la práctica porque ejecutar_simulacion siempre
+        # pasa copias frescas de los eventos, pero es un invariante del motor
+        # que cualquier otro caller -- tests, un futuro modo batch -- podría
+        # violar en silencio.)
+        if not any(f.get('activo', True) for f in evento.get('factores_ajuste', [])):
+            for _campo_stale in ('_factores_vector', '_factores_severidad_vector',
+                                  '_usa_estocastico', '_seguros_aplicables',
+                                  '_factores_severidad_vector_es_unidad',
+                                  '_factor_severidad_estatico'):
+                evento.pop(_campo_stale, None)
+
         # ====================================================================
         # APLICAR AJUSTES DE PROBABILIDAD SI EXISTEN FACTORES ACTIVOS
         # ====================================================================
@@ -3591,7 +3616,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         _dbg(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Sistémico (alpha={alpha}) aplicado "
                               f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
                               f"factor rango: {sev_freq_factor[_indices_pos].min():.3f}-{sev_freq_factor[_indices_pos].max():.3f})")
-                
+
+                    # R3 medio #22: sev_limite_superior se aplicaba (rejection
+                    # sampling) ANTES de este escalamiento por reincidencia/
+                    # sistémico, que multiplica esas mismas pérdidas hasta por
+                    # factor_max. El resultado final podía terminar bien por
+                    # encima del cap declarado, contradiciendo la promesa de
+                    # que ninguna severidad individual supera
+                    # sev_limite_superior. Se re-aplica el cap (clip directo,
+                    # no rejection sampling) sobre el resultado ya escalado.
+                    if sev_cap is not None and sev_cap > 0:
+                        np.minimum(total_perdidas_del_evento_concatenadas, sev_cap,
+                                   out=total_perdidas_del_evento_concatenadas)
+
                 # =====================================================
                 # APLICAR FACTOR DE SEVERIDAD DE VÍNCULOS (cascada)
                 # ANTES de aplicar controles y seguros
@@ -10320,7 +10357,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             estatico_layout.addRow(afecta_frecuencia_check)
             
             impacto_var = NoScrollSpinBox()
-            impacto_var.setRange(-200, 99)  # Positivo reduce (máx 99%), negativo aumenta
+            # R3 medio #29: el rango permitía hasta -200%, pero el motor
+            # aplica un piso de -99% (factor mínimo 0.01) sin importar cuán
+            # más negativo sea el valor -- un control configurado en -150%
+            # tenía EXACTAMENTE el mismo efecto que uno en -99%, una "zona
+            # muerta" no comunicada al usuario. Se acota el rango a lo que
+            # realmente tiene efecto.
+            impacto_var.setRange(-99, 99)  # Positivo reduce (máx 99%), negativo aumenta
             impacto_var.setValue(30)  # Por defecto 30% reducción
             impacto_var.setSuffix("%")
             impacto_var.setToolTip(
@@ -10368,7 +10411,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             porcentual_layout.setContentsMargins(0, 5, 0, 0)
             
             impacto_severidad_var = NoScrollSpinBox()
-            impacto_severidad_var.setRange(-200, 99)
+            impacto_severidad_var.setRange(-99, 99)
             impacto_severidad_var.setValue(25)
             impacto_severidad_var.setSuffix("%")
             impacto_severidad_var.setToolTip("Positivo reduce el impacto económico (0-99%), negativo lo aumenta")
@@ -10417,6 +10460,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
             seguro_limite_ocurrencia_var.setPrefix("$ ")
             seguro_limite_ocurrencia_var.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
             seguro_layout.addRow("Límite por siniestro:", seguro_limite_ocurrencia_var)
+
+            # R3 medio #20: el motor SOLO lee 'seguro_limite_ocurrencia' para
+            # pólizas 'por_ocurrencia' (lo ignora por completo para
+            # 'agregado'), pero el spinbox quedaba siempre habilitado sin
+            # importar el tipo de deducible seleccionado, sugiriendo
+            # falsamente que el límite tendría efecto también en modo
+            # agregado.
+            def _actualizar_habilitado_limite_ocurrencia():
+                habilitado = tipo_ded_ocurrencia.isChecked()
+                seguro_limite_ocurrencia_var.setEnabled(habilitado)
+                label_lim_ocurr = seguro_layout.labelForField(seguro_limite_ocurrencia_var)
+                if label_lim_ocurr is not None:
+                    label_lim_ocurr.setEnabled(habilitado)
+                seguro_limite_ocurrencia_var.setToolTip(
+                    "Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)"
+                    if habilitado else
+                    "No aplica: el tipo de deducible es 'Agregado anual', el motor ignora este límite"
+                )
+            tipo_ded_ocurrencia.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia())
+            _actualizar_habilitado_limite_ocurrencia()
             
             seguro_limite_var = NoScrollSpinBox()
             seguro_limite_var.setRange(0, 999999999)
@@ -10822,7 +10885,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             estatico_layout.addRow(afecta_frecuencia_check)
             
             impacto_var = NoScrollSpinBox()
-            impacto_var.setRange(-200, 99)  # Positivo reduce (máx 99%), negativo aumenta
+            impacto_var.setRange(-99, 99)  # Positivo reduce (máx 99%), negativo aumenta
             # Invertir signo al cargar: internamente negativo = reducción, UI positivo = reducción
             impacto_var.setValue(-factor_actual.get('impacto_porcentual', -30))  # Pre-cargar valor invertido
             impacto_var.setSuffix("%")
@@ -10879,7 +10942,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             porcentual_layout_edit.setContentsMargins(0, 5, 0, 0)
             
             impacto_severidad_var = NoScrollSpinBox()
-            impacto_severidad_var.setRange(-200, 99)
+            impacto_severidad_var.setRange(-99, 99)
             impacto_severidad_var.setValue(-factor_actual.get('impacto_severidad_pct', -25))
             impacto_severidad_var.setSuffix("%")
             impacto_severidad_var.setToolTip("Positivo reduce el impacto económico (0-99%), negativo lo aumenta")
@@ -10933,6 +10996,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
             seguro_limite_ocurrencia_var_edit.setPrefix("$ ")
             seguro_limite_ocurrencia_var_edit.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
             seguro_layout_edit.addRow("Límite por siniestro:", seguro_limite_ocurrencia_var_edit)
+
+            # R3 medio #20: ver mismo fix en el diálogo de "agregar" factor.
+            def _actualizar_habilitado_limite_ocurrencia_edit():
+                habilitado = tipo_ded_ocurrencia_edit.isChecked()
+                seguro_limite_ocurrencia_var_edit.setEnabled(habilitado)
+                label_lim_ocurr_edit = seguro_layout_edit.labelForField(seguro_limite_ocurrencia_var_edit)
+                if label_lim_ocurr_edit is not None:
+                    label_lim_ocurr_edit.setEnabled(habilitado)
+            tipo_ded_ocurrencia_edit.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_edit())
+            _actualizar_habilitado_limite_ocurrencia_edit()
             
             seguro_limite_var_edit = NoScrollSpinBox()
             seguro_limite_var_edit.setRange(0, 999999999)
@@ -13583,7 +13656,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 afecta_freq_check.setChecked(True)
                 estatico_form.addRow(afecta_freq_check)
                 impacto_freq_spin = NoScrollSpinBox()
-                impacto_freq_spin.setRange(-200, 99)
+                impacto_freq_spin.setRange(-99, 99)
                 impacto_freq_spin.setValue(30)
                 impacto_freq_spin.setSuffix("%")
                 estatico_form.addRow("   Reducción frecuencia:", impacto_freq_spin)
@@ -13618,7 +13691,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 porcentual_layout_esc = QtWidgets.QFormLayout(porcentual_frame_esc)
                 porcentual_layout_esc.setContentsMargins(0, 5, 0, 0)
                 impacto_sev_spin = NoScrollSpinBox()
-                impacto_sev_spin.setRange(-200, 99)
+                impacto_sev_spin.setRange(-99, 99)
                 impacto_sev_spin.setValue(25)
                 impacto_sev_spin.setSuffix("%")
                 porcentual_layout_esc.addRow("Reducción (%):", impacto_sev_spin)
@@ -13663,6 +13736,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 seguro_lim_ocurr_spin_esc.setPrefix("$ ")
                 seguro_lim_ocurr_spin_esc.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
                 seguro_layout_esc.addRow("Límite por siniestro:", seguro_lim_ocurr_spin_esc)
+
+                # R3 medio #20: ver mismo fix en el diálogo principal de eventos.
+                def _actualizar_habilitado_limite_ocurrencia_esc():
+                    habilitado = tipo_ded_ocurrencia_esc.isChecked()
+                    seguro_lim_ocurr_spin_esc.setEnabled(habilitado)
+                    label_lim_ocurr_esc = seguro_layout_esc.labelForField(seguro_lim_ocurr_spin_esc)
+                    if label_lim_ocurr_esc is not None:
+                        label_lim_ocurr_esc.setEnabled(habilitado)
+                tipo_ded_ocurrencia_esc.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_esc())
+                _actualizar_habilitado_limite_ocurrencia_esc()
                 
                 seguro_lim_spin_esc = NoScrollSpinBox()
                 seguro_lim_spin_esc.setRange(0, 999999999)
@@ -13870,7 +13953,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 afecta_freq_check.setChecked(afecta_freq_default)
                 estatico_form.addRow(afecta_freq_check)
                 impacto_freq_spin = NoScrollSpinBox()
-                impacto_freq_spin.setRange(-200, 99)
+                impacto_freq_spin.setRange(-99, 99)
                 impacto_freq_spin.setValue(-factor_actual.get('impacto_porcentual', -30))
                 impacto_freq_spin.setSuffix("%")
                 impacto_freq_spin.setEnabled(afecta_freq_default)
@@ -13913,7 +13996,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 porcentual_layout_edit_esc = QtWidgets.QFormLayout(porcentual_frame_edit_esc)
                 porcentual_layout_edit_esc.setContentsMargins(0, 5, 0, 0)
                 impacto_sev_spin = NoScrollSpinBox()
-                impacto_sev_spin.setRange(-200, 99)
+                impacto_sev_spin.setRange(-99, 99)
                 impacto_sev_spin.setValue(-factor_actual.get('impacto_severidad_pct', -25))
                 impacto_sev_spin.setSuffix("%")
                 porcentual_layout_edit_esc.addRow("Reducción (%):", impacto_sev_spin)
@@ -13963,6 +14046,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 seguro_lim_ocurr_spin_edit_esc.setPrefix("$ ")
                 seguro_lim_ocurr_spin_edit_esc.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
                 seguro_layout_edit_esc.addRow("Límite por siniestro:", seguro_lim_ocurr_spin_edit_esc)
+
+                # R3 medio #20: ver mismo fix en el diálogo principal de eventos.
+                def _actualizar_habilitado_limite_ocurrencia_edit_esc():
+                    habilitado = tipo_ded_ocurrencia_edit_esc.isChecked()
+                    seguro_lim_ocurr_spin_edit_esc.setEnabled(habilitado)
+                    label_lim_ocurr_edit_esc = seguro_layout_edit_esc.labelForField(seguro_lim_ocurr_spin_edit_esc)
+                    if label_lim_ocurr_edit_esc is not None:
+                        label_lim_ocurr_edit_esc.setEnabled(habilitado)
+                tipo_ded_ocurrencia_edit_esc.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_edit_esc())
+                _actualizar_habilitado_limite_ocurrencia_edit_esc()
                 
                 seguro_lim_spin_edit_esc = NoScrollSpinBox()
                 seguro_lim_spin_edit_esc.setRange(0, 999999999)
@@ -14503,6 +14596,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if not nombre_scenario:
                 raise ValueError("El nombre del escenario no puede estar vacío.")
 
+            # R3 medio #25: sin esta validación, dos escenarios podían tener
+            # el mismo nombre. La restauración del "escenario actual" tras
+            # cargar un JSON empareja por nombre (primer match), por lo que
+            # un archivo con nombres duplicados podía seleccionar el
+            # escenario equivocado de forma silenciosa.
+            for i, sc in enumerate(self.scenarios):
+                if (new or i != row) and sc.nombre == nombre_scenario:
+                    raise ValueError(
+                        f"Ya existe un escenario llamado '{nombre_scenario}'. "
+                        f"Elija un nombre único."
+                    )
+
             # Crear instancia del escenario
             old = self.scenarios[row] if (not new and 0 <= row < len(self.scenarios)) else None
             scenario = Scenario(nombre_scenario, descripcion_scenario)
@@ -14536,6 +14641,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         self.selected_scenario_label.setText(self.current_scenario.nombre)
                     except Exception:
                         pass
+                # R3 medio #26: la rama de edición nunca llamaba a
+                # actualizar_vista_escenarios(), a diferencia de la rama
+                # "nuevo" (línea de arriba). Los setItem() de arriba crean
+                # QTableWidgetItem NUEVOS sin el resaltado (fondo verde/✓)
+                # que esa función aplica, por lo que la fila del escenario
+                # editado quedaba "des-resaltada" aunque siguiera siendo el
+                # escenario actual.
+                self.actualizar_vista_escenarios()
 
             dialog.accept()
 
@@ -14885,11 +14998,22 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if perdidas_cola.size == 0:
             perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
+        # R3 medio #28: cuando la distribución es degenerada (masa puntual en
+        # el máximo que cubre >=20% de las simulaciones), el fallback ">="
+        # de arriba puede terminar seleccionando el 100% de los datos, pero
+        # el título seguía diciendo "Percentil 80 al 100" -- dando la falsa
+        # impresión de una cola extrema diferenciada cuando en realidad no
+        # hay ninguna diferenciación de cola.
+        if perdidas_cola.size >= perdidas_totales.size:
+            titulo_cola = 'Cola de Pérdidas (distribución degenerada: sin diferenciación de cola)'
+        else:
+            titulo_cola = 'Cola de Pérdidas (Percentil 80 al 100)'
+
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure()
         ax10 = fig10.add_subplot(111)
         sns.histplot(perdidas_cola, bins=30, kde=True, color='#1f77b4', edgecolor='black', ax=ax10)
-        ax10.set_title('Cola de Pérdidas (Percentil 80 al 100)')
+        ax10.set_title(titulo_cola)
         ax10.set_xlabel('Pérdida Total')
         ax10.set_ylabel('Frecuencia')
         ax10.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
@@ -16409,6 +16533,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if perdidas_cola.size == 0:
             perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
+        # R3 medio #28: ver mismo fix en generar_figuras (título dinámico
+        # para distribuciones degeneradas donde el fallback ">=" selecciona
+        # el 100% de los datos).
+        if perdidas_cola.size >= perdidas_totales.size:
+            titulo_cola = 'Cola de Pérdidas (distribución degenerada: sin diferenciación de cola)'
+        else:
+            titulo_cola = 'Cola de Pérdidas (Percentil 80-100)'
+
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure(figsize=(8, 5))
         canvas10 = InteractiveFigureCanvas(fig10)
@@ -16451,7 +16583,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
         
         # Mejorar títulos y etiquetas
-        ax10.set_title('Cola de Pérdidas (Percentil 80-100)')
+        ax10.set_title(titulo_cola)
         ax10.set_xlabel('Pérdida Total')
         ax10.set_ylabel('Frecuencia')
         
@@ -17880,7 +18012,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "nivel": nombre,
                     "umbral": umbral,
                     "prob_anual_pct": prob_anual_pct,
-                    "periodo_retorno_años": periodo_años_val if periodo != float("inf") else "infinito",
+                    # R3 medio #30: siempre numérico (float) o None -- nunca el
+                    # string "infinito" -- para no alternar de tipo según el
+                    # valor. Cuando es None, "etiqueta" ya indica ">100 años".
+                    "periodo_retorno_años": periodo_años_val,
                     "etiqueta": etiqueta
                 })
             return {
@@ -18105,9 +18240,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "tipo": "Scatter + regresión",
                     "correlacion": corr,
                     "interpretacion": (
+                        # R3 medio #23: solo se reconocía corr > 0.5 (positiva
+                        # fuerte); una correlación NEGATIVA fuerte (p.ej. -0.9)
+                        # se etiquetaba como "moderada o débil", cuando en
+                        # realidad es una relación muy fuerte (inversa).
                         "Correlación positiva fuerte → años con más eventos tienen mayor "
                         "pérdida agregada (típico operacional)."
                         if corr is not None and corr > 0.5 else
+                        "Correlación negativa fuerte → años con más eventos tienen MENOR "
+                        "pérdida agregada (relación inversa, atípica; revisar el modelo)."
+                        if corr is not None and corr < -0.5 else
                         "Correlación moderada o débil entre frecuencia y pérdida."
                     )
                 },
@@ -19255,11 +19397,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         id_mapeo[antiguo_id] = nuevo_id
                         evento_data['id'] = nuevo_id
 
-                        # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal
-                        eventos_padres_actualizados = []
-                        for padre_id in evento_data.get('eventos_padres', []):
-                            eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
-                        evento_data['eventos_padres'] = eventos_padres_actualizados
+                        # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal.
+                        # R3 medio #27: antes se asignaba esta clave SIEMPRE
+                        # (incluso con lista vacía) aunque el evento original
+                        # (formato moderno, solo con 'vinculos') nunca la
+                        # hubiera tenido, rompiendo la fidelidad round-trip
+                        # (el dict cargado no era idéntico al guardado).
+                        if 'eventos_padres' in evento_data:
+                            evento_data['eventos_padres'] = [
+                                id_mapeo.get(padre_id, padre_id)
+                                for padre_id in evento_data['eventos_padres']
+                            ]
 
                         # Asegurar que tenga el campo 'activo' (backward compatibility con archivos antiguos)
                         if 'activo' not in evento_data:
@@ -19402,15 +19550,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             id_mapeo_scenario[antiguo_id] = nuevo_id
                             evento_data['id'] = nuevo_id
 
-                            # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario
-                            eventos_padres_actualizados = []
-                            for padre_id in evento_data.get('eventos_padres', []):
-                                if padre_id in id_mapeo_scenario:
-                                    eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
-                                else:
-                                    # Si el evento padre está en la simulación principal
-                                    eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
-                            evento_data['eventos_padres'] = eventos_padres_actualizados
+                            # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario.
+                            # R3 medio #27: ver mismo fix en la lista principal
+                            # (no agregar la clave si el evento original no la tenía).
+                            if 'eventos_padres' in evento_data:
+                                _eventos_padres_actualizados = []
+                                for padre_id in evento_data['eventos_padres']:
+                                    if padre_id in id_mapeo_scenario:
+                                        _eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
+                                    else:
+                                        # Si el evento padre está en la simulación principal
+                                        _eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
+                                evento_data['eventos_padres'] = _eventos_padres_actualizados
 
                             # Asegurar que tenga el campo 'activo' (backward compatibility)
                             if 'activo' not in evento_data:

@@ -29,7 +29,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 import Risk_Lab_Beta as RLB
 
@@ -45,6 +45,16 @@ def check(condition, msg):
     else:
         FAIL += 1
         print(f"  ❌ FALLO: {msg}")
+
+
+def _seleccionar_fila(tabla, row):
+    # NOTA: QTableWidget.selectRow() no es confiable en modo headless/offscreen
+    # tras un insertRow() previo cuando la tabla está en MultiSelection (queda
+    # sin selección). Se usa selectionModel().select() explícitamente en su lugar.
+    sm = tabla.selectionModel()
+    sm.clearSelection()
+    sm.select(tabla.model().index(row, 0),
+              QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
 
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
@@ -72,7 +82,7 @@ win.scenarios = [scenario_base]
 agregar_fila_tabla(win, scenario_base)
 win.actualizar_vista_escenarios()
 
-win.scenarios_table.selectRow(0)
+_seleccionar_fila(win.scenarios_table, 0)
 win.duplicar_scenario()
 
 print(f"  Escenarios tras 1ra duplicación: {[sc.nombre for sc in win.scenarios]}")
@@ -81,7 +91,7 @@ check(win.scenarios[1].nombre == "Base (Copia)",
       f"Primera duplicación produce 'Base (Copia)' (obtenido: {win.scenarios[1].nombre!r})")
 
 # Duplicar el escenario ORIGINAL "Base" de nuevo -- ahora ya existe "Base (Copia)".
-win.scenarios_table.selectRow(0)
+_seleccionar_fila(win.scenarios_table, 0)
 win.duplicar_scenario()
 
 print(f"  Escenarios tras 2da duplicación: {[sc.nombre for sc in win.scenarios]}")

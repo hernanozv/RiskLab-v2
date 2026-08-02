@@ -11912,6 +11912,29 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # otra sigue corriendo.
         self.central_widget.setTabEnabled(self.central_widget.indexOf(self.scenarios_tab), estado)
 
+    def closeEvent(self, event):
+        """Fix bug #30: SimulacionThread.stop() existía pero nunca se llamaba
+        desde ningún lado. Sin este closeEvent, cerrar la aplicación mientras
+        una simulación está corriendo en background dejaba el QThread huérfano
+        (pudiendo emitir señales hacia una ventana ya destruida y crashear, o
+        simplemente quedar corriendo sin que el usuario lo sepa). Se pregunta
+        al usuario y, si confirma, se detiene el hilo cooperativamente
+        (is_running=False) y se espera a que termine antes de cerrar.
+        """
+        hilo = getattr(self, 'simulation_thread', None)
+        if hilo is not None and hilo.isRunning():
+            respuesta = QtWidgets.QMessageBox.question(
+                self, "Simulación en curso",
+                "Hay una simulación en ejecución. ¿Desea cancelarla y salir de la aplicación?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if respuesta != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+            hilo.stop()
+            hilo.wait(10_000)
+        event.accept()
+
     def generar_resultados(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento,
                            eventos_riesgo, generar_reporte=False, pdf_filename='reporte_simulacion.pdf'):
         """Calcula estadísticas, muestra resultados y genera gráficos."""
@@ -18527,8 +18550,27 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 except Exception:
                     # Si falla la serialización de resultados, continuar sin bloquear el guardado de configuración
                     pass
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(configuracion, f, ensure_ascii=False, indent=4)
+                # Fix bug #29: escritura atómica. Antes se abría filepath
+                # directamente en modo 'w', que trunca el archivo existente al
+                # abrirlo; si json.dump fallaba a mitad de camino (p.ej. disco
+                # lleno), la configuración previa válida ya estaba destruida y
+                # se perdía. Ahora se escribe a un archivo temporal en el mismo
+                # directorio y solo se reemplaza el archivo destino con
+                # os.replace (atómico) una vez que la escritura completa tuvo
+                # éxito.
+                import tempfile
+                directorio_destino = os.path.dirname(filepath) or '.'
+                fd, ruta_temporal = tempfile.mkstemp(
+                    dir=directorio_destino, prefix='.risklab_tmp_', suffix='.json'
+                )
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        json.dump(configuracion, f, ensure_ascii=False, indent=4)
+                    os.replace(ruta_temporal, filepath)
+                except Exception:
+                    if os.path.exists(ruta_temporal):
+                        os.remove(ruta_temporal)
+                    raise
                 self.statusBar().showMessage("La Simulación ha sido guardada exitosamente", 5000)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la Simulación: {e}")

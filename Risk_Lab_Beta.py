@@ -13954,7 +13954,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             raise ValueError("El número de eventos (n) no puede estar vacío.")
                         if not p_var.text().strip():
                             raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
-                        n = int(n_var.text())
+                        # Fix bug bajo #22 (QA ronda 2): int(float(...)) en vez de
+                        # int(...) crudo, igual que el diálogo principal
+                        # (guardar_evento). El campo se precarga con
+                        # str(evento.get('num_eventos')): si ese valor fue
+                        # guardado como float (p.ej. 5.0), el texto queda "5.0"
+                        # y int("5.0") lanza ValueError, mientras que
+                        # int(float("5.0")) funciona correctamente.
+                        n = int(float(n_var.text()))
                         p = float(p_var.text())
                         if n <= 0:
                             raise ValueError("El número de eventos (n) debe ser mayor que cero.")

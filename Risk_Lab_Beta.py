@@ -15556,195 +15556,202 @@ class RiskLabApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # Gráfico 7: Gráfico de Tornado - Contribución de Eventos de Riesgo
-            contribuciones = []
-            nombres_eventos = []
-            for idx, perdidas_evento in enumerate(perdidas_por_evento):
-                contribucion = np.mean(perdidas_evento)
-                contribuciones.append(contribucion)
-                nombre_evento = eventos_riesgo[idx]['nombre']
-                nombres_eventos.append(nombre_evento)
+        # Gráfico 7: Gráfico de Tornado - Contribución de Eventos de Riesgo
+        # Fix bug #40 (QA ronda 2): este bloque estaba indentado un nivel de más,
+        # anidado dentro del "if datos_plot:" del Gráfico 6. datos_plot solo se
+        # pone en True si ALGÚN evento tiene std>0 (severidad no determinista);
+        # con eventos de severidad fija (multa regulatoria, monto constante), la
+        # pestaña "Contribución" desaparecía por completo aunque las
+        # contribuciones fueran > 0. Ahora es un bloque independiente, igual que
+        # en la versión legacy (generar_figuras).
+        contribuciones = []
+        nombres_eventos = []
+        for idx, perdidas_evento in enumerate(perdidas_por_evento):
+            contribucion = np.mean(perdidas_evento)
+            contribuciones.append(contribucion)
+            nombre_evento = eventos_riesgo[idx]['nombre']
+            nombres_eventos.append(nombre_evento)
 
-            if any(c > 0 for c in contribuciones):
-                fig7 = Figure(figsize=(9, 6))  # Tamño optimizado para mejor visualización
-                canvas7 = InteractiveFigureCanvas(fig7)
-                ax7 = fig7.add_subplot(111)
-                tornado_df = pd.DataFrame({
-                    'Evento de Riesgo': nombres_eventos,
-                    'Contribución Promedio': contribuciones
-                })
-                tornado_df = tornado_df[tornado_df['Contribución Promedio'] > 0]
-                tornado_df['Porcentaje'] = (tornado_df['Contribución Promedio'] / tornado_df['Contribución Promedio'].sum()) * 100
+        if any(c > 0 for c in contribuciones):
+            fig7 = Figure(figsize=(9, 6))  # Tamño optimizado para mejor visualización
+            canvas7 = InteractiveFigureCanvas(fig7)
+            ax7 = fig7.add_subplot(111)
+            tornado_df = pd.DataFrame({
+                'Evento de Riesgo': nombres_eventos,
+                'Contribución Promedio': contribuciones
+            })
+            tornado_df = tornado_df[tornado_df['Contribución Promedio'] > 0]
+            tornado_df['Porcentaje'] = (tornado_df['Contribución Promedio'] / tornado_df['Contribución Promedio'].sum()) * 100
+            
+            # Ordenar para el gráfico de tornado (ascendente para barras horizontales)
+            tornado_df.sort_values('Contribución Promedio', inplace=True, ascending=True)
+            
+            # Limitar a los 10 eventos más significativos si hay demasiados
+            if len(tornado_df) > 10:
+                top_eventos = tornado_df.tail(10).copy()
+                otros_eventos = tornado_df.head(len(tornado_df)-10)
+                suma_otros = {
+                    'Evento de Riesgo': f'Otros eventos ({len(otros_eventos)})',
+                    'Contribución Promedio': otros_eventos['Contribución Promedio'].sum(),
+                    'Porcentaje': otros_eventos['Porcentaje'].sum()
+                }
+                tornado_df = pd.concat([pd.DataFrame([suma_otros]), top_eventos])
+                tornado_df.reset_index(drop=True, inplace=True)
+            
+            # Crear degradado de colores desde amarillo (MercadoLibre) hasta azul
+            num_eventos = len(tornado_df)
+            colores_eventos = []
+            
+            for i in range(num_eventos):
+                if i == num_eventos - 1:  # El evento más importante
+                    colores_eventos.append(MELI_AMARILLO)  # Amarillo MercadoLibre para evento principal
+                elif i == num_eventos - 2:  # Segundo evento más importante
+                    colores_eventos.append(MELI_AZUL_CORP)  # Azul corporativo
+                elif i == 0 and 'Otros eventos' in tornado_df.iloc[0]['Evento de Riesgo']:
+                    colores_eventos.append('#CCCCCC')  # Gris para los eventos agrupados
+                else:
+                    # Mezcla entre azul y amarillo MELI con una proporción adecuada
+                    ratio = i / (num_eventos - 1)
+                    colores_eventos.append(f'#{blend_colors(MELI_AZUL, MELI_AMARILLO, ratio)}')
+            
+            # Crear las barras horizontales con colores personalizados MercadoLibre
+            bars = ax7.barh(tornado_df['Evento de Riesgo'], 
+                          tornado_df['Contribución Promedio'], 
+                          color=colores_eventos, 
+                          edgecolor='white', 
+                          alpha=0.85,
+                          height=0.65)  # Altura para mejor visualización
+            
+            # Añadir etiquetas con valor y porcentaje
+            for i, (bar, valor, porcentaje, nombre) in enumerate(zip(bars, 
+                                                    tornado_df['Contribución Promedio'],
+                                                    tornado_df['Porcentaje'],
+                                                    tornado_df['Evento de Riesgo'])):
+                width = bar.get_width()
+                label_x_pos = width * 1.01
                 
-                # Ordenar para el gráfico de tornado (ascendente para barras horizontales)
-                tornado_df.sort_values('Contribución Promedio', inplace=True, ascending=True)
+                # Optimización de etiquetas para evitar sobrecargar el gráfico
+                if porcentaje >= 1.0:  # Solo mostrar porcentaje si es significativo
+                    label_text = f"{currency_format(valor)} ({porcentaje:.1f}%)"
+                else:
+                    label_text = f"{currency_format(valor)}"
                 
-                # Limitar a los 10 eventos más significativos si hay demasiados
-                if len(tornado_df) > 10:
-                    top_eventos = tornado_df.tail(10).copy()
-                    otros_eventos = tornado_df.head(len(tornado_df)-10)
-                    suma_otros = {
-                        'Evento de Riesgo': f'Otros eventos ({len(otros_eventos)})',
-                        'Contribución Promedio': otros_eventos['Contribución Promedio'].sum(),
-                        'Porcentaje': otros_eventos['Porcentaje'].sum()
-                    }
-                    tornado_df = pd.concat([pd.DataFrame([suma_otros]), top_eventos])
-                    tornado_df.reset_index(drop=True, inplace=True)
+                # Etiqueta con fondo blanco para mejor legibilidad
+                ax7.text(label_x_pos, 
+                       bar.get_y() + bar.get_height()/2, 
+                       label_text, 
+                       va='center',
+                       fontsize=8,
+                       fontweight='bold' if i >= num_eventos - 3 else 'normal', 
+                       bbox=dict(facecolor='white', alpha=0.9, edgecolor=None))
+            
+            # Añadir línea vertical para la media con estilo MELI
+            mean_contrib = tornado_df['Contribución Promedio'].mean()
+            ax7.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
+                      label=f'Media: {currency_format(mean_contrib)}')
+            
+            # Resumen de contribuciones para referencia rápida
+            total_contrib = tornado_df['Contribución Promedio'].sum()
+            top3_contrib = tornado_df.nlargest(3, 'Contribución Promedio')['Contribución Promedio'].sum()
+            top3_pct = (top3_contrib / total_contrib) * 100
+            
+            # Añadir texto resumen en esquina superior izquierda
+            resumen_text = f"Total: {currency_format(total_contrib)}\nTop 3: {top3_pct:.0f}%"
+            ax7.text(0.02, 0.97, resumen_text, transform=ax7.transAxes, 
+                    fontsize=8, va='top', ha='left',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
+            
+            # Título y etiquetas mejoradas
+            ax7.set_title('Contribución por Evento de Riesgo')
+            ax7.set_xlabel('Contribución a la Pérdida Media ($)')
+            ax7.set_ylabel('Evento de Riesgo')
+            
+            # Formatear el eje X para moneda
+            ax7.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
+            
+            # Aplicar estilo MercadoLibre global
+            aplicar_estilo_meli(ax7, tipo='barh')
+            
+            # Añadir grid horizontal sutil
+            ax7.grid(axis='x', linestyle='--', alpha=0.3)
+            
+            # Añadir leyenda con estilo depurado
+            ax7.legend(loc='lower right', fontsize=8, framealpha=0.9)
+            
+            # Asegurar que haya suficiente espacio para las etiquetas
+            fig7.tight_layout()
+            
+            # Configurar tooltips para el gráfico de tornado
+            # Para cada barra del tornado, crear un tooltip con información detallada
+            for i, (bar, evento, contribucion, porcentaje) in enumerate(zip(bars, 
+                                                         tornado_df['Evento de Riesgo'],
+                                                         tornado_df['Contribución Promedio'],
+                                                         tornado_df['Porcentaje'])):
+                y_pos = bar.get_y() + bar.get_height() / 2
+                tooltip_label = f"{evento}\nContribución: {currency_format(contribucion)}\nPorcentaje: {porcentaje:.2f}%"
                 
-                # Crear degradado de colores desde amarillo (MercadoLibre) hasta azul
-                num_eventos = len(tornado_df)
-                colores_eventos = []
+                # Determinar el color del tooltip según la posición/importancia en el gráfico
+                if i == num_eventos - 1:  # El evento más importante
+                    color = MELI_AMARILLO
+                elif i == num_eventos - 2:  # Segundo evento más importante
+                    color = MELI_AZUL_CORP
+                elif i == 0 and 'Otros eventos' in evento:
+                    color = '#CCCCCC'
+                else:
+                    color = None  # Usar el color por defecto
                 
-                for i in range(num_eventos):
-                    if i == num_eventos - 1:  # El evento más importante
-                        colores_eventos.append(MELI_AMARILLO)  # Amarillo MercadoLibre para evento principal
-                    elif i == num_eventos - 2:  # Segundo evento más importante
-                        colores_eventos.append(MELI_AZUL_CORP)  # Azul corporativo
-                    elif i == 0 and 'Otros eventos' in tornado_df.iloc[0]['Evento de Riesgo']:
-                        colores_eventos.append('#CCCCCC')  # Gris para los eventos agrupados
-                    else:
-                        # Mezcla entre azul y amarillo MELI con una proporción adecuada
-                        ratio = i / (num_eventos - 1)
-                        colores_eventos.append(f'#{blend_colors(MELI_AZUL, MELI_AMARILLO, ratio)}')
-                
-                # Crear las barras horizontales con colores personalizados MercadoLibre
-                bars = ax7.barh(tornado_df['Evento de Riesgo'], 
-                              tornado_df['Contribución Promedio'], 
-                              color=colores_eventos, 
-                              edgecolor='white', 
-                              alpha=0.85,
-                              height=0.65)  # Altura para mejor visualización
-                
-                # Añadir etiquetas con valor y porcentaje
-                for i, (bar, valor, porcentaje, nombre) in enumerate(zip(bars, 
-                                                        tornado_df['Contribución Promedio'],
-                                                        tornado_df['Porcentaje'],
-                                                        tornado_df['Evento de Riesgo'])):
-                    width = bar.get_width()
-                    label_x_pos = width * 1.01
-                    
-                    # Optimización de etiquetas para evitar sobrecargar el gráfico
-                    if porcentaje >= 1.0:  # Solo mostrar porcentaje si es significativo
-                        label_text = f"{currency_format(valor)} ({porcentaje:.1f}%)"
-                    else:
-                        label_text = f"{currency_format(valor)}"
-                    
-                    # Etiqueta con fondo blanco para mejor legibilidad
-                    ax7.text(label_x_pos, 
-                           bar.get_y() + bar.get_height()/2, 
-                           label_text, 
-                           va='center',
-                           fontsize=8,
-                           fontweight='bold' if i >= num_eventos - 3 else 'normal', 
-                           bbox=dict(facecolor='white', alpha=0.9, edgecolor=None))
-                
-                # Añadir línea vertical para la media con estilo MELI
-                mean_contrib = tornado_df['Contribución Promedio'].mean()
-                ax7.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
-                          label=f'Media: {currency_format(mean_contrib)}')
-                
-                # Resumen de contribuciones para referencia rápida
-                total_contrib = tornado_df['Contribución Promedio'].sum()
-                top3_contrib = tornado_df.nlargest(3, 'Contribución Promedio')['Contribución Promedio'].sum()
-                top3_pct = (top3_contrib / total_contrib) * 100
-                
-                # Añadir texto resumen en esquina superior izquierda
-                resumen_text = f"Total: {currency_format(total_contrib)}\nTop 3: {top3_pct:.0f}%"
-                ax7.text(0.02, 0.97, resumen_text, transform=ax7.transAxes, 
-                        fontsize=8, va='top', ha='left',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
-                
-                # Título y etiquetas mejoradas
-                ax7.set_title('Contribución por Evento de Riesgo')
-                ax7.set_xlabel('Contribución a la Pérdida Media ($)')
-                ax7.set_ylabel('Evento de Riesgo')
-                
-                # Formatear el eje X para moneda
-                ax7.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
-                
-                # Aplicar estilo MercadoLibre global
-                aplicar_estilo_meli(ax7, tipo='barh')
-                
-                # Añadir grid horizontal sutil
-                ax7.grid(axis='x', linestyle='--', alpha=0.3)
-                
-                # Añadir leyenda con estilo depurado
-                ax7.legend(loc='lower right', fontsize=8, framealpha=0.9)
-                
-                # Asegurar que haya suficiente espacio para las etiquetas
-                fig7.tight_layout()
-                
-                # Configurar tooltips para el gráfico de tornado
-                # Para cada barra del tornado, crear un tooltip con información detallada
-                for i, (bar, evento, contribucion, porcentaje) in enumerate(zip(bars, 
-                                                             tornado_df['Evento de Riesgo'],
-                                                             tornado_df['Contribución Promedio'],
-                                                             tornado_df['Porcentaje'])):
-                    y_pos = bar.get_y() + bar.get_height() / 2
-                    tooltip_label = f"{evento}\nContribución: {currency_format(contribucion)}\nPorcentaje: {porcentaje:.2f}%"
-                    
-                    # Determinar el color del tooltip según la posición/importancia en el gráfico
-                    if i == num_eventos - 1:  # El evento más importante
-                        color = MELI_AMARILLO
-                    elif i == num_eventos - 2:  # Segundo evento más importante
-                        color = MELI_AZUL_CORP
-                    elif i == 0 and 'Otros eventos' in evento:
-                        color = '#CCCCCC'
-                    else:
-                        color = None  # Usar el color por defecto
-                    
-                    canvas7.add_tooltip_data(ax7, [contribucion], [y_pos], 
-                                         labels=[tooltip_label],
-                                         highlight_color=color)
-                
-                # Añadir tooltip para la línea de la media
-                media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
-                # Encontrar un punto y adecuado para mostrar el tooltip de la media
-                # Usamos la altura media del gráfico
-                y_mid = len(tornado_df) / 2
-                canvas7.add_tooltip_data(ax7, [mean_contrib], [y_mid], 
-                                     labels=[media_tooltip], 
-                                     highlight_color=MELI_ROJO)
-                
-                # Guardar referencias para actualización dinámica
-                self.fig_contribucion = fig7
-                self.canvas_contribucion = canvas7
-                self.ax_contribucion = ax7
-                
-                tab10 = QtWidgets.QWidget()
-                layout7 = QtWidgets.QVBoxLayout(tab10)
-                
-                # Panel de controles superiores con selector de percentil
-                contrib_ctrls = QtWidgets.QWidget()
-                contrib_ctrls_layout = QtWidgets.QHBoxLayout(contrib_ctrls)
-                contrib_ctrls_layout.setContentsMargins(0, 0, 0, 0)
-                
-                lbl_percentil = QtWidgets.QLabel("Contribución al:")
-                lbl_percentil.setStyleSheet("font-weight: bold;")
-                self.combo_percentil_contrib = QtWidgets.QComboBox()
-                self.combo_percentil_contrib.addItems([
-                    "Media", "P75", "P80", "P90", "P95", "P99"
-                ])
-                self.combo_percentil_contrib.setToolTip(
-                    "Seleccione el percentil para ver qué eventos contribuyen más\n"
-                    "cuando la pérdida total está en ese nivel.\n"
-                    "Ej: P90 muestra contribución en escenarios de cola severos."
-                )
-                self.combo_percentil_contrib.currentIndexChanged.connect(self.actualizar_grafico_contribucion)
-                
-                contrib_ctrls_layout.addWidget(lbl_percentil)
-                contrib_ctrls_layout.addWidget(self.combo_percentil_contrib)
-                contrib_ctrls_layout.addStretch()
-                
-                layout7.addWidget(contrib_ctrls)
-                layout7.addWidget(self._wrap_canvas_in_scroll(canvas7))
-                self.graficos_tab_widget.addTab(tab10, "Contribución")
-                try:
-                    curr = self.progress_bar.value()
-                    self.actualizar_progreso_post(min(curr + 1, 93), "Agregando gráficos…")
-                    QtWidgets.QApplication.processEvents()
-                except Exception:
-                    pass
+                canvas7.add_tooltip_data(ax7, [contribucion], [y_pos], 
+                                     labels=[tooltip_label],
+                                     highlight_color=color)
+            
+            # Añadir tooltip para la línea de la media
+            media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
+            # Encontrar un punto y adecuado para mostrar el tooltip de la media
+            # Usamos la altura media del gráfico
+            y_mid = len(tornado_df) / 2
+            canvas7.add_tooltip_data(ax7, [mean_contrib], [y_mid], 
+                                 labels=[media_tooltip], 
+                                 highlight_color=MELI_ROJO)
+            
+            # Guardar referencias para actualización dinámica
+            self.fig_contribucion = fig7
+            self.canvas_contribucion = canvas7
+            self.ax_contribucion = ax7
+            
+            tab10 = QtWidgets.QWidget()
+            layout7 = QtWidgets.QVBoxLayout(tab10)
+            
+            # Panel de controles superiores con selector de percentil
+            contrib_ctrls = QtWidgets.QWidget()
+            contrib_ctrls_layout = QtWidgets.QHBoxLayout(contrib_ctrls)
+            contrib_ctrls_layout.setContentsMargins(0, 0, 0, 0)
+            
+            lbl_percentil = QtWidgets.QLabel("Contribución al:")
+            lbl_percentil.setStyleSheet("font-weight: bold;")
+            self.combo_percentil_contrib = QtWidgets.QComboBox()
+            self.combo_percentil_contrib.addItems([
+                "Media", "P75", "P80", "P90", "P95", "P99"
+            ])
+            self.combo_percentil_contrib.setToolTip(
+                "Seleccione el percentil para ver qué eventos contribuyen más\n"
+                "cuando la pérdida total está en ese nivel.\n"
+                "Ej: P90 muestra contribución en escenarios de cola severos."
+            )
+            self.combo_percentil_contrib.currentIndexChanged.connect(self.actualizar_grafico_contribucion)
+            
+            contrib_ctrls_layout.addWidget(lbl_percentil)
+            contrib_ctrls_layout.addWidget(self.combo_percentil_contrib)
+            contrib_ctrls_layout.addStretch()
+            
+            layout7.addWidget(contrib_ctrls)
+            layout7.addWidget(self._wrap_canvas_in_scroll(canvas7))
+            self.graficos_tab_widget.addTab(tab10, "Contribución")
+            try:
+                curr = self.progress_bar.value()
+                self.actualizar_progreso_post(min(curr + 1, 93), "Agregando gráficos…")
+                QtWidgets.QApplication.processEvents()
+            except Exception:
+                pass
 
         # Gráfico 8: Box Plots por Evento de Riesgo
         fig8 = Figure(figsize=(9, 6))  # Tamaño optimizado para buena visualización

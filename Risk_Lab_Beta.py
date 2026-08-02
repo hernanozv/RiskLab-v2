@@ -8236,7 +8236,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             # Limpiar el eje actual
             ax = self.ax_contribucion
             ax.clear()
-            
+            # Fix bug alto #11 (QA ronda 2): limpiar los tooltips de la
+            # llamada anterior. add_tooltip_data solo agrega datos, nunca
+            # reemplaza; sin este clear, los tooltips quedaban con los
+            # valores del percentil anteriormente seleccionado, desalineados
+            # con las barras recién dibujadas.
+            self.canvas_contribucion.clear_tooltip_data(ax)
+
             # Filtrar eventos sin contribución
             if not any(c > 0 for c in contribuciones):
                 ax.text(0.5, 0.5, "No hay contribuciones para mostrar",
@@ -8311,9 +8317,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Añadir línea vertical para la media de contribuciones
             mean_contrib = tornado_df['Contribución'].mean()
-            ax.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
+            ax.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7,
                       label=f'Media: {currency_format(mean_contrib)}')
-            
+
+            # Fix bug alto #11 (QA ronda 2): registrar tooltips para las
+            # barras recién dibujadas (antes nunca se llamaba a
+            # add_tooltip_data acá, así que el usuario veía las barras de
+            # "P99" pero el tooltip seguía mostrando los valores de "Media"
+            # de la primera vez que se dibujó el gráfico).
+            for i, (bar, evento, valor, porcentaje) in enumerate(zip(bars,
+                                                    tornado_df['Evento de Riesgo'],
+                                                    tornado_df['Contribución'],
+                                                    tornado_df['Porcentaje'])):
+                y_pos = bar.get_y() + bar.get_height() / 2
+                tooltip_label = f"{evento}\nContribución: {currency_format(valor)}\nPorcentaje: {porcentaje:.2f}%"
+                if i == num_eventos - 1:
+                    color = MELI_AMARILLO
+                elif i == num_eventos - 2:
+                    color = MELI_AZUL_CORP
+                elif i == 0 and 'Otros eventos' in str(evento):
+                    color = '#CCCCCC'
+                else:
+                    color = None
+                self.canvas_contribucion.add_tooltip_data(ax, [valor], [y_pos],
+                                     labels=[tooltip_label],
+                                     highlight_color=color)
+
+            media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
+            y_mid = len(tornado_df) / 2
+            self.canvas_contribucion.add_tooltip_data(ax, [mean_contrib], [y_mid],
+                                 labels=[media_tooltip],
+                                 highlight_color=MELI_ROJO)
+
             # Resumen de contribuciones
             total_contrib = tornado_df['Contribución'].sum()
             top3_contrib = tornado_df.nlargest(3, 'Contribución')['Contribución'].sum()

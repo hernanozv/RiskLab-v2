@@ -161,10 +161,29 @@ class InteractiveFigureCanvas(FigureCanvas):
         
         # Actualizar contador de datos para optimizar rendimiento
         self._dataset_size += len(x_data)
-        
+
         # Optimizar umbral de distancia basado en el tamaño del dataset
         if self._dataset_size > 500:
             self._optimize_tooltip_data(ax_id)
+
+    def clear_tooltip_data(self, ax):
+        """Elimina los datos de tooltip previamente registrados para un eje.
+
+        Fix bug alto #11 (QA ronda 2): gráficos que se redibujan dinámicamente
+        sobre el MISMO objeto Axes (p.ej. actualizar_grafico_contribucion, que
+        hace ax.clear() y vuelve a dibujar barras distintas según el
+        percentil elegido) nunca tenían forma de invalidar los tooltips
+        agregados en la llamada anterior. add_tooltip_data solo agrega
+        (extend/append) — nunca reemplaza — así que los tooltips de la
+        llamada anterior seguían mostrándose sobre las barras nuevas,
+        desalineados con los datos realmente dibujados. Llamar a este método
+        antes de volver a poblar el gráfico limpia ambas estructuras
+        (tooltip_data y tooltip_labels) para ese eje.
+        """
+        ax_id = id(ax)
+        self.tooltip_data.pop(ax_id, None)
+        self.tooltip_labels = [d for d in self.tooltip_labels if d['ax'] is not ax]
+        self._dataset_size = sum(len(d['x_data']) for d in self.tooltip_labels)
 
     def _optimize_tooltip_data(self, ax_id):
         """Optimiza los datos de tooltip para grandes conjuntos de datos usando KD-Tree."""

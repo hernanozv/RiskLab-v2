@@ -77,6 +77,14 @@ class _FakeCanvas:
     def draw_idle(self):
         pass
 
+    def clear_tooltip_data(self, ax):
+        # Fix bug alto #11 (QA ronda 2): actualizar_grafico_contribucion
+        # ahora limpia los tooltips previos del eje antes de redibujar.
+        pass
+
+    def add_tooltip_data(self, *args, **kwargs):
+        pass
+
 
 def _construir_self(perdidas_totales, perdidas_por_evento, eventos, idx_combo, texto_combo):
     fake_self = type('FakeApp', (), {})()

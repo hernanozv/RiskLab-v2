@@ -19556,7 +19556,7 @@ class ResultReport:
         Args:
             filename: Ruta completa del archivo PDF a generar
         """
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepTogether
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import cm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -19594,7 +19594,7 @@ class ResultReport:
             stats_dict: Diccionario con estadísticas calculadas
             figuras: Lista de objetos Figure de matplotlib a incluir en el PDF
         """
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepInFrame
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepInFrame, KeepTogether
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import cm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -19758,7 +19758,14 @@ class ResultReport:
             # carácter lo causó.
             nombre_evento_escapado = _xml_escape_pdf(nombre_evento_display)
 
-            elements.append(Paragraph(f"<b>{i+1}. {nombre_evento_escapado}</b>", event_title_style))
+            # Fix bug medio #19 (QA ronda 2): agrupar el título del evento,
+            # sus vínculos (si existen) y su tabla de estadísticas en un
+            # único bloque via KeepTogether. Sin esto, con 20+ eventos el
+            # título podía quedar en el final de una página y su tabla de
+            # estadísticas recién en la página siguiente ("huérfano"), sin
+            # ninguna relación visual clara entre ambos para el lector.
+            bloque_evento = []
+            bloque_evento.append(Paragraph(f"<b>{i+1}. {nombre_evento_escapado}</b>", event_title_style))
 
             # Info de vínculos si existen
             vinculos_evt = evento.get('vinculos', [])
@@ -19788,9 +19795,9 @@ class ResultReport:
                     desc += ")"
                     deps.append(desc)
                 dep_text = " | ".join(deps)
-                elements.append(Paragraph(f"<i>Vínculos: {dep_text}</i>", styles['Normal']))
-                elements.append(Spacer(1, 3))
-            
+                bloque_evento.append(Paragraph(f"<i>Vínculos: {dep_text}</i>", styles['Normal']))
+                bloque_evento.append(Spacer(1, 3))
+
             # Tabla de estadísticas del evento
             event_data = [
                 ["Métrica", "Valor"],
@@ -19813,9 +19820,10 @@ class ResultReport:
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
                 ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
             ]))
-            elements.append(t_evt)
-            elements.append(Spacer(1, 6))
-        
+            bloque_evento.append(t_evt)
+            bloque_evento.append(Spacer(1, 6))
+            elements.append(KeepTogether(bloque_evento))
+
         elements.append(PageBreak())
         
         # Tabla de percentiles por evento (formato mejorado: eventos en filas)

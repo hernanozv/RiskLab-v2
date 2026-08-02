@@ -19372,7 +19372,12 @@ class ResultReport:
                     if fsev != 1.0:
                         desc += f", sev:{fsev:.2f}x"
                     if umbral > 0:
-                        desc += f", umbral:${umbral:,}"
+                        # Fix bug #38: usar currency_format() (formato "$1.234.567",
+                        # consistente con el resto del PDF/app) en vez de un f-string
+                        # crudo "${:,}" que produce el formato inverso en ingles
+                        # ("$1,234,567"), inconsistente con la tabla de estadisticas
+                        # del mismo evento, apenas debajo.
+                        desc += f", umbral:{currency_format(umbral)}"
                     desc += ")"
                     deps.append(desc)
                 dep_text = " | ".join(deps)

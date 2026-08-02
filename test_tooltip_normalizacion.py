@@ -102,6 +102,67 @@ if registrados:
     check('A_correcto' in texto_mostrado,
           "El texto del tooltip corresponde a la etiqueta del punto A")
 
+# --- 8. Bug #37: highlight_color (singular, string hex) no debe corromperse
+#        al indexar por punto en _process_tooltip. ---
+print("\n" + "=" * 70)
+print("BUG #37: highlight_color (singular) no se corrompe a un caracter")
+print("=" * 70)
+
+fig2 = Figure()
+ax2 = fig2.add_subplot(111)
+ax2.set_xlim(0, 10)
+ax2.set_ylim(0, 10)
+canvas2 = InteractiveFigureCanvas(fig2)
+
+COLOR_HEX = '#F23D4F'  # MELI_ROJO
+
+# Caso 1: un solo punto con highlight_color singular (patron mas comun en
+# Risk_Lab_Beta.py: add_tooltip_data(ax, [x], [y], highlight_color=MELI_ROJO))
+canvas2.add_tooltip_data(ax2, x_data=[5.0], y_data=[5.0],
+                         labels=['Punto unico'], highlight_color=COLOR_HEX)
+
+colores_recibidos = []
+canvas2._show_tooltip = lambda ax_, x, y, text, highlight_color=None: colores_recibidos.append(highlight_color)
+
+evento2 = _FakeEvent(ax2, xdata=5.0, ydata=5.0)
+canvas2._process_tooltip(evento2)
+
+check(len(colores_recibidos) == 1, "Se muestra el tooltip del punto unico")
+if colores_recibidos:
+    check(colores_recibidos[0] == COLOR_HEX,
+          f"Bug #37: highlight_color llega completo ('{COLOR_HEX}'), no un solo "
+          f"caracter (obtenido: {colores_recibidos[0]!r})")
+    from matplotlib.colors import to_rgba
+    try:
+        to_rgba(colores_recibidos[0])
+        check(True, "El color recibido es un color matplotlib válido (no cae a gris)")
+    except (ValueError, TypeError):
+        check(False, "El color recibido es un color matplotlib válido (no cae a gris)")
+
+# Caso 2: multiples puntos con highlight_colors (plural, lista) -- no debe
+# regresionar: cada punto debe recibir SU color correspondiente.
+fig3 = Figure()
+ax3 = fig3.add_subplot(111)
+ax3.set_xlim(0, 10)
+ax3.set_ylim(0, 10)
+canvas3 = InteractiveFigureCanvas(fig3)
+
+canvas3.add_tooltip_data(
+    ax3, x_data=[2.0, 8.0], y_data=[2.0, 8.0],
+    labels=['Punto A', 'Punto B'],
+    highlight_colors=['#00A650', '#2D3277']  # MELI_VERDE, MELI_AZUL_CORP
+)
+colores_recibidos_multi = []
+canvas3._show_tooltip = lambda ax_, x, y, text, highlight_color=None: colores_recibidos_multi.append(highlight_color)
+
+canvas3._process_tooltip(_FakeEvent(ax3, xdata=2.0, ydata=2.0))
+canvas3._process_tooltip(_FakeEvent(ax3, xdata=8.0, ydata=8.0))
+
+check(colores_recibidos_multi == ['#00A650', '#2D3277'],
+      f"highlight_colors (plural, lista): cada punto recibe su propio color "
+      f"(obtenido: {colores_recibidos_multi})")
+
+
 print("\n" + "=" * 70)
 total = PASS + FAIL
 print(f"RESULTADOS: {PASS}/{total} tests pasaron, {FAIL} fallaron")

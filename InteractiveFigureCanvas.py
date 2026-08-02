@@ -101,7 +101,20 @@ class InteractiveFigureCanvas(FigureCanvas):
         # Manejar el caso donde se proporciona highlight_color (singular) en lugar de highlight_colors (plural)
         if highlight_color is not None and highlight_colors is None:
             highlight_colors = highlight_color
-            
+
+        # Fix bug #37: normalizar SIEMPRE a una lista por-punto antes de guardar.
+        # Antes, cuando el llamador usaba highlight_color (singular, p.ej. un string
+        # hex '#F23D4F') en vez de highlight_colors (plural), el string se guardaba
+        # tal cual. _process_tooltip luego hacia
+        # `data_set['highlight_colors'][min_idx]`, y sobre un STRING eso indexa un
+        # CARACTER, no el color completo (p.ej. '#F23D4F'[0] == '#'). to_rgba('#')
+        # no es un color valido, y como el fallback no contempla ese caso, el
+        # tooltip terminaba mostrandose gris en silencio en vez del color pedido.
+        if highlight_colors is not None and not isinstance(highlight_colors, list):
+            highlight_colors_por_punto = [highlight_colors] * len(x_data)
+        else:
+            highlight_colors_por_punto = highlight_colors
+
         self.tooltip_labels.append({
             'ax': ax,
             'x_data': np.asarray(x_data),
@@ -109,7 +122,7 @@ class InteractiveFigureCanvas(FigureCanvas):
             'labels': labels,
             'artists': artists,
             'formatter': formatter,
-            'highlight_colors': highlight_colors  # Almacenar los colores de resaltado
+            'highlight_colors': highlight_colors_por_punto  # Lista por-punto (o None)
         })
         
         # Identificador único para este eje

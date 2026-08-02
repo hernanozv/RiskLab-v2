@@ -17050,8 +17050,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
             "comprimir": cb_gzip.isChecked()
         }
 
+    @staticmethod
+    def _sanear_nan_inf_recursivo(obj):
+        """Reemplaza recursivamente NaN/Infinity por representaciones JSON-seguras.
+
+        Fix bug #27: el parámetro `default=` de json.dumps NUNCA se invoca para
+        objetos que el encoder estándar ya sabe serializar de forma nativa, y
+        `float` (incluyendo `np.floating`, que es subclase de `float`) es uno de
+        esos tipos. Por lo tanto, la lógica de _json_default que intenta
+        convertir NaN/Infinity a None/"inf"/"-inf" nunca se ejecutaba para estos
+        valores: el encoder estándar los escribía tal cual como los tokens
+        literales NaN/Infinity/-Infinity, que no son JSON válido y rompen
+        parsers estrictos. Este saneo recorre la estructura ANTES de serializar
+        y reemplaza esos valores donde el encoder no puede interceptarlos.
+        """
+        if isinstance(obj, dict):
+            return {k: RiskLabApp._sanear_nan_inf_recursivo(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [RiskLabApp._sanear_nan_inf_recursivo(v) for v in obj]
+        if isinstance(obj, (float, np.floating)):
+            obj = float(obj)
+            if obj != obj:  # NaN
+                return None
+            if obj == float("inf"):
+                return "inf"
+            if obj == float("-inf"):
+                return "-inf"
+            return obj
+        return obj
+
     def _escribir_export_json(self, filepath, payload, comprimir=False):
         """Serializa el payload a JSON (con o sin gzip)."""
+        payload = self._sanear_nan_inf_recursivo(payload)
         json_str = json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default)
         if comprimir:
             import gzip
@@ -18534,6 +18564,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # Lista para acumular eventos que no se pudieron cargar
                 eventos_con_error = []
 
+                # Fix bug #28: lista para acumular vínculos cuyo id_padre no
+                # corresponde a ningún evento del archivo. Antes esto se
+                # resolvía en silencio (el vínculo quedaba con un ID que no
+                # existe en ningún evento cargado) y el evento hijo terminaba
+                # comportándose como independiente sin ningún aviso al usuario.
+                vinculos_huerfanos = []
+
                 # Cargar eventos de riesgo de la simulación principal a lista temporal
                 for evento_data in configuracion.get('eventos_riesgo', []):
                     sev_opcion = evento_data['sev_opcion']
@@ -18642,6 +18679,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         vinculos_actualizados = []
                         for vinculo in evento_data['vinculos']:
                             id_padre_antiguo = vinculo['id_padre']
+                            if id_padre_antiguo not in id_mapeo:
+                                vinculos_huerfanos.append(
+                                    f"• {evento_data.get('nombre', 'N/A')}: vínculo hacia un evento "
+                                    f"con ID '{id_padre_antiguo}' que no existe en el archivo. "
+                                    f"El vínculo se ignorará (el evento se comportará como independiente)."
+                                )
                             id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
                             prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
                             fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
@@ -18768,8 +18811,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 # Primero buscar en el mapeo del escenario, luego en el mapeo general
                                 if id_padre_antiguo in id_mapeo_scenario:
                                     id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
+                                elif id_padre_antiguo in id_mapeo:
+                                    id_padre_nuevo = id_mapeo[id_padre_antiguo]
                                 else:
-                                    id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)
+                                    vinculos_huerfanos.append(
+                                        f"• {evento_data.get('nombre', 'N/A')} (Escenario: {scenario.nombre}): "
+                                        f"vínculo hacia un evento con ID '{id_padre_antiguo}' que no existe "
+                                        f"en el archivo. El vínculo se ignorará (el evento se comportará "
+                                        f"como independiente)."
+                                    )
+                                    id_padre_nuevo = id_padre_antiguo
                                 prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
                                 fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
                                 umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
@@ -18912,7 +18963,31 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     
                     QtWidgets.QMessageBox.warning(self, "Eventos No Cargados", mensaje_errores)
                     self.statusBar().showMessage(f"Configuración cargada con {cantidad_errores} advertencia(s)", 5000)
-                else:
+
+                # Fix bug #28: reportar vínculos cuyo padre no fue encontrado en el
+                # archivo. El evento en sí SI se cargó correctamente; solo el
+                # vínculo puntual se ignoró y el evento pasa a comportarse como
+                # independiente (antes esto ocurría en silencio).
+                if vinculos_huerfanos:
+                    cantidad_huerfanos = len(vinculos_huerfanos)
+                    mensaje_huerfanos = (
+                        f"Se cargó la configuración, pero {cantidad_huerfanos} vínculo(s) "
+                        f"hacen referencia a un evento padre que no existe en el archivo:\n\n"
+                    )
+                    huerfanos_a_mostrar = vinculos_huerfanos[:10]
+                    mensaje_huerfanos += "\n".join(huerfanos_a_mostrar)
+                    if cantidad_huerfanos > 10:
+                        mensaje_huerfanos += f"\n\n... y {cantidad_huerfanos - 10} vínculo(s) adicional(es)."
+                    mensaje_huerfanos += (
+                        "\n\nEsos vínculos fueron ignorados; los eventos afectados se "
+                        "comportarán como independientes. Verifique la configuración del archivo."
+                    )
+                    QtWidgets.QMessageBox.warning(self, "Vínculos No Restaurados", mensaje_huerfanos)
+                    self.statusBar().showMessage(
+                        f"Configuración cargada con {cantidad_huerfanos} vínculo(s) no restaurado(s)", 5000
+                    )
+
+                if not eventos_con_error and not vinculos_huerfanos:
                     self.statusBar().showMessage("La Simulación ha sido cargada exitosamente", 5000)
                 
                 # Refrescar layout si la ventana está maximizada (fix bug de alineación)

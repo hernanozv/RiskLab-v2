@@ -85,6 +85,33 @@ class RiskLabRejectionFallbackWarning(UserWarning):
 # UI y el export adviertan al usuario sobre la distorsion.
 MAX_EVENTOS_POR_EVENTO_POR_CHUNK = 500_000_000
 
+# Fix bug #33: campos internos que el motor de simulación agrega a los dicts
+# de evento en tiempo de ejecución (cache de factores, flags de estado,
+# huella del cap de frecuencia, etc.) y que NUNCA deben persistirse al
+# guardar la configuración. Centralizado en una sola lista para que
+# guardar_configuracion no pueda "olvidarse" de limpiar un campo nuevo en
+# una de sus dos copias (eventos principales y eventos de escenario) sin
+# tocar la otra. Antes de este fix, los campos '_cap_frecuencia_*' no
+# estaban en ninguna de las dos listas de limpieza: quedaban guardados en
+# el JSON y, al recargarlo, podían disparar el aviso de "resultados
+# distorsionados" para una corrida que en realidad no re-disparó el cap.
+_CAMPOS_INTERNOS_SIMULACION = (
+    '_usa_estocastico',
+    '_factores_vector',
+    '_factores_severidad_vector',
+    '_factor_severidad_estatico',
+    '_seguros_aplicables',
+    '_factor_severidad_vinculos',
+    '_factor_severidad_vinculos_es_unidad',
+    '_factores_severidad_vector_es_unidad',
+    '_cap_frecuencia_aplicado',
+    '_cap_frecuencia_factor',
+    '_cap_frecuencia_suma_original',
+    '_cap_frecuencia_suma_capeada',
+    '_cap_frecuencia_media_original',
+    '_cap_frecuencia_media_capeada',
+)
+
 
 # ==========================================================================
 # Constantes para el feature "Exportar para Análisis (IA)"
@@ -15923,197 +15950,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-# --- INICIO: Nuevo Gráfico - Mapa de Riesgos Mejorado (Jerarquía Visual y Cuadrantes) ---
-        try:
-            if len(eventos_riesgo) > 0 and len(perdidas_por_evento) == len(eventos_riesgo) and len(frecuencias_por_evento) == len(eventos_riesgo):
-
-                # 1. Preparar datos para el gráfico con cálculos mejorados
-                data_riesgos = []
-                for idx, evento in enumerate(eventos_riesgo):
-                    nombre = evento['nombre']
-                    # Usar una copia para evitar modificar los arrays originales
-                    perdidas_evt = np.array(perdidas_por_evento[idx])
-                    frecuencias_evt = np.array(frecuencias_por_evento[idx])
-
-                    # Cálculos de impacto
-                    impacto_medio = np.mean(perdidas_evt) if len(perdidas_evt) > 0 else 0
-                    impacto_p90 = np.percentile(perdidas_evt, 90) if len(perdidas_evt) > 0 else 0
-
-                    # Cálculo de Frecuencia MODO (Valor más frecuente)
-                    if len(frecuencias_evt) > 0:
-                        mode_result = stats.mode(frecuencias_evt, keepdims=True)
-                        frecuencia_modo = float(mode_result.mode[0]) if mode_result.mode.size > 0 else 0
-                        # Añadir también frecuencia media para comparación
-                        frecuencia_media = np.mean(frecuencias_evt) 
-                    else:
-                        frecuencia_modo = 0
-                        frecuencia_media = 0
-
-                    # Actualizar Importancia usando P90 * Frecuencia MODO para mejor representación del riesgo
-                    # Esto da más peso a los escenarios severos pero probables
-                    importancia = (impacto_p90 * frecuencia_modo) + 1e-9  # Epsilon para evitar tamaño cero
-
-                    data_riesgos.append({
-                        'Nombre': nombre,
-                        'ImpactoMedio': impacto_medio,
-                        'ImpactoP90': impacto_p90,
-                        'FrecuenciaModo': frecuencia_modo,
-                        'FrecuenciaMedia': frecuencia_media,
-                        'Importancia': importancia
-                    })
-
-                # 2. Crear DataFrame
-                df_riesgos = pd.DataFrame(data_riesgos)
-
-                # Asegurarnos de que no haya valores negativos o cero donde no deben
-                df_riesgos['Importancia'] = df_riesgos['Importancia'].clip(lower=1e-9)
-                df_riesgos['ImpactoP90'] = df_riesgos['ImpactoP90'].clip(lower=0)
-                df_riesgos['ImpactoMedio'] = df_riesgos['ImpactoMedio'].clip(lower=0)
-                df_riesgos['FrecuenciaModo'] = df_riesgos['FrecuenciaModo'].clip(lower=0)
-
-                # 3. Generar Gráfico Scatterplot Mejorado
-                fig_mapa = Figure(figsize=(11, 8))  # Tamaño aumentado para mejor visualización
-                canvas_mapa = InteractiveFigureCanvas(fig_mapa)
-                
-                # Usar gridspec para definir la estructura del gráfico con mejor control
-                gs = fig_mapa.add_gridspec(1, 20, wspace=0.5)  # 20 columnas para control fino
-                ax_mapa = fig_mapa.add_subplot(gs[0, :16])     # Gráfico principal: 16/20 del ancho
-                cax = fig_mapa.add_subplot(gs[0, 17:19])       # Barra de color: 2/20 del ancho
-
-                # Crear el scatterplot con visualización mejorada
-                scatter = sns.scatterplot(
-                    data=df_riesgos,
-                    x='ImpactoMedio',
-                    y='FrecuenciaModo',
-                    size='Importancia',
-                    hue='ImpactoP90',
-                    palette='RdYlGn_r',     # Paleta Verde(bajo)->Rojo(alto)
-                    sizes=(50, 1500),       # Rango de tamaño
-                    alpha=0.75,             # Transparencia
-                    legend=False,           # Quitar leyendas automáticas
-                    ax=ax_mapa
-                )
-                
-                # Agregar tooltips interactivos para el mapa de riesgos
-                for i, row in df_riesgos.iterrows():
-                    tooltip_text = (
-                        f"Evento: {row['Nombre']}\n"
-                        f"Impacto Medio: {currency_format(row['ImpactoMedio'])}\n"
-                        f"Impacto P90: {currency_format(row['ImpactoP90'])}\n"
-                        f"Frecuencia Modo: {row['FrecuenciaModo']:.0f}\n"
-                        f"Frecuencia Media: {row['FrecuenciaMedia']:.2f}\n"
-                        f"Importancia: {row['Importancia']:.0f}"
-                    )
-                    
-                    # Determinar color del tooltip según la importancia del riesgo
-                    # Los eventos más importantes reciben colores destacados
-                    highlight_color = None
-                    if row['Importancia'] == df_riesgos['Importancia'].max():
-                        highlight_color = MELI_ROJO
-                    elif row['Importancia'] >= df_riesgos['Importancia'].quantile(0.75):
-                        highlight_color = MELI_AMARILLO
-                    
-                    canvas_mapa.add_tooltip_data(
-                        ax_mapa, 
-                        [row['ImpactoMedio']], 
-                        [row['FrecuenciaModo']],
-                        labels=[tooltip_text],
-                        highlight_color=highlight_color
-                    )
-
-                # 4. Mejorar la visualización con cuadrantes de riesgo
-                if not df_riesgos.empty:
-                    # Usar percentiles de los datos para los umbrales de cuadrantes
-                    umbral_x = df_riesgos['ImpactoMedio'].median() * 1.2  # Ajustado hacia arriba
-                    umbral_y = df_riesgos['FrecuenciaModo'].median() * 1.2
-                    
-                    # Asegurar que los umbrales no sean cero
-                    umbral_x = max(umbral_x, df_riesgos['ImpactoMedio'].max() * 0.3)
-                    umbral_y = max(umbral_y, df_riesgos['FrecuenciaModo'].max() * 0.3)
-                    
-                    # Calcular límites máximos para posicionar etiquetas
-                    max_x = df_riesgos['ImpactoMedio'].max() * 1.1
-                    max_y = df_riesgos['FrecuenciaModo'].max() * 1.1
-                    
-                    # Líneas de cuadrantes con estilo mejorado
-                    ax_mapa.axvline(x=umbral_x, color='gray', linestyle='--', alpha=0.5)
-                    ax_mapa.axhline(y=umbral_y, color='gray', linestyle='--', alpha=0.5)
-                    
-                    # Etiquetar cuadrantes con más claridad
-                    ax_mapa.text(max_x * 0.2, max_y * 0.9, "IMPACTO BAJO\nFRECUENCIA ALTA", 
-                             ha='center', fontsize=8, alpha=0.7, color='darkblue',
-                             bbox=dict(facecolor='white', alpha=0.4, edgecolor='none'))
-                    ax_mapa.text(max_x * 0.8, max_y * 0.9, "IMPACTO ALTO\nFRECUENCIA ALTA", 
-                             ha='center', fontsize=8, alpha=0.7, color='darkred',
-                             bbox=dict(facecolor='white', alpha=0.4, edgecolor='none'))
-                    ax_mapa.text(max_x * 0.2, max_y * 0.1, "IMPACTO BAJO\nFRECUENCIA BAJA", 
-                             ha='center', fontsize=8, alpha=0.7, color='darkgreen',
-                             bbox=dict(facecolor='white', alpha=0.4, edgecolor='none'))
-                    ax_mapa.text(max_x * 0.8, max_y * 0.1, "IMPACTO ALTO\nFRECUENCIA BAJA", 
-                             ha='center', fontsize=8, alpha=0.7, color='darkorange',
-                             bbox=dict(facecolor='white', alpha=0.4, edgecolor='none'))
-
-                # 5. Personalizar Gráfico Principal con mejor jerarquía visual
-                ax_mapa.set_title('Mapa de Riesgos: Análisis Jerárquico de Impacto y Frecuencia', fontsize=14)
-                ax_mapa.set_xlabel('Impacto Económico Promedio', fontsize=11)
-                ax_mapa.set_ylabel('Frecuencia Anual Más Probable (Modo)', fontsize=11)
-                ax_mapa.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
-                ax_mapa.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{int(y)}'))
-                
-                # Ajustar límites y rejilla para mejor visualización
-                min_x = df_riesgos['ImpactoMedio'].min() if not df_riesgos.empty else 0
-                min_y = df_riesgos['FrecuenciaModo'].min() if not df_riesgos.empty else 0
-                ax_mapa.set_xlim(left=max(0, min_x * 0.9))
-                ax_mapa.set_ylim(bottom=max(0, min_y * 0.9))
-                ax_mapa.grid(True, linestyle='--', alpha=0.4)  # Rejilla más sutil
-
-                # 6. Añadir anotaciones con Nombre y P90 (manteniendo formato actual)
-                n_top_riesgos = 7  # Anotar los N más importantes por tamaño
-                if not df_riesgos.empty:
-                    df_riesgos_sorted = df_riesgos.nlargest(min(n_top_riesgos, len(df_riesgos)), 'Importancia')
-
-                    for i, row in df_riesgos_sorted.iterrows():
-                        # Mantener formato actual de etiqueta con nombre y P90
-                        label_texto = f"{row['Nombre']}\nP90: {currency_format(row['ImpactoP90'])}"
-                        
-                        # Mejorar la apariencia de las etiquetas con flechas para evitar solapamientos
-                        ax_mapa.annotate(
-                            label_texto,
-                            xy=(row['ImpactoMedio'], row['FrecuenciaModo']),  # Posición del punto
-                            xytext=(15, 0),  # Offset desde el punto
-                            textcoords="offset points",
-                            fontsize=8,
-                            ha='left', va='center',
-                            bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85, ec='grey', lw=0.5),
-                            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', color='grey', alpha=0.7)
-                        )
-
-                # 7. Crear Barra de Color para Leyenda de P90 (hue)
-                if not df_riesgos.empty:
-                    norm = plt.Normalize(df_riesgos['ImpactoP90'].min(), df_riesgos['ImpactoP90'].max())
-                    cmap = plt.get_cmap("RdYlGn_r")  # Colormap: Verde(bajo)->Rojo(alto)
-            else:
-                frecuencia_modo = 0
-                frecuencia_media = 0
-
-            # Actualizar Importancia usando P90 * Frecuencia MODO para mejor representación del riesgo
-            # Esto da más peso a los escenarios severos pero probables
-            importancia = (impacto_p90 * frecuencia_modo) + 1e-9  # Epsilon para evitar tamaño cero
-        except ImportError:
-            # Manejo específico si falta SciPy
-            print("Error: Se requiere SciPy para calcular el modo. Instala SciPy: pip install scipy")
-            # Mostrar mensaje al usuario en la GUI
-            QtWidgets.QMessageBox.warning(self, "Dependencia Faltante",
-                                          "Se requiere la librería SciPy para usar la frecuencia modo en el Mapa de Riesgos.\n"
-                                          "Por favor, instálala (ej: pip install scipy) y reinicia la aplicación.\n"
-                                          "El gráfico no se generará en esta sesión.")
-        except Exception as e:
-            # Capturar otros errores
-            print(f"Error al generar el Mapa de Riesgos Mejorado: {e}")
-            error_message_mapa = traceback.format_exc()
-            print(error_message_mapa)
-
-# --- FIN: Nuevo Gráfico - Mapa de Riesgos Mejorado ---
 
         # Gráfico de Velocímetro/Gauge de Riesgo con umbrales fijos
         from matplotlib.patches import Wedge, FancyArrow, Circle, FancyBboxPatch
@@ -18499,24 +18335,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         del evento_data['dist_frecuencia']
                     
                     # Remover flags temporales de simulación (no deben guardarse)
-                    if '_usa_estocastico' in evento_data:
-                        del evento_data['_usa_estocastico']
-                    if '_factores_vector' in evento_data:
-                        del evento_data['_factores_vector']
-                    # NUEVOS: flags de severidad
-                    if '_factores_severidad_vector' in evento_data:
-                        del evento_data['_factores_severidad_vector']
-                    if '_factor_severidad_estatico' in evento_data:
-                        del evento_data['_factor_severidad_estatico']
-                    if '_seguros_aplicables' in evento_data:
-                        del evento_data['_seguros_aplicables']
-                    if '_factor_severidad_vinculos' in evento_data:
-                        del evento_data['_factor_severidad_vinculos']
-                    # Flags de cache no-op añadidas en optimización
-                    if '_factor_severidad_vinculos_es_unidad' in evento_data:
-                        del evento_data['_factor_severidad_vinculos_es_unidad']
-                    if '_factores_severidad_vector_es_unidad' in evento_data:
-                        del evento_data['_factores_severidad_vector_es_unidad']
+                    for campo_interno in _CAMPOS_INTERNOS_SIMULACION:
+                        evento_data.pop(campo_interno, None)
 
                     # DEBUG: Verificar que factores_ajuste se está guardando
                     if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
@@ -18540,24 +18360,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             del evento_data['dist_frecuencia']
                         
                         # Remover flags temporales de simulación (no deben guardarse)
-                        if '_usa_estocastico' in evento_data:
-                            del evento_data['_usa_estocastico']
-                        if '_factores_vector' in evento_data:
-                            del evento_data['_factores_vector']
-                        # NUEVOS: flags de severidad
-                        if '_factores_severidad_vector' in evento_data:
-                            del evento_data['_factores_severidad_vector']
-                        if '_factor_severidad_estatico' in evento_data:
-                            del evento_data['_factor_severidad_estatico']
-                        if '_seguros_aplicables' in evento_data:
-                            del evento_data['_seguros_aplicables']
-                        if '_factor_severidad_vinculos' in evento_data:
-                            del evento_data['_factor_severidad_vinculos']
-                        # Flags de cache no-op añadidas en optimización
-                        if '_factor_severidad_vinculos_es_unidad' in evento_data:
-                            del evento_data['_factor_severidad_vinculos_es_unidad']
-                        if '_factores_severidad_vector_es_unidad' in evento_data:
-                            del evento_data['_factores_severidad_vector_es_unidad']
+                        for campo_interno in _CAMPOS_INTERNOS_SIMULACION:
+                            evento_data.pop(campo_interno, None)
 
                         escenario_data['eventos_riesgo'].append(evento_data)
                     configuracion['scenarios'].append(escenario_data)
@@ -18606,8 +18410,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     dir=directorio_destino, prefix='.risklab_tmp_', suffix='.json'
                 )
                 try:
+                    # Fix bug #34: usar el mismo encoder personalizado (_json_default)
+                    # y el mismo saneo de NaN/Infinity (_sanear_nan_inf_recursivo) que
+                    # ya usa el export para análisis IA (_escribir_export_json). Sin
+                    # default=, cualquier tipo numpy que NO sea subclase de un tipo
+                    # nativo de Python (np.int64, np.bool_, np.ndarray) hace fallar
+                    # json.dump con un TypeError crudo en vez de serializarse
+                    # correctamente; y sin el saneo, un NaN/Infinity (p.ej. en un CV
+                    # con media~0) se guardaria como token invalido para JSON estricto.
+                    configuracion_saneada = self._sanear_nan_inf_recursivo(configuracion)
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                        json.dump(configuracion, f, ensure_ascii=False, indent=4)
+                        json.dump(configuracion_saneada, f, ensure_ascii=False, indent=4,
+                                  default=self._json_default)
                     os.replace(ruta_temporal, filepath)
                 except Exception:
                     if os.path.exists(ruta_temporal):

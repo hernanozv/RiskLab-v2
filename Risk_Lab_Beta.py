@@ -31,6 +31,7 @@ import io
 import traceback
 import uuid
 import copy
+from xml.sax.saxutils import escape as _xml_escape_pdf
 
 # Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
 from log_odds_utils import (
@@ -72,6 +73,31 @@ class RiskLabRejectionFallbackWarning(UserWarning):
     clamping fuerza al cap los valores que no se pudieron remuestrear, lo que
     crea una masa puntual artificial en el cap. Indica que el cap es muy
     restrictivo para la distribucion subyacente."""
+    pass
+
+
+class RiskLabFallbackWarning(UserWarning):
+    """Fix bug #43 (QA ronda 2): se emite cuando el motor no puede generar la
+    frecuencia/severidad de un evento (error inesperado durante el muestreo)
+    y cae al fallback de asignar cero para ese evento. Antes estas alertas
+    usaban RuntimeWarning, la MISMA categoría que
+    `warnings.filterwarnings("ignore", category=RuntimeWarning)` silencia
+    globalmente para suprimir warnings internos ruidosos de numpy/scipy — lo
+    que las dejaba completamente invisibles (nunca llegaban a mostrarse, ni
+    siquiera capturándolas con `catch_warnings`) desde el arranque de la
+    aplicación. Al usar una categoría propia (heredada de UserWarning, igual
+    que las otras alertas de Risk Lab), quedan protegidas de ese filtro."""
+    pass
+
+
+class RiskLabAjusteImperfectoWarning(UserWarning):
+    """Fix bug #44 (QA ronda 2): se emite en obtener_parametros_gamma_para_poisson
+    y obtener_parametros_beta_frecuencia cuando el ajuste encontrado, aunque
+    válido, no reproduce con precisión el mínimo/más probable/máximo pedidos.
+    Esto es matemáticamente esperable: son 3 objetivos (moda + 2 cuantiles)
+    para solo 2 parámetros libres (forma/tasa), un sistema sobre-determinado
+    que en general no tiene solución exacta. La alerta es informativa, no
+    bloquea la simulación."""
     pass
 
 
@@ -278,7 +304,14 @@ def ajustar_distribuciones(losses):
 # Configuramos Seaborn y Matplotlib
 sns.set(style="whitegrid")
 
-# Ignoramos advertencias de runtime
+# Ignoramos advertencias de runtime RUIDOSAS de numpy/scipy (p.ej. "invalid
+# value encountered in divide/log" en cálculos internos ya manejados).
+# Fix bug #43 (QA ronda 2): las alertas propias de Risk Lab que avisan sobre
+# un fallback a cero por error de generación de frecuencia/severidad usaban
+# esta MISMA categoría (RuntimeWarning), quedando también silenciadas por
+# este filtro desde el arranque, sin que nadie lo notara. Esas alertas ahora
+# usan RiskLabFallbackWarning (ver clase arriba), que no es afectada por
+# este filtro.
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 def media_cola_condicional(arr, umbral):
@@ -789,43 +822,112 @@ def obtener_parametros_gamma_para_poisson(minimo, mas_probable, maximo, confianz
     
     # Convertir la confianza a percentiles para los extremos
     tail_prob = (1 - confianza) / 2
-    
-    # Función objetivo para optimización
+
+    # Función objetivo para optimización.
+    # Fix bug #44 (QA ronda 2): los términos de error se normalizan por el
+    # valor objetivo (error relativo al cuadrado, no absoluto). Antes, cuando
+    # maximo >> mas_probable (caso común: p.ej. frecuencia mínima 0.2, moda
+    # 0.5, máximo 50/año), el término max_error dominaba numéricamente por
+    # pura escala y el optimizador ignoraba la moda pedida por el usuario.
     def objective(params):
         alpha, beta = params
         if alpha <= 1 or beta <= 0:  # Restricciones para asegurar que la moda exista y sea positiva
             return 1e10
-        
+
         # La moda de Gamma es (alpha-1)/beta cuando alpha > 1
         estimated_mode = (alpha - 1) / beta
-        mode_error = (estimated_mode - mas_probable)**2
-        
+        mode_error = ((estimated_mode - mas_probable) / mas_probable)**2
+
         # Calcular los cuantiles teóricos para los extremos
         q_min = stats.gamma.ppf(tail_prob, a=alpha, scale=1/beta)
         q_max = stats.gamma.ppf(1-tail_prob, a=alpha, scale=1/beta)
-        
-        # Error en los cuantiles
-        min_error = (q_min - minimo)**2
-        max_error = (q_max - maximo)**2
-        
+
+        # Error en los cuantiles (relativo)
+        min_error = ((q_min - minimo) / minimo)**2
+        max_error = ((q_max - maximo) / maximo)**2
+
         return mode_error + min_error + max_error
-    
+
     # Estimación inicial: usar método de momentos
     mean_est = (minimo + 4*mas_probable + maximo) / 6  # Estimación de la media usando regla de PERT
     var_est = ((maximo - minimo) / 6)**2  # Estimación de la varianza
-    
+
     # Para Gamma: alpha = mean²/var, beta = mean/var
-    alpha_init = mean_est**2 / var_est if var_est > 0 else 2.0
-    beta_init = mean_est / var_est if var_est > 0 else 1.0
-    
-    # Asegurar que alpha > 1 para que la moda exista
-    alpha_init = max(alpha_init, 1.1)
-    
-    # Optimización para encontrar mejores parámetros
-    result = minimize(objective, [alpha_init, beta_init], method='Nelder-Mead', 
-                     bounds=[(1.001, None), (1e-6, None)])
-    
+    alpha_init_momentos = mean_est**2 / var_est if var_est > 0 else 2.0
+
+    # Fix bug #44: multi-arranque. Con un solo punto de partida, Nelder-Mead
+    # podía quedar atrapado en el límite inferior del bound (alpha≈1.001) sin
+    # explorar el resto del espacio de parámetros, incluso con el objetivo ya
+    # normalizado. Se prueban varios alpha_init en distintos órdenes de
+    # magnitud (cada uno con su beta_init derivado analíticamente de la moda
+    # pedida) y se conserva el resultado con menor error total.
+    candidatos_alpha_init = sorted({round(max(alpha_init_momentos, 1.1), 6), 1.1, 1.5, 2.0, 3.0, 5.0, 10.0})
+    mejor_resultado = None
+    for alpha_init in candidatos_alpha_init:
+        beta_init = max((alpha_init - 1) / mas_probable, 1e-6)
+        resultado_intento = minimize(
+            objective, [alpha_init, beta_init], method='Nelder-Mead',
+            bounds=[(1.001, None), (1e-9, None)],
+            options={'xatol': 1e-10, 'fatol': 1e-12, 'maxiter': 5000}
+        )
+        if mejor_resultado is None or resultado_intento.fun < mejor_resultado.fun:
+            mejor_resultado = resultado_intento
+    result = mejor_resultado
+
     alpha, beta = result.x
+
+    # Fix bug #44: validación de calidad del ajuste (a diferencia de
+    # obtener_parametros_lognormal/obtener_parametros_gpd, esta función nunca
+    # validaba result.success ni la calidad real del fit). Con 3 objetivos
+    # (moda + 2 cuantiles) y solo 2 parámetros libres, el sistema está
+    # sobre-determinado: un ajuste perfecto en los 3 frentes simultáneamente
+    # no siempre existe, así que el criterio de "fit razonable" no puede ser
+    # un único error muy estricto sobre la moda (eso rechazaba, en pruebas,
+    # prácticamente cualquier entrada realista). En cambio: se calcula el
+    # peor error relativo entre los 3 objetivos (recalculado a partir de los
+    # alpha/beta realmente devueltos, no del flag `result.success`: Nelder-Mead
+    # puede reportar "no convergió" por tolerancias de paso muy finas incluso
+    # cuando el punto encontrado ya es prácticamente exacto, sobre todo en
+    # escalas numéricas grandes; el error real medido sobre el resultado es
+    # una señal mucho más confiable). Solo se rechaza cuando ese peor error
+    # satura cerca del 100%, señal de que ninguna Gamma razonable puede
+    # aproximar lo pedido. Un desajuste moderado, esperable dado el
+    # sobre-ajuste, se informa con un warning en vez de bloquear al usuario.
+    moda_ajustada = (alpha - 1) / beta
+    error_relativo_moda = abs(moda_ajustada - mas_probable) / mas_probable
+    q_min_ajustado = stats.gamma.ppf(tail_prob, a=alpha, scale=1/beta)
+    q_max_ajustado = stats.gamma.ppf(1 - tail_prob, a=alpha, scale=1/beta)
+    error_relativo_min = abs(q_min_ajustado - minimo) / minimo
+    error_relativo_max = abs(q_max_ajustado - maximo) / maximo
+    peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
+
+    if peor_error > 0.98:
+        raise ValueError(
+            f"No se pudo ajustar una distribución Gamma razonable para "
+            f"mínimo={minimo:.4g}, más probable={mas_probable:.4g}, "
+            f"máximo={maximo:.4g} (confianza={confianza:.2f}). "
+            f"El mejor ajuste encontrado difiere {peor_error:.0%} del peor "
+            f"de los valores pedidos (moda: {error_relativo_moda:.0%}, "
+            f"percentil inferior: {error_relativo_min:.0%}, percentil "
+            f"superior: {error_relativo_max:.0%}). "
+            f"Verifique que los valores sean consistentes entre sí, o "
+            f"reduzca la amplitud del rango mínimo-máximo."
+        )
+
+    if peor_error > 0.30:
+        warnings.warn(
+            f"El ajuste de la distribución Gamma no reproduce con "
+            f"precisión los valores pedidos (mínimo={minimo:.4g}, más "
+            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+            f"confianza={confianza:.2f}): diferencia relativa de "
+            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+            f"en el percentil inferior y {error_relativo_max:.0%} en el "
+            f"superior. Esto ocurre porque los 3 valores son difíciles de "
+            f"conciliar simultáneamente con una distribución Gamma; "
+            f"verifique que sean coherentes entre sí.",
+            RiskLabAjusteImperfectoWarning
+        )
+
     return alpha, beta
 
 def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0.8):
@@ -861,52 +963,108 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
     factor_confianza = 1.0 / confianza if confianza > 0 else 1.25
     varianza = (rango / 6.0)**2 * factor_confianza
     
-    # Función objetivo para optimización
+    # Función objetivo para optimización.
+    # Fix bug #44 (QA ronda 2): términos de error normalizados (relativos al
+    # cuadrado) por la misma razón que en obtener_parametros_gamma_para_poisson
+    # (evitar que un término domine numéricamente solo por su escala).
     def objective(params):
         alpha, beta = params
         if alpha <= 1 or beta <= 1:  # Restricciones para asegurar que la moda exista y esté entre 0 y 1
             return 1e10
-        
+
         # La moda de Beta es (alpha-1)/(alpha+beta-2) cuando alpha, beta > 1
         estimated_mode = (alpha - 1) / (alpha + beta - 2)
-        mode_error = (estimated_mode - mas_probable)**2
-        
+        mode_error = ((estimated_mode - mas_probable) / mas_probable)**2
+
         # Calcular los cuantiles teóricos para los extremos
         q_min = stats.beta.ppf(tail_prob, alpha, beta)
         q_max = stats.beta.ppf(1-tail_prob, alpha, beta)
-        
-        # Error en los cuantiles
-        min_error = (q_min - minimo)**2
-        max_error = (q_max - maximo)**2
-        
+
+        # Error en los cuantiles (relativo; minimo puede ser 0, se usa un
+        # denominador seguro para ese caso límite documentado)
+        min_error = ((q_min - minimo) / minimo)**2 if minimo > 0 else (q_min - minimo)**2
+        max_error = ((q_max - maximo) / maximo)**2
+
         # Penalizar si los parámetros llevan a una media muy diferente de la esperada
         mean_est = alpha / (alpha + beta)
-        mean_error = (mean_est - media)**2
-        
+        mean_error = ((mean_est - media) / media)**2 if media > 0 else (mean_est - media)**2
+
         return mode_error + min_error + max_error + mean_error
-    
+
     # Estimación inicial basada en momentos
     if varianza <= 0 or not (0 < media < 1):
         # Valores por defecto razonables si los cálculos iniciales no son válidos
-        alpha_init = 2.0
-        beta_init = 2.0 * (1 - mas_probable) / mas_probable if mas_probable > 0 else 2.0
+        alpha_init_momentos = 2.0
     else:
-        # Fórmulas de momentos para Beta: 
+        # Fórmulas de momentos para Beta:
         # alpha = media * [(media*(1-media)/varianza) - 1]
-        # beta = (1-media) * [(media*(1-media)/varianza) - 1]
         temp = media * (1 - media) / varianza - 1
-        alpha_init = media * temp
-        beta_init = (1 - media) * temp
-    
-    # Asegurar que alpha, beta > 1 para que la moda exista
-    alpha_init = max(alpha_init, 1.1)
-    beta_init = max(beta_init, 1.1)
-    
-    # Optimización para encontrar mejores parámetros
-    result = minimize(objective, [alpha_init, beta_init], method='Nelder-Mead', 
-                     bounds=[(1.001, None), (1.001, None)])
-    
+        alpha_init_momentos = media * temp
+
+    # Fix bug #44: multi-arranque (ver mismo fix en la función Gamma). Cada
+    # alpha_init se combina con el beta_init que resuelve exactamente la moda
+    # pedida: mode = (a-1)/(a+b-2) => b = (a-1)/mode - a + 2.
+    candidatos_alpha_init = sorted({round(max(alpha_init_momentos, 1.1), 6), 1.1, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0})
+    mejor_resultado = None
+    for alpha_init in candidatos_alpha_init:
+        if 0 < mas_probable < 1:
+            beta_init = max((alpha_init - 1) / mas_probable - alpha_init + 2, 1.1)
+        else:
+            beta_init = 2.0
+        resultado_intento = minimize(
+            objective, [alpha_init, beta_init], method='Nelder-Mead',
+            bounds=[(1.001, None), (1.001, None)],
+            options={'xatol': 1e-10, 'fatol': 1e-12, 'maxiter': 5000}
+        )
+        if mejor_resultado is None or resultado_intento.fun < mejor_resultado.fun:
+            mejor_resultado = resultado_intento
+    result = mejor_resultado
+
     alpha, beta = result.x
+
+    # Fix bug #44: validación de calidad del ajuste (ver mismo razonamiento
+    # que en obtener_parametros_gamma_para_poisson: 3 objetivos, 2 parámetros
+    # libres, sistema sobre-determinado. Se calcula el peor error relativo,
+    # recalculado sobre los alpha/beta realmente devueltos en vez de confiar
+    # en `result.success` — ver por qué en el comentario equivalente de la
+    # función Gamma —, y solo se rechaza cuando el ajuste está realmente
+    # roto; un desajuste moderado se informa con un warning).
+    moda_ajustada = (alpha - 1) / (alpha + beta - 2)
+    error_relativo_moda = abs(moda_ajustada - mas_probable) / mas_probable
+    q_min_ajustado = stats.beta.ppf(tail_prob, alpha, beta)
+    q_max_ajustado = stats.beta.ppf(1 - tail_prob, alpha, beta)
+    error_relativo_min = (abs(q_min_ajustado - minimo) / minimo if minimo > 0
+                           else abs(q_min_ajustado - minimo))
+    error_relativo_max = abs(q_max_ajustado - maximo) / maximo
+    peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
+
+    if peor_error > 0.98:
+        raise ValueError(
+            f"No se pudo ajustar una distribución Beta razonable para "
+            f"mínimo={minimo:.4g}, más probable={mas_probable:.4g}, "
+            f"máximo={maximo:.4g} (confianza={confianza:.2f}). "
+            f"El mejor ajuste encontrado difiere {peor_error:.0%} del peor "
+            f"de los valores pedidos (moda: {error_relativo_moda:.0%}, "
+            f"percentil inferior: {error_relativo_min:.0%}, percentil "
+            f"superior: {error_relativo_max:.0%}). "
+            f"Verifique que los valores sean consistentes entre sí, o "
+            f"reduzca la amplitud del rango mínimo-máximo."
+        )
+
+    if peor_error > 0.30:
+        warnings.warn(
+            f"El ajuste de la distribución Beta no reproduce con precisión "
+            f"los valores pedidos (mínimo={minimo:.4g}, más "
+            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+            f"confianza={confianza:.2f}): diferencia relativa de "
+            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+            f"en el percentil inferior y {error_relativo_max:.0%} en el "
+            f"superior. Esto ocurre porque los 3 valores son difíciles de "
+            f"conciliar simultáneamente con una distribución Beta; "
+            f"verifique que sean coherentes entre sí.",
+            RiskLabAjusteImperfectoWarning
+        )
+
     return alpha, beta
 
 class TruncatedGPD:
@@ -1112,7 +1270,7 @@ class BetaFrequencyDistribution:
             warnings.warn(
                 f"Error al generar muestras de frecuencia Beta-Bernoulli: {str(e)}. "
                 f"Retornando ceros como fallback, pero esto puede afectar los resultados de la simulación.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Devolver un array de ceros del tamaño correcto como fallback
@@ -1166,7 +1324,7 @@ class BetaFrequencyDistribution:
         except Exception as e:
             warnings.warn(
                 f"Error al calcular PMF de Beta-Bernoulli: {str(e)}. Retornando ceros.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Valor por defecto en caso de error
@@ -1202,7 +1360,7 @@ class BetaFrequencyDistribution:
         except Exception as e:
             warnings.warn(
                 f"Error al calcular CDF de Beta-Bernoulli: {str(e)}. Retornando fallback.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Valor por defecto en caso de error
@@ -2373,12 +2531,31 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     if tiene_estocasticos:
                         # ===== MODELO ESTOCÁSTICO: Generar vector de factores por simulación =====
                         _dbg(f"[DEBUG ESTOCASTICO] Evento '{nombre_evento}' tiene factores estocásticos")
-                        
+
                         # Generar vector de factores multiplicativos (uno por simulación)
                         factores_vector = np.ones(num_simulaciones)
                         factores_severidad_vector = np.ones(num_simulaciones)  # NUEVO: vector para severidad
                         seguros_aplicables = []  # Lista de seguros a aplicar (independiente del modelo)
-                        
+
+                        # Fix bug medio #15 (QA ronda 2): para Binomial/Bernoulli/Beta
+                        # (freq_opcion 2/3/5), el factor de frecuencia se aplica más
+                        # abajo vía aplicar_factor_a_probabilidad_vec, que interpreta
+                        # el factor como un shift ADITIVO en escala log-odds
+                        # (shift = factor-1). Cuando TODOS los factores de un evento
+                        # son estáticos (rama pura, ajustar_probabilidad_por_factores
+                        # en log_odds_utils.py), esos shifts se acumulan ADITIVAMENTE
+                        # entre sí. Antes, en esta rama (evento con al menos un factor
+                        # estocástico presente), los factores estáticos se acumulaban
+                        # MULTIPLICATIVAMENTE en factores_vector junto con el
+                        # estocástico, y Σ(fi-1) ≠ Π(fi)-1 para 2+ factores estáticos:
+                        # el mismo conjunto de controles daba un resultado distinto
+                        # según hubiera o no otro factor estocástico en el evento. Para
+                        # Poisson/Poisson-Gamma (freq_opcion 1/4) el factor escala λ
+                        # directamente por multiplicación, así que ahí la acumulación
+                        # multiplicativa sigue siendo la correcta (sin cambios).
+                        freq_es_probabilidad = freq_opcion in (2, 3, 5)
+                        estatico_shift_freq = 0.0
+
                         for f in factores_activos:
                             tipo_modelo = f.get('tipo_modelo', 'estatico')
                             
@@ -2421,18 +2598,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     impacto_pct = f.get('impacto_porcentual', 0)
                                     # VALIDACIÓN: Clipear impacto para evitar factores <= 0
                                     impacto_pct = max(impacto_pct, -99)
-                                    # LIMITACIÓN CONOCIDA (no corregida): para Bernoulli/Binomial/Beta,
-                                    # los factores estáticos aquí se acumulan MULTIPLICATIVAMENTE en
-                                    # factores_vector y luego aplicar_factor_a_probabilidad_vec hace
-                                    # shift = producto(factores) - 1. En cambio, cuando TODOS los
-                                    # factores del evento son estáticos (rama pura, ver
-                                    # ajustar_probabilidad_por_factores en log_odds_utils.py), los
-                                    # shifts se acumulan ADITIVAMENTE. Σ(fi-1) ≠ Π(fi)-1 para N>1
-                                    # factores, así que el mismo conjunto de factores estáticos da un
-                                    # resultado distinto según haya o no OTRO factor estocástico en el
-                                    # mismo evento. Para Poisson/Poisson-Gamma esto no afecta el
-                                    # resultado (ambas formas de acumular coinciden al multiplicar λ).
-                                    factores_vector *= (1 + impacto_pct / 100.0)
+                                    # Fix bug medio #15: ver explicación completa arriba, junto a
+                                    # freq_es_probabilidad. Para Binomial/Bernoulli/Beta acumulamos
+                                    # el shift ADITIVAMENTE (igual que la rama pura estática);
+                                    # para Poisson/Poisson-Gamma seguimos acumulando
+                                    # multiplicativamente en factores_vector (correcto ahí).
+                                    if freq_es_probabilidad:
+                                        estatico_shift_freq += impacto_pct / 100.0
+                                    else:
+                                        factores_vector *= (1 + impacto_pct / 100.0)
                                 
                                 # Severidad: solo si afecta_severidad es True
                                 if f.get('afecta_severidad', False):
@@ -2470,8 +2644,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         impacto_sev = max(impacto_sev, -99)
                                         factores_severidad_vector *= (1 + impacto_sev / 100.0)
                         
-                        # VALIDACIÓN FINAL: Asegurar vectores en rango razonable [0.01, inf)
-                        factores_vector = np.maximum(factores_vector, 0.01)
+                        # VALIDACIÓN FINAL
+                        if freq_es_probabilidad:
+                            # Fix bug medio #15: combinar el shift aditivo de los
+                            # factores estáticos con el factor multiplicativo
+                            # estocástico. aplicar_factor_a_probabilidad_vec calcula
+                            # shift = factor-1, así que sumar el shift estático acá
+                            # (factor_efectivo = factor_estocastico + shift_estatico)
+                            # produce shift = (factor_estocastico-1) + shift_estatico,
+                            # exactamente la suma aditiva de ambos efectos en escala
+                            # log-odds. No se aplica un piso de 0.01 acá (no es un
+                            # multiplicador de tasa): la probabilidad final ya queda
+                            # acotada a [0.0001, 0.9999] más abajo, igual que en la
+                            # rama pura estática (ajustar_probabilidad_por_factores).
+                            factores_vector = factores_vector + estatico_shift_freq
+                        else:
+                            # Asegurar vector en rango razonable [0.01, inf) — es un
+                            # multiplicador directo de tasa (Poisson/Poisson-Gamma).
+                            factores_vector = np.maximum(factores_vector, 0.01)
                         factores_severidad_vector = np.maximum(factores_severidad_vector, 0.01)
                         
                         _dbg(f"[DEBUG ESTOCASTICO]   Factor frecuencia: min={factores_vector.min():.4f}, "
@@ -2685,7 +2875,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 warnings.warn(
                     f"Error al aplicar ajustes de probabilidad para evento '{evento.get('nombre', evento_id)}': {str(e)}. "
                     f"Se usará la distribución original.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
         # ====================================================================
@@ -2848,7 +3038,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}': {str(e)}. "
                         f"Asignando frecuencia cero para {len(indices_a_simular)} simulaciones. "
                         f"Esto puede afectar significativamente los resultados.",
-                        RuntimeWarning,
+                        RiskLabFallbackWarning,
                         stacklevel=2
                     )
                     # En caso de error, asignar ceros como fallback
@@ -2857,8 +3047,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         elif 'eventos_padres' in evento and evento['eventos_padres']:
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
             # Formato antiguo: usar tipo_dependencia único para todos los padres
-            eventos_padres = evento.get('eventos_padres', [])
+            eventos_padres_declarados = evento.get('eventos_padres', [])
             tipo_dependencia = evento.get('tipo_dependencia', 'AND')
+
+            # Fix bug #41 (QA ronda 2): a diferencia de la rama nueva ('vinculos',
+            # línea ~2720), esta rama legacy no filtraba id_padre inexistentes en
+            # id_a_index antes de indexar. Un vínculo legacy huérfano (p.ej. el
+            # padre fue borrado tras importar un JSON en formato antiguo, ya que
+            # la limpieza de huérfanos solo actualiza 'vinculos', no
+            # 'eventos_padres') hacía que id_a_index[padre_id] lanzara un
+            # KeyError sin capturar, abortando la simulación COMPLETA (no solo
+            # el evento afectado). Ahora se ignoran los padres inexistentes,
+            # igual que en la rama nueva.
+            eventos_padres = []
+            for padre_id in eventos_padres_declarados:
+                if padre_id not in id_a_index:
+                    _dbg(f"[DEBUG] eventos_padres (legacy): id_padre {padre_id} no encontrado en id_a_index, se ignora")
+                    continue
+                eventos_padres.append(padre_id)
 
             if eventos_padres:
                 # Verificar condiciones según tipo de dependencia
@@ -2933,7 +3139,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (formato antiguo): {str(e)}. "
                             f"Asignando frecuencia cero para {len(indices_a_simular)} simulaciones. "
                             f"Esto puede afectar significativamente los resultados.",
-                            RuntimeWarning,
+                            RiskLabFallbackWarning,
                             stacklevel=2
                         )
                         # En caso de error, asignar ceros como fallback
@@ -2989,7 +3195,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     warnings.warn(
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin padres): {str(e)}. "
                         f"Asignando frecuencia cero. Esto puede afectar significativamente los resultados.",
-                        RuntimeWarning,
+                        RiskLabFallbackWarning,
                         stacklevel=2
                     )
                     muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
@@ -3045,7 +3251,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 warnings.warn(
                     f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin dependencias): {str(e)}. "
                     f"Asignando frecuencia cero. Esto puede afectar significativamente los resultados.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
                 muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
@@ -3186,13 +3392,31 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         factor_max = max(1.0, float(evento.get('sev_freq_factor_max', 5.0)))
 
                         if tipo_esc == 'tabla':
+                            # Fix bug medio #13 (QA ronda 2): sev_freq_factor_max está
+                            # documentado como el cap del modelo "reincidencia" en
+                            # general (no solo lineal/exponencial), y la UI siempre
+                            # muestra el texto "..., máx ×{factor_max}" sin importar el
+                            # tipo de escalamiento elegido — incluyendo "tabla". Sin
+                            # aplicar este cap acá, ese texto era engañoso: un
+                            # multiplicador de tabla más alto que factor_max se usaba
+                            # sin capear, a diferencia de lineal/exponencial (que sí
+                            # respetan el cap mostrado en pantalla).
                             tabla = evento.get('sev_freq_tabla', [])
                             if tabla:
-                                _multiplicadores = _aplicar_tabla_escalamiento(_occurrence_idx, tabla)
+                                _multiplicadores = np.minimum(
+                                    _aplicar_tabla_escalamiento(_occurrence_idx, tabla), factor_max
+                                )
                             else:
                                 _multiplicadores = np.ones(len(_occurrence_idx))
                         elif tipo_esc == 'exponencial':
-                            base = float(evento.get('sev_freq_base', 1.5))
+                            # Fix bug #49 (QA ronda 2, alto #6): sev_freq_base documentado
+                            # como > 1.0 (mismo patrón que sev_freq_paso/sev_freq_factor_max).
+                            # Sin este piso: base<1 hacia que el multiplicador DISMINUYERA con
+                            # la reincidencia (invirtiendo la severidad en vez de escalarla);
+                            # base=0 anulaba (multiplicador=0) todas las ocurrencias desde la
+                            # 2da en adelante; base negativo producia signo alternante segun
+                            # la paridad del indice de ocurrencia (comportamiento erratico).
+                            base = max(1.0, float(evento.get('sev_freq_base', 1.5)))
                             max_exp = np.log(factor_max) / np.log(base) if base > 1 else 100
                             safe_exponents = np.minimum(_occurrence_idx - 1, max_exp)
                             _multiplicadores = base ** safe_exponents
@@ -3221,7 +3445,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     elif sev_freq_modelo == 'sistemico':
                         alpha = float(evento.get('sev_freq_alpha', 0.5))
                         solo_aumento = evento.get('sev_freq_solo_aumento', True)
-                        factor_max = float(evento.get('sev_freq_sistemico_factor_max', 3.0))
+                        # Fix bug #42 (QA ronda 2): documentado como > 1.0 (es el
+                        # multiplicador MÁXIMO; np.clip usa 1/factor_max como
+                        # mínimo, así que requiere factor_max >= 1 para que el
+                        # rango [1/factor_max, factor_max] tenga sentido). Sin
+                        # este piso: factor_max=0 producía ZeroDivisionError
+                        # (capturado en silencio por el except genérico de más
+                        # abajo, poniendo las pérdidas del evento en 0 sin
+                        # aviso); factor_max entre 0 y 1 invertía el rango de
+                        # np.clip (a_min > a_max) forzando TODAS las
+                        # simulaciones al mismo multiplicador reducido, sin
+                        # importar la frecuencia real; factor_max negativo
+                        # producía severidades negativas.
+                        factor_max = max(1.0, float(evento.get('sev_freq_sistemico_factor_max', 3.0)))
                         freq_mean = final_event_frequencies.mean()
                         freq_std = final_event_frequencies.std()
                         
@@ -3391,7 +3627,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     f"Error INESPERADO al generar/asignar severidad para evento '{nombre_evento}': {str(e)}. "
                     f"Las pérdidas para este evento se establecerán en 0. "
                     f"Esto afectará significativamente los resultados de la simulación.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
 
@@ -4934,6 +5170,19 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 evento['vinculos'] = [
                     v for v in evento['vinculos']
                     if v.get('id_padre') not in ids_eliminados
+                ]
+            # Fix bug #41 (QA ronda 2): esta limpieza solo cubría 'vinculos'
+            # (formato nuevo), nunca 'eventos_padres' (formato legacy, usado por
+            # eventos importados de JSON antiguo antes de la auto-conversión).
+            # Un evento legacy quedaba con un id_padre apuntando a un evento ya
+            # borrado, lo cual el motor de simulación no filtraba (ver fix en
+            # generar_lda_con_secuencialidad) y podía volver a producir un
+            # KeyError si esa protección llegara a fallar o cambiar. Se limpia
+            # aquí también, por consistencia y defensa en profundidad.
+            if 'eventos_padres' in evento and evento['eventos_padres']:
+                evento['eventos_padres'] = [
+                    padre_id for padre_id in evento['eventos_padres']
+                    if padre_id not in ids_eliminados
                 ]
 
     def reconstruir_checkboxes_eventos(self):
@@ -8001,7 +8250,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     umbral_superior = np.percentile(perdidas_totales, margen_superior)
                     mascara = (perdidas_totales >= umbral_inferior) & (perdidas_totales <= umbral_superior)
                     indices_percentil = np.where(mascara)[0]
-                
+
+                # Fix bug alto #8 (QA ronda 2): misma recurrencia del bug de
+                # CVaR/media_cola_condicional ya corregida en
+                # _build_marginal_contribution (export IA, Ronda 1). Cuando hay
+                # una masa puntual grande en 0 (la mayoría de los años sin
+                # pérdida), el límite inferior de la ventana puede caer dentro
+                # de esa masa, haciendo que la máscara incluya TODAS las
+                # simulaciones en cero (no solo las cercanas al percentil
+                # objetivo) y colapsando la "contribución en P99" a la
+                # contribución promedio general. Si el percentil objetivo es
+                # estrictamente positivo, excluimos del rango las simulaciones
+                # en cero (no son parte de la cola real).
+                if valor_percentil > 0:
+                    indices_percentil = indices_percentil[perdidas_totales[indices_percentil] > 0]
+
                 # 4. Calcular contribución promedio de cada evento en esas simulaciones
                 for idx, perdidas_evento in enumerate(perdidas_por_evento):
                     if len(indices_percentil) > 0:
@@ -8017,7 +8280,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             # Limpiar el eje actual
             ax = self.ax_contribucion
             ax.clear()
-            
+            # Fix bug alto #11 (QA ronda 2): limpiar los tooltips de la
+            # llamada anterior. add_tooltip_data solo agrega datos, nunca
+            # reemplaza; sin este clear, los tooltips quedaban con los
+            # valores del percentil anteriormente seleccionado, desalineados
+            # con las barras recién dibujadas.
+            self.canvas_contribucion.clear_tooltip_data(ax)
+
             # Filtrar eventos sin contribución
             if not any(c > 0 for c in contribuciones):
                 ax.text(0.5, 0.5, "No hay contribuciones para mostrar",
@@ -8092,9 +8361,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Añadir línea vertical para la media de contribuciones
             mean_contrib = tornado_df['Contribución'].mean()
-            ax.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
+            ax.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7,
                       label=f'Media: {currency_format(mean_contrib)}')
-            
+
+            # Fix bug alto #11 (QA ronda 2): registrar tooltips para las
+            # barras recién dibujadas (antes nunca se llamaba a
+            # add_tooltip_data acá, así que el usuario veía las barras de
+            # "P99" pero el tooltip seguía mostrando los valores de "Media"
+            # de la primera vez que se dibujó el gráfico).
+            for i, (bar, evento, valor, porcentaje) in enumerate(zip(bars,
+                                                    tornado_df['Evento de Riesgo'],
+                                                    tornado_df['Contribución'],
+                                                    tornado_df['Porcentaje'])):
+                y_pos = bar.get_y() + bar.get_height() / 2
+                tooltip_label = f"{evento}\nContribución: {currency_format(valor)}\nPorcentaje: {porcentaje:.2f}%"
+                if i == num_eventos - 1:
+                    color = MELI_AMARILLO
+                elif i == num_eventos - 2:
+                    color = MELI_AZUL_CORP
+                elif i == 0 and 'Otros eventos' in str(evento):
+                    color = '#CCCCCC'
+                else:
+                    color = None
+                self.canvas_contribucion.add_tooltip_data(ax, [valor], [y_pos],
+                                     labels=[tooltip_label],
+                                     highlight_color=color)
+
+            media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
+            y_mid = len(tornado_df) / 2
+            self.canvas_contribucion.add_tooltip_data(ax, [mean_contrib], [y_mid],
+                                 labels=[media_tooltip],
+                                 highlight_color=MELI_ROJO)
+
             # Resumen de contribuciones
             total_contrib = tornado_df['Contribución'].sum()
             top3_contrib = tornado_df.nlargest(3, 'Contribución')['Contribución'].sum()
@@ -9333,8 +9631,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             tipo_combo.currentTextChanged.connect(on_tipo_changed_dialog)
 
             # Probabilidad de activación del vínculo
+            # Fix bug alto #9 (QA ronda 2): usar NoScrollSpinBox/
+            # NoScrollDoubleSpinBox (ya definidas en el proyecto para este
+            # propósito) en vez de QSpinBox/QDoubleSpinBox crudos. Sin esto,
+            # un scroll del mouse sin clic sobre el spinbox cambia su valor
+            # y lo persiste silenciosamente.
             sel_layout.addWidget(QtWidgets.QLabel("Probabilidad de activación (%):"))
-            prob_spinbox = QtWidgets.QSpinBox()
+            prob_spinbox = NoScrollSpinBox()
             prob_spinbox.setRange(1, 100)
             prob_spinbox.setValue(100)
             prob_spinbox.setSuffix("%")
@@ -9343,7 +9646,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             # Factor de severidad condicional
             sel_layout.addWidget(QtWidgets.QLabel("Factor de severidad:"))
-            factor_sev_spinbox = QtWidgets.QDoubleSpinBox()
+            factor_sev_spinbox = NoScrollDoubleSpinBox()
             factor_sev_spinbox.setRange(0.10, 5.00)
             factor_sev_spinbox.setValue(1.00)
             factor_sev_spinbox.setSingleStep(0.01)
@@ -9354,7 +9657,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             # Umbral de severidad del padre
             sel_layout.addWidget(QtWidgets.QLabel("Umbral de severidad del padre ($):"))
-            umbral_sev_spinbox = QtWidgets.QSpinBox()
+            umbral_sev_spinbox = NoScrollSpinBox()
             umbral_sev_spinbox.setRange(0, 999999999)
             umbral_sev_spinbox.setValue(0)
             umbral_sev_spinbox.setSingleStep(1000)
@@ -9422,9 +9725,32 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 1, tipo_combo)
 
                 # Spinbox para probabilidad de activación
-                prob_spin = QtWidgets.QSpinBox()
+                # Fix bug alto #9 (QA ronda 2): NoScrollSpinBox/
+                # NoScrollDoubleSpinBox en vez de QSpinBox/QDoubleSpinBox
+                # crudos (ver mismo fix arriba, en el diálogo de agregar
+                # vínculo). Estos spinboxes viven embebidos en una tabla
+                # scrolleable: sin esto, scrollear la tabla con el mouse
+                # sobre una celda cambia su valor sin que el usuario haga
+                # clic, y el cambio se persiste silenciosamente.
+                # Fix bug medio #16 (QA ronda 2): setValue() clipea el valor
+                # MOSTRADO al rango del spinbox, pero como .connect() se
+                # llama DESPUÉS de .setValue() acá abajo, ese clampeo inicial
+                # nunca disparaba valueChanged (todavía no había nada
+                # conectado) y por lo tanto nunca sincronizaba de vuelta
+                # vinculos_existentes[idx]. Si un vínculo traía un valor
+                # fuera de rango (p.ej. importado de un JSON con
+                # probabilidad=150), la UI mostraba el valor clampeado
+                # (100%) pero el dato real en memoria seguía siendo 150
+                # hasta que el usuario tocaba el control — y si guardaba sin
+                # tocarlo, se persistía el valor NO mostrado (150), no el
+                # que el usuario vio en pantalla. Ahora se escribe el valor
+                # clampeado de vuelta al dict inmediatamente, sin depender
+                # del orden de conexión de señales.
+                prob_clampeada = max(1, min(100, vinculo.get('probabilidad', 100)))
+                vinculo['probabilidad'] = prob_clampeada
+                prob_spin = NoScrollSpinBox()
                 prob_spin.setRange(1, 100)
-                prob_spin.setValue(max(1, min(100, vinculo.get('probabilidad', 100))))
+                prob_spin.setValue(prob_clampeada)
                 prob_spin.setSuffix("%")
                 prob_spin.setFixedHeight(30)
                 prob_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
@@ -9432,9 +9758,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 2, prob_spin)
 
                 # DoubleSpinbox para factor de severidad
-                factor_sev_spin = QtWidgets.QDoubleSpinBox()
+                factor_sev_clampeado = max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0)))
+                vinculo['factor_severidad'] = factor_sev_clampeado
+                factor_sev_spin = NoScrollDoubleSpinBox()
                 factor_sev_spin.setRange(0.10, 5.00)
-                factor_sev_spin.setValue(max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0))))
+                factor_sev_spin.setValue(factor_sev_clampeado)
                 factor_sev_spin.setSingleStep(0.01)
                 factor_sev_spin.setDecimals(2)
                 factor_sev_spin.setSuffix("x")
@@ -9445,12 +9773,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 if vinculo['tipo'] == 'EXCLUYE':
                     factor_sev_spin.setEnabled(False)
                     factor_sev_spin.setValue(1.00)
+                    vinculo['factor_severidad'] = 1.00
                 vinculos_table.setCellWidget(idx, 3, factor_sev_spin)
 
                 # Spinbox para umbral de severidad del padre
-                umbral_spin = QtWidgets.QSpinBox()
+                umbral_clampeado = max(0, vinculo.get('umbral_severidad', 0))
+                vinculo['umbral_severidad'] = umbral_clampeado
+                umbral_spin = NoScrollSpinBox()
                 umbral_spin.setRange(0, 999999999)
-                umbral_spin.setValue(max(0, vinculo.get('umbral_severidad', 0)))
+                umbral_spin.setValue(umbral_clampeado)
                 umbral_spin.setSingleStep(1000)
                 umbral_spin.setPrefix("$")
                 umbral_spin.setFixedHeight(30)
@@ -9518,91 +9849,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # ====================================================================
         
         # Función helper para normalizar factores (migración automática de formato legacy)
-        def normalizar_factor(factor):
-            """Asegura que el factor tenga todos los campos necesarios (backward compatibility)"""
-            factor_norm = factor.copy()
-            
-            # Si no tiene tipo_modelo, es formato legacy → migrar a estático
-            if 'tipo_modelo' not in factor_norm:
-                factor_norm['tipo_modelo'] = 'estatico'
-            
-            # Asegurar campos para modelo estático
-            if 'impacto_porcentual' not in factor_norm:
-                factor_norm['impacto_porcentual'] = 0
-            
-            # Asegurar campos para modelo estocástico (valores por defecto)
-            if 'confiabilidad' not in factor_norm:
-                # Si migra de estático, usar 100% confiabilidad
-                factor_norm['confiabilidad'] = 100
-            
-            if 'reduccion_efectiva' not in factor_norm:
-                # Usar el valor absoluto del impacto como reducción efectiva
-                factor_norm['reduccion_efectiva'] = abs(factor_norm.get('impacto_porcentual', 0))
-            
-            if 'reduccion_fallo' not in factor_norm:
-                # Por defecto, sin reducción cuando falla
-                factor_norm['reduccion_fallo'] = 0
-            
-            # Asegurar campo activo
-            if 'activo' not in factor_norm:
-                factor_norm['activo'] = True
-            
-            # ====================================================================
-            # NUEVOS CAMPOS: Impacto en frecuencia y severidad (backward compatible)
-            # ====================================================================
-            
-            # afecta_frecuencia: True por defecto si impacto_porcentual != 0 (backward compat)
-            if 'afecta_frecuencia' not in factor_norm:
-                factor_norm['afecta_frecuencia'] = factor_norm.get('impacto_porcentual', 0) != 0
-            
-            # afecta_severidad: False por defecto para mantener comportamiento existente
-            if 'afecta_severidad' not in factor_norm:
-                factor_norm['afecta_severidad'] = False
-            
-            # Para modelo ESTÁTICO: impacto porcentual en severidad
-            if 'impacto_severidad_pct' not in factor_norm:
-                factor_norm['impacto_severidad_pct'] = 0
-            
-            # Para modelo ESTOCÁSTICO: reducción de severidad cuando funciona/falla
-            if 'reduccion_severidad_efectiva' not in factor_norm:
-                factor_norm['reduccion_severidad_efectiva'] = 0
-            
-            if 'reduccion_severidad_fallo' not in factor_norm:
-                factor_norm['reduccion_severidad_fallo'] = 0
-            
-            # ================================================================
-            # MODELO DE SEGURO/TRANSFERENCIA (para severidad)
-            # ================================================================
-            # tipo_severidad: 'porcentual' (default) o 'seguro'
-            if 'tipo_severidad' not in factor_norm:
-                factor_norm['tipo_severidad'] = 'porcentual'
-            
-            # Campos de seguro (solo usados si tipo_severidad == 'seguro')
-            if 'seguro_deducible' not in factor_norm:
-                factor_norm['seguro_deducible'] = 0
-            
-            if 'seguro_cobertura_pct' not in factor_norm:
-                factor_norm['seguro_cobertura_pct'] = 100
-            
-            if 'seguro_limite' not in factor_norm:
-                factor_norm['seguro_limite'] = 0  # 0 = sin límite agregado
-            
-            # NUEVO: Tipo de deducible - 'agregado' o 'por_ocurrencia'
-            if 'seguro_tipo_deducible' not in factor_norm:
-                factor_norm['seguro_tipo_deducible'] = 'agregado'
-            
-            # NUEVO: Límite por ocurrencia
-            if 'seguro_limite_ocurrencia' not in factor_norm:
-                factor_norm['seguro_limite_ocurrencia'] = 0
-            
-            return factor_norm
-        
-        # Cargar factores de ajuste existentes desde el evento
+        # Cargar factores de ajuste existentes desde el evento.
+        # Fix bug bajo #21 (QA ronda 2): antes había una copia LOCAL de
+        # normalizar_factor duplicando (y desincronizada de)
+        # normalizar_factor_global — a diferencia de la versión canónica, la
+        # copia local no clipeaba impacto_porcentual/reduccion_efectiva/
+        # confiabilidad a rangos válidos. No era explotable hoy porque los
+        # spinboxes de la UI ya clipean al mostrar, pero era una trampa de
+        # mantenimiento (dos implementaciones que podían divergir en
+        # silencio). Se usa la misma función canónica que ya usan el editor
+        # de escenario y el import de JSON.
         factores_ajuste_existentes = []
         if evento_data and 'factores_ajuste' in evento_data:
             # Cargar y normalizar factores (migración automática)
             factores_raw = copy.deepcopy(evento_data['factores_ajuste'])
-            factores_ajuste_existentes = [normalizar_factor(f) for f in factores_raw]
+            factores_ajuste_existentes = [normalizar_factor_global(f) for f in factores_raw]
             
             # DEBUG: Verificar que los factores se cargaron
             if factores_ajuste_existentes:
@@ -9732,12 +9993,23 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     prob_ajustada_label.setText("")
                     return
                 
-                # Calcular factor multiplicativo total
+                # Calcular factor multiplicativo total.
+                # Fix bug alto #7 (QA ronda 2): el motor real (modelo estático,
+                # ver más arriba en generar_lda_con_secuencialidad) clipea cada
+                # impacto individual a >= -99% y el factor_multiplicativo final
+                # a >= 0.01 (mínimo 1% de la frecuencia original). Este preview
+                # no aplicaba ninguno de los dos: con 3 controles de -99% cada
+                # uno, el factor real da (1-0.99)^3=1e-6 sin clipear, pero el
+                # motor lo clipea a 0.01 antes de usarlo — el preview mostraba
+                # una frecuencia ajustada 10.000 veces menor a la que el motor
+                # realmente simula.
                 factor_multiplicativo = 1.0
                 for f in factores_activos:
                     impacto_pct = f.get('impacto_porcentual', 0)
+                    impacto_pct = max(impacto_pct, -99)
                     factor_multiplicativo *= (1 + impacto_pct / 100.0)
-                
+                factor_multiplicativo = max(factor_multiplicativo, 0.01)
+
                 # Obtener tipo de distribución de frecuencia
                 freq_opcion = freq_combobox.currentIndex() + 1
                 tipo_dist_nombres = ['Poisson', 'Binomial', 'Bernoulli', 'Poisson-Gamma', 'Beta']
@@ -11281,28 +11553,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_actualizados = []
                 for vinculo in evento_nuevo.get('vinculos', []):
                     padre_id = vinculo['id_padre']
-                    tipo = vinculo['tipo']
-                    prob = vinculo.get('probabilidad', 100)
-                    fsev = vinculo.get('factor_severidad', 1.0)
-                    umbral = vinculo.get('umbral_severidad', 0)
-                    # Si el evento padre fue duplicado, usamos el nuevo ID
-                    if padre_id in id_original_a_nuevo:
-                        vinculos_actualizados.append({
-                            'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
-                    else:
-                        # Si no, mantenemos el ID original
-                        vinculos_actualizados.append({
-                            'id_padre': padre_id,
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
+                    # Fix bug medio #14 (QA ronda 2): partir de una copia del
+                    # vínculo original (no de un dict nuevo con solo 5 claves
+                    # fijas) para preservar cualquier clave desconocida/futura,
+                    # igual que ya se corrigió para el import JSON (bug #39
+                    # de la Ronda 1) pero nunca se aplicó a esta ruta de
+                    # duplicación de eventos.
+                    nuevo_padre_id = id_original_a_nuevo.get(padre_id, padre_id)
+                    vinculo_actualizado = dict(vinculo)
+                    vinculo_actualizado['id_padre'] = nuevo_padre_id
+                    vinculos_actualizados.append(vinculo_actualizado)
                 evento_nuevo['vinculos'] = vinculos_actualizados
 
             # Compatibilidad con formato antiguo
@@ -11736,25 +11996,46 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Crear un set con los IDs de eventos activos para filtrar vínculos
             ids_eventos_activos = {e['id'] for e in eventos_activos}
-            
+
             # Filtrar vínculos: eliminar vínculos que apuntan a eventos inactivos
+            # Fix bug medio #17 (QA ronda 2): antes, cuando un vínculo apuntaba a
+            # un evento padre desactivado (ya sea en la pestaña Simulación o
+            # dentro de un Escenario, que reutiliza este mismo flujo), el aviso
+            # de que ese vínculo se ignoraría era solo un print() a consola —
+            # invisible en un build de producción con consola oculta. El
+            # usuario no tenía forma de saber que su evento hijo pasaba a
+            # comportarse como independiente. Se recolectan los eventos
+            # afectados y se muestra un aviso visible en la UI.
+            eventos_con_vinculos_ignorados = []
             for evento in eventos_activos:
                 if 'vinculos' in evento and evento['vinculos']:
                     # Guardar cantidad original para el reporte
                     vinculos_originales = len(evento['vinculos'])
-                    
+
                     # Mantener solo vínculos cuyos padres están activos
                     vinculos_validos = [
-                        v for v in evento['vinculos'] 
+                        v for v in evento['vinculos']
                         if v.get('id_padre') in ids_eventos_activos
                     ]
                     evento['vinculos'] = vinculos_validos
-                    
+
                     # Informar si se filtraron vínculos
                     vinculos_filtrados = vinculos_originales - len(vinculos_validos)
                     if vinculos_filtrados > 0:
-                        print(f"[DEBUG] Evento '{evento['nombre']}': se ignoraron {vinculos_filtrados} vínculo(s) a eventos inactivos")
-            
+                        eventos_con_vinculos_ignorados.append((evento['nombre'], vinculos_filtrados))
+
+            if eventos_con_vinculos_ignorados:
+                detalle = "\n".join(
+                    f"• {nombre}: {n} vínculo(s) ignorado(s)"
+                    for nombre, n in eventos_con_vinculos_ignorados
+                )
+                QtWidgets.QMessageBox.warning(
+                    self, "Vínculos ignorados",
+                    "Algunos vínculos apuntan a eventos padre desactivados y se "
+                    "ignorarán en esta simulación (el evento hijo se comportará "
+                    "como independiente para ese vínculo):\n\n" + detalle
+                )
+
             # Mostrar información en status bar
             total_eventos = len(eventos)
             activos_count = len(eventos_activos)
@@ -13673,7 +13954,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             raise ValueError("El número de eventos (n) no puede estar vacío.")
                         if not p_var.text().strip():
                             raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
-                        n = int(n_var.text())
+                        # Fix bug bajo #22 (QA ronda 2): int(float(...)) en vez de
+                        # int(...) crudo, igual que el diálogo principal
+                        # (guardar_evento). El campo se precarga con
+                        # str(evento.get('num_eventos')): si ese valor fue
+                        # guardado como float (p.ej. 5.0), el texto queda "5.0"
+                        # y int("5.0") lanza ValueError, mientras que
+                        # int(float("5.0")) funciona correctamente.
+                        n = int(float(n_var.text()))
                         p = float(p_var.text())
                         if n <= 0:
                             raise ValueError("El número de eventos (n) debe ser mayor que cero.")
@@ -14097,28 +14385,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_actualizados = []
                 for vinculo in evento.get('vinculos', []):
                     padre_id = vinculo['id_padre']
-                    tipo = vinculo['tipo']
-                    prob = vinculo.get('probabilidad', 100)
-                    fsev = vinculo.get('factor_severidad', 1.0)
-                    umbral = vinculo.get('umbral_severidad', 0)
-                    # Si el evento padre fue duplicado, usamos el nuevo ID
-                    if padre_id in id_original_a_nuevo:
-                        vinculos_actualizados.append({
-                            'id_padre': id_original_a_nuevo[padre_id],
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
-                    else:
-                        # Si no, mantenemos el ID original
-                        vinculos_actualizados.append({
-                            'id_padre': padre_id,
-                            'tipo': tipo,
-                            'probabilidad': prob,
-                            'factor_severidad': fsev,
-                            'umbral_severidad': umbral
-                        })
+                    # Fix bug medio #14 (QA ronda 2): ver mismo fix en
+                    # duplicar_eventos — copiar el vínculo original en vez de
+                    # reconstruirlo con solo 5 claves fijas, para no
+                    # descartar claves desconocidas/futuras.
+                    nuevo_padre_id = id_original_a_nuevo.get(padre_id, padre_id)
+                    vinculo_actualizado = dict(vinculo)
+                    vinculo_actualizado['id_padre'] = nuevo_padre_id
+                    vinculos_actualizados.append(vinculo_actualizado)
                 evento['vinculos'] = vinculos_actualizados
 
             # Compatibilidad con formato antiguo
@@ -15556,195 +15830,202 @@ class RiskLabApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # Gráfico 7: Gráfico de Tornado - Contribución de Eventos de Riesgo
-            contribuciones = []
-            nombres_eventos = []
-            for idx, perdidas_evento in enumerate(perdidas_por_evento):
-                contribucion = np.mean(perdidas_evento)
-                contribuciones.append(contribucion)
-                nombre_evento = eventos_riesgo[idx]['nombre']
-                nombres_eventos.append(nombre_evento)
+        # Gráfico 7: Gráfico de Tornado - Contribución de Eventos de Riesgo
+        # Fix bug #40 (QA ronda 2): este bloque estaba indentado un nivel de más,
+        # anidado dentro del "if datos_plot:" del Gráfico 6. datos_plot solo se
+        # pone en True si ALGÚN evento tiene std>0 (severidad no determinista);
+        # con eventos de severidad fija (multa regulatoria, monto constante), la
+        # pestaña "Contribución" desaparecía por completo aunque las
+        # contribuciones fueran > 0. Ahora es un bloque independiente, igual que
+        # en la versión legacy (generar_figuras).
+        contribuciones = []
+        nombres_eventos = []
+        for idx, perdidas_evento in enumerate(perdidas_por_evento):
+            contribucion = np.mean(perdidas_evento)
+            contribuciones.append(contribucion)
+            nombre_evento = eventos_riesgo[idx]['nombre']
+            nombres_eventos.append(nombre_evento)
 
-            if any(c > 0 for c in contribuciones):
-                fig7 = Figure(figsize=(9, 6))  # Tamño optimizado para mejor visualización
-                canvas7 = InteractiveFigureCanvas(fig7)
-                ax7 = fig7.add_subplot(111)
-                tornado_df = pd.DataFrame({
-                    'Evento de Riesgo': nombres_eventos,
-                    'Contribución Promedio': contribuciones
-                })
-                tornado_df = tornado_df[tornado_df['Contribución Promedio'] > 0]
-                tornado_df['Porcentaje'] = (tornado_df['Contribución Promedio'] / tornado_df['Contribución Promedio'].sum()) * 100
+        if any(c > 0 for c in contribuciones):
+            fig7 = Figure(figsize=(9, 6))  # Tamño optimizado para mejor visualización
+            canvas7 = InteractiveFigureCanvas(fig7)
+            ax7 = fig7.add_subplot(111)
+            tornado_df = pd.DataFrame({
+                'Evento de Riesgo': nombres_eventos,
+                'Contribución Promedio': contribuciones
+            })
+            tornado_df = tornado_df[tornado_df['Contribución Promedio'] > 0]
+            tornado_df['Porcentaje'] = (tornado_df['Contribución Promedio'] / tornado_df['Contribución Promedio'].sum()) * 100
+            
+            # Ordenar para el gráfico de tornado (ascendente para barras horizontales)
+            tornado_df.sort_values('Contribución Promedio', inplace=True, ascending=True)
+            
+            # Limitar a los 10 eventos más significativos si hay demasiados
+            if len(tornado_df) > 10:
+                top_eventos = tornado_df.tail(10).copy()
+                otros_eventos = tornado_df.head(len(tornado_df)-10)
+                suma_otros = {
+                    'Evento de Riesgo': f'Otros eventos ({len(otros_eventos)})',
+                    'Contribución Promedio': otros_eventos['Contribución Promedio'].sum(),
+                    'Porcentaje': otros_eventos['Porcentaje'].sum()
+                }
+                tornado_df = pd.concat([pd.DataFrame([suma_otros]), top_eventos])
+                tornado_df.reset_index(drop=True, inplace=True)
+            
+            # Crear degradado de colores desde amarillo (MercadoLibre) hasta azul
+            num_eventos = len(tornado_df)
+            colores_eventos = []
+            
+            for i in range(num_eventos):
+                if i == num_eventos - 1:  # El evento más importante
+                    colores_eventos.append(MELI_AMARILLO)  # Amarillo MercadoLibre para evento principal
+                elif i == num_eventos - 2:  # Segundo evento más importante
+                    colores_eventos.append(MELI_AZUL_CORP)  # Azul corporativo
+                elif i == 0 and 'Otros eventos' in tornado_df.iloc[0]['Evento de Riesgo']:
+                    colores_eventos.append('#CCCCCC')  # Gris para los eventos agrupados
+                else:
+                    # Mezcla entre azul y amarillo MELI con una proporción adecuada
+                    ratio = i / (num_eventos - 1)
+                    colores_eventos.append(f'#{blend_colors(MELI_AZUL, MELI_AMARILLO, ratio)}')
+            
+            # Crear las barras horizontales con colores personalizados MercadoLibre
+            bars = ax7.barh(tornado_df['Evento de Riesgo'], 
+                          tornado_df['Contribución Promedio'], 
+                          color=colores_eventos, 
+                          edgecolor='white', 
+                          alpha=0.85,
+                          height=0.65)  # Altura para mejor visualización
+            
+            # Añadir etiquetas con valor y porcentaje
+            for i, (bar, valor, porcentaje, nombre) in enumerate(zip(bars, 
+                                                    tornado_df['Contribución Promedio'],
+                                                    tornado_df['Porcentaje'],
+                                                    tornado_df['Evento de Riesgo'])):
+                width = bar.get_width()
+                label_x_pos = width * 1.01
                 
-                # Ordenar para el gráfico de tornado (ascendente para barras horizontales)
-                tornado_df.sort_values('Contribución Promedio', inplace=True, ascending=True)
+                # Optimización de etiquetas para evitar sobrecargar el gráfico
+                if porcentaje >= 1.0:  # Solo mostrar porcentaje si es significativo
+                    label_text = f"{currency_format(valor)} ({porcentaje:.1f}%)"
+                else:
+                    label_text = f"{currency_format(valor)}"
                 
-                # Limitar a los 10 eventos más significativos si hay demasiados
-                if len(tornado_df) > 10:
-                    top_eventos = tornado_df.tail(10).copy()
-                    otros_eventos = tornado_df.head(len(tornado_df)-10)
-                    suma_otros = {
-                        'Evento de Riesgo': f'Otros eventos ({len(otros_eventos)})',
-                        'Contribución Promedio': otros_eventos['Contribución Promedio'].sum(),
-                        'Porcentaje': otros_eventos['Porcentaje'].sum()
-                    }
-                    tornado_df = pd.concat([pd.DataFrame([suma_otros]), top_eventos])
-                    tornado_df.reset_index(drop=True, inplace=True)
+                # Etiqueta con fondo blanco para mejor legibilidad
+                ax7.text(label_x_pos, 
+                       bar.get_y() + bar.get_height()/2, 
+                       label_text, 
+                       va='center',
+                       fontsize=8,
+                       fontweight='bold' if i >= num_eventos - 3 else 'normal', 
+                       bbox=dict(facecolor='white', alpha=0.9, edgecolor=None))
+            
+            # Añadir línea vertical para la media con estilo MELI
+            mean_contrib = tornado_df['Contribución Promedio'].mean()
+            ax7.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
+                      label=f'Media: {currency_format(mean_contrib)}')
+            
+            # Resumen de contribuciones para referencia rápida
+            total_contrib = tornado_df['Contribución Promedio'].sum()
+            top3_contrib = tornado_df.nlargest(3, 'Contribución Promedio')['Contribución Promedio'].sum()
+            top3_pct = (top3_contrib / total_contrib) * 100
+            
+            # Añadir texto resumen en esquina superior izquierda
+            resumen_text = f"Total: {currency_format(total_contrib)}\nTop 3: {top3_pct:.0f}%"
+            ax7.text(0.02, 0.97, resumen_text, transform=ax7.transAxes, 
+                    fontsize=8, va='top', ha='left',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
+            
+            # Título y etiquetas mejoradas
+            ax7.set_title('Contribución por Evento de Riesgo')
+            ax7.set_xlabel('Contribución a la Pérdida Media ($)')
+            ax7.set_ylabel('Evento de Riesgo')
+            
+            # Formatear el eje X para moneda
+            ax7.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
+            
+            # Aplicar estilo MercadoLibre global
+            aplicar_estilo_meli(ax7, tipo='barh')
+            
+            # Añadir grid horizontal sutil
+            ax7.grid(axis='x', linestyle='--', alpha=0.3)
+            
+            # Añadir leyenda con estilo depurado
+            ax7.legend(loc='lower right', fontsize=8, framealpha=0.9)
+            
+            # Asegurar que haya suficiente espacio para las etiquetas
+            fig7.tight_layout()
+            
+            # Configurar tooltips para el gráfico de tornado
+            # Para cada barra del tornado, crear un tooltip con información detallada
+            for i, (bar, evento, contribucion, porcentaje) in enumerate(zip(bars, 
+                                                         tornado_df['Evento de Riesgo'],
+                                                         tornado_df['Contribución Promedio'],
+                                                         tornado_df['Porcentaje'])):
+                y_pos = bar.get_y() + bar.get_height() / 2
+                tooltip_label = f"{evento}\nContribución: {currency_format(contribucion)}\nPorcentaje: {porcentaje:.2f}%"
                 
-                # Crear degradado de colores desde amarillo (MercadoLibre) hasta azul
-                num_eventos = len(tornado_df)
-                colores_eventos = []
+                # Determinar el color del tooltip según la posición/importancia en el gráfico
+                if i == num_eventos - 1:  # El evento más importante
+                    color = MELI_AMARILLO
+                elif i == num_eventos - 2:  # Segundo evento más importante
+                    color = MELI_AZUL_CORP
+                elif i == 0 and 'Otros eventos' in evento:
+                    color = '#CCCCCC'
+                else:
+                    color = None  # Usar el color por defecto
                 
-                for i in range(num_eventos):
-                    if i == num_eventos - 1:  # El evento más importante
-                        colores_eventos.append(MELI_AMARILLO)  # Amarillo MercadoLibre para evento principal
-                    elif i == num_eventos - 2:  # Segundo evento más importante
-                        colores_eventos.append(MELI_AZUL_CORP)  # Azul corporativo
-                    elif i == 0 and 'Otros eventos' in tornado_df.iloc[0]['Evento de Riesgo']:
-                        colores_eventos.append('#CCCCCC')  # Gris para los eventos agrupados
-                    else:
-                        # Mezcla entre azul y amarillo MELI con una proporción adecuada
-                        ratio = i / (num_eventos - 1)
-                        colores_eventos.append(f'#{blend_colors(MELI_AZUL, MELI_AMARILLO, ratio)}')
-                
-                # Crear las barras horizontales con colores personalizados MercadoLibre
-                bars = ax7.barh(tornado_df['Evento de Riesgo'], 
-                              tornado_df['Contribución Promedio'], 
-                              color=colores_eventos, 
-                              edgecolor='white', 
-                              alpha=0.85,
-                              height=0.65)  # Altura para mejor visualización
-                
-                # Añadir etiquetas con valor y porcentaje
-                for i, (bar, valor, porcentaje, nombre) in enumerate(zip(bars, 
-                                                        tornado_df['Contribución Promedio'],
-                                                        tornado_df['Porcentaje'],
-                                                        tornado_df['Evento de Riesgo'])):
-                    width = bar.get_width()
-                    label_x_pos = width * 1.01
-                    
-                    # Optimización de etiquetas para evitar sobrecargar el gráfico
-                    if porcentaje >= 1.0:  # Solo mostrar porcentaje si es significativo
-                        label_text = f"{currency_format(valor)} ({porcentaje:.1f}%)"
-                    else:
-                        label_text = f"{currency_format(valor)}"
-                    
-                    # Etiqueta con fondo blanco para mejor legibilidad
-                    ax7.text(label_x_pos, 
-                           bar.get_y() + bar.get_height()/2, 
-                           label_text, 
-                           va='center',
-                           fontsize=8,
-                           fontweight='bold' if i >= num_eventos - 3 else 'normal', 
-                           bbox=dict(facecolor='white', alpha=0.9, edgecolor=None))
-                
-                # Añadir línea vertical para la media con estilo MELI
-                mean_contrib = tornado_df['Contribución Promedio'].mean()
-                ax7.axvline(x=mean_contrib, color=MELI_ROJO, linestyle='--', alpha=0.7, 
-                          label=f'Media: {currency_format(mean_contrib)}')
-                
-                # Resumen de contribuciones para referencia rápida
-                total_contrib = tornado_df['Contribución Promedio'].sum()
-                top3_contrib = tornado_df.nlargest(3, 'Contribución Promedio')['Contribución Promedio'].sum()
-                top3_pct = (top3_contrib / total_contrib) * 100
-                
-                # Añadir texto resumen en esquina superior izquierda
-                resumen_text = f"Total: {currency_format(total_contrib)}\nTop 3: {top3_pct:.0f}%"
-                ax7.text(0.02, 0.97, resumen_text, transform=ax7.transAxes, 
-                        fontsize=8, va='top', ha='left',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
-                
-                # Título y etiquetas mejoradas
-                ax7.set_title('Contribución por Evento de Riesgo')
-                ax7.set_xlabel('Contribución a la Pérdida Media ($)')
-                ax7.set_ylabel('Evento de Riesgo')
-                
-                # Formatear el eje X para moneda
-                ax7.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
-                
-                # Aplicar estilo MercadoLibre global
-                aplicar_estilo_meli(ax7, tipo='barh')
-                
-                # Añadir grid horizontal sutil
-                ax7.grid(axis='x', linestyle='--', alpha=0.3)
-                
-                # Añadir leyenda con estilo depurado
-                ax7.legend(loc='lower right', fontsize=8, framealpha=0.9)
-                
-                # Asegurar que haya suficiente espacio para las etiquetas
-                fig7.tight_layout()
-                
-                # Configurar tooltips para el gráfico de tornado
-                # Para cada barra del tornado, crear un tooltip con información detallada
-                for i, (bar, evento, contribucion, porcentaje) in enumerate(zip(bars, 
-                                                             tornado_df['Evento de Riesgo'],
-                                                             tornado_df['Contribución Promedio'],
-                                                             tornado_df['Porcentaje'])):
-                    y_pos = bar.get_y() + bar.get_height() / 2
-                    tooltip_label = f"{evento}\nContribución: {currency_format(contribucion)}\nPorcentaje: {porcentaje:.2f}%"
-                    
-                    # Determinar el color del tooltip según la posición/importancia en el gráfico
-                    if i == num_eventos - 1:  # El evento más importante
-                        color = MELI_AMARILLO
-                    elif i == num_eventos - 2:  # Segundo evento más importante
-                        color = MELI_AZUL_CORP
-                    elif i == 0 and 'Otros eventos' in evento:
-                        color = '#CCCCCC'
-                    else:
-                        color = None  # Usar el color por defecto
-                    
-                    canvas7.add_tooltip_data(ax7, [contribucion], [y_pos], 
-                                         labels=[tooltip_label],
-                                         highlight_color=color)
-                
-                # Añadir tooltip para la línea de la media
-                media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
-                # Encontrar un punto y adecuado para mostrar el tooltip de la media
-                # Usamos la altura media del gráfico
-                y_mid = len(tornado_df) / 2
-                canvas7.add_tooltip_data(ax7, [mean_contrib], [y_mid], 
-                                     labels=[media_tooltip], 
-                                     highlight_color=MELI_ROJO)
-                
-                # Guardar referencias para actualización dinámica
-                self.fig_contribucion = fig7
-                self.canvas_contribucion = canvas7
-                self.ax_contribucion = ax7
-                
-                tab10 = QtWidgets.QWidget()
-                layout7 = QtWidgets.QVBoxLayout(tab10)
-                
-                # Panel de controles superiores con selector de percentil
-                contrib_ctrls = QtWidgets.QWidget()
-                contrib_ctrls_layout = QtWidgets.QHBoxLayout(contrib_ctrls)
-                contrib_ctrls_layout.setContentsMargins(0, 0, 0, 0)
-                
-                lbl_percentil = QtWidgets.QLabel("Contribución al:")
-                lbl_percentil.setStyleSheet("font-weight: bold;")
-                self.combo_percentil_contrib = QtWidgets.QComboBox()
-                self.combo_percentil_contrib.addItems([
-                    "Media", "P75", "P80", "P90", "P95", "P99"
-                ])
-                self.combo_percentil_contrib.setToolTip(
-                    "Seleccione el percentil para ver qué eventos contribuyen más\n"
-                    "cuando la pérdida total está en ese nivel.\n"
-                    "Ej: P90 muestra contribución en escenarios de cola severos."
-                )
-                self.combo_percentil_contrib.currentIndexChanged.connect(self.actualizar_grafico_contribucion)
-                
-                contrib_ctrls_layout.addWidget(lbl_percentil)
-                contrib_ctrls_layout.addWidget(self.combo_percentil_contrib)
-                contrib_ctrls_layout.addStretch()
-                
-                layout7.addWidget(contrib_ctrls)
-                layout7.addWidget(self._wrap_canvas_in_scroll(canvas7))
-                self.graficos_tab_widget.addTab(tab10, "Contribución")
-                try:
-                    curr = self.progress_bar.value()
-                    self.actualizar_progreso_post(min(curr + 1, 93), "Agregando gráficos…")
-                    QtWidgets.QApplication.processEvents()
-                except Exception:
-                    pass
+                canvas7.add_tooltip_data(ax7, [contribucion], [y_pos], 
+                                     labels=[tooltip_label],
+                                     highlight_color=color)
+            
+            # Añadir tooltip para la línea de la media
+            media_tooltip = f"Contribución media: {currency_format(mean_contrib)}"
+            # Encontrar un punto y adecuado para mostrar el tooltip de la media
+            # Usamos la altura media del gráfico
+            y_mid = len(tornado_df) / 2
+            canvas7.add_tooltip_data(ax7, [mean_contrib], [y_mid], 
+                                 labels=[media_tooltip], 
+                                 highlight_color=MELI_ROJO)
+            
+            # Guardar referencias para actualización dinámica
+            self.fig_contribucion = fig7
+            self.canvas_contribucion = canvas7
+            self.ax_contribucion = ax7
+            
+            tab10 = QtWidgets.QWidget()
+            layout7 = QtWidgets.QVBoxLayout(tab10)
+            
+            # Panel de controles superiores con selector de percentil
+            contrib_ctrls = QtWidgets.QWidget()
+            contrib_ctrls_layout = QtWidgets.QHBoxLayout(contrib_ctrls)
+            contrib_ctrls_layout.setContentsMargins(0, 0, 0, 0)
+            
+            lbl_percentil = QtWidgets.QLabel("Contribución al:")
+            lbl_percentil.setStyleSheet("font-weight: bold;")
+            self.combo_percentil_contrib = QtWidgets.QComboBox()
+            self.combo_percentil_contrib.addItems([
+                "Media", "P75", "P80", "P90", "P95", "P99"
+            ])
+            self.combo_percentil_contrib.setToolTip(
+                "Seleccione el percentil para ver qué eventos contribuyen más\n"
+                "cuando la pérdida total está en ese nivel.\n"
+                "Ej: P90 muestra contribución en escenarios de cola severos."
+            )
+            self.combo_percentil_contrib.currentIndexChanged.connect(self.actualizar_grafico_contribucion)
+            
+            contrib_ctrls_layout.addWidget(lbl_percentil)
+            contrib_ctrls_layout.addWidget(self.combo_percentil_contrib)
+            contrib_ctrls_layout.addStretch()
+            
+            layout7.addWidget(contrib_ctrls)
+            layout7.addWidget(self._wrap_canvas_in_scroll(canvas7))
+            self.graficos_tab_widget.addTab(tab10, "Contribución")
+            try:
+                curr = self.progress_bar.value()
+                self.actualizar_progreso_post(min(curr + 1, 93), "Agregando gráficos…")
+                QtWidgets.QApplication.processEvents()
+            except Exception:
+                pass
 
         # Gráfico 8: Box Plots por Evento de Riesgo
         fig8 = Figure(figsize=(9, 6))  # Tamaño optimizado para buena visualización
@@ -16186,12 +16467,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         p90 = np.percentile(perdidas_totales, 90)
         p99 = np.percentile(perdidas_totales, 99)
         
-        # Definir rangos con los umbrales fijos
+        # Definir rangos con los umbrales fijos.
+        # Fix bug alto #10 (QA ronda 2): el bin "Crítico" usaba
+        # np.max(perdidas_totales) como límite superior junto con una máscara
+        # "< max_val" (comparación estricta), igual que los demás bins. Si hay
+        # una masa puntual en el máximo (p.ej. severidad determinista, o un
+        # límite de póliza que satura muchas simulaciones exactamente en el
+        # mismo valor), esas simulaciones quedaban excluidas de TODOS los
+        # bins (ni siquiera "Crítico" las contaba), haciendo que las 4
+        # probabilidades sumaran menos de 100% — en el caso extremo, 0% si
+        # TODA la masa crítica está en ese máximo. Se usa np.inf como límite
+        # superior del último bin (sin masa puntual puede caer ahí), igual
+        # que hace la referencia _build_risk_classification (">= umbral_alto"
+        # sin límite superior).
         rangos = [
             (0, umbral_bajo, "Bajo"),
             (umbral_bajo, umbral_moderado, "Moderado"),
             (umbral_moderado, umbral_alto, "Alto"),
-            (umbral_alto, np.max(perdidas_totales), "Crítico")
+            (umbral_alto, np.inf, "Crítico")
         ]
         
         # Calcular probabilidad para cada rango con visualización mejorada
@@ -17573,10 +17866,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             porc_ceros = float(np.mean(perdidas_totales == 0) * 100.0) if perdidas_totales.size > 0 else 0.0
 
+            # Fix bug medio #20 (QA ronda 2): usar currency_format() (formato
+            # "$1.234.567", consistente con el resto de la app/PDF) en vez de
+            # un f-string crudo "${:,.0f}" que produce el formato inverso en
+            # inglés ("$1,234,567") — mismo antipatrón ya corregido en la
+            # descripción de vínculos del PDF (fix bug #38).
             findings = [
-                f"Pérdida media esperada: ${media:,.0f} anuales",
-                f"Con 99% de confianza, las pérdidas no superarán ${var_99:,.0f} (VaR 99%)",
-                f"Si se supera el VaR 99%, la pérdida esperada es ${es_99:,.0f} (Expected Shortfall)",
+                f"Pérdida media esperada: {currency_format(media)} anuales",
+                f"Con 99% de confianza, las pérdidas no superarán {currency_format(var_99)} (VaR 99%)",
+                f"Si se supera el VaR 99%, la pérdida esperada es {currency_format(es_99)} (Expected Shortfall)",
                 f"El evento '{top_evento}' contribuye {top_pct}% al riesgo agregado medio",
                 f"{porc_ceros:.1f}% de los años no presentan pérdida alguna",
                 f"Cola: kurtosis={curt:.2f}, asimetría={asim:.2f}",
@@ -17600,8 +17898,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             return {
                 "headline": (
-                    f"Pérdida agregada media de ${media:,.0f} con VaR 99% de "
-                    f"${var_99:,.0f}. Cartera en zona {zona_media} (media) / "
+                    f"Pérdida agregada media de {currency_format(media)} con VaR 99% de "
+                    f"{currency_format(var_99)}. Cartera en zona {zona_media} (media) / "
                     f"{zona_p99} (P99)."
                 ),
                 "key_findings": findings,
@@ -19200,7 +19498,7 @@ class ResultReport:
         Args:
             filename: Ruta completa del archivo PDF a generar
         """
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepTogether
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import cm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -19238,7 +19536,7 @@ class ResultReport:
             stats_dict: Diccionario con estadísticas calculadas
             figuras: Lista de objetos Figure de matplotlib a incluir en el PDF
         """
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepInFrame
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer, PageBreak, KeepInFrame, KeepTogether
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import cm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -19393,9 +19691,24 @@ class ResultReport:
                 nombre_evento_display = nombre_evento[:57] + "..."
             else:
                 nombre_evento_display = nombre_evento
-            
-            elements.append(Paragraph(f"<b>{i+1}. {nombre_evento_display}</b>", event_title_style))
-            
+            # Fix bug alto #12 (QA ronda 2): escapar el nombre del evento
+            # antes de insertarlo en el markup de reportlab. Paragraph()
+            # interpreta el texto como XML/HTML simplificado (<b>, <i>,
+            # etc.); un nombre con un patrón como "<br" sin cerrar (plausible
+            # si se copia desde Excel/HTML) rompía el parseo y abortaba
+            # doc.build() COMPLETO, sin ninguna pista de qué evento o
+            # carácter lo causó.
+            nombre_evento_escapado = _xml_escape_pdf(nombre_evento_display)
+
+            # Fix bug medio #19 (QA ronda 2): agrupar el título del evento,
+            # sus vínculos (si existen) y su tabla de estadísticas en un
+            # único bloque via KeepTogether. Sin esto, con 20+ eventos el
+            # título podía quedar en el final de una página y su tabla de
+            # estadísticas recién en la página siguiente ("huérfano"), sin
+            # ninguna relación visual clara entre ambos para el lector.
+            bloque_evento = []
+            bloque_evento.append(Paragraph(f"<b>{i+1}. {nombre_evento_escapado}</b>", event_title_style))
+
             # Info de vínculos si existen
             vinculos_evt = evento.get('vinculos', [])
             if vinculos_evt:
@@ -19406,6 +19719,9 @@ class ResultReport:
                         if e['id'] == v.get('id_padre'):
                             nombre_padre = e['nombre'][:25]
                             break
+                    # Fix bug alto #12: mismo escape para el nombre del
+                    # evento padre (también texto de usuario).
+                    nombre_padre = _xml_escape_pdf(nombre_padre)
                     desc = f"{v.get('tipo', '?')} → {nombre_padre} ({v.get('probabilidad', 100)}%"
                     fsev = v.get('factor_severidad', 1.0)
                     umbral = v.get('umbral_severidad', 0)
@@ -19421,9 +19737,9 @@ class ResultReport:
                     desc += ")"
                     deps.append(desc)
                 dep_text = " | ".join(deps)
-                elements.append(Paragraph(f"<i>Vínculos: {dep_text}</i>", styles['Normal']))
-                elements.append(Spacer(1, 3))
-            
+                bloque_evento.append(Paragraph(f"<i>Vínculos: {dep_text}</i>", styles['Normal']))
+                bloque_evento.append(Spacer(1, 3))
+
             # Tabla de estadísticas del evento
             event_data = [
                 ["Métrica", "Valor"],
@@ -19446,9 +19762,10 @@ class ResultReport:
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
                 ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
             ]))
-            elements.append(t_evt)
-            elements.append(Spacer(1, 6))
-        
+            bloque_evento.append(t_evt)
+            bloque_evento.append(Spacer(1, 6))
+            elements.append(KeepTogether(bloque_evento))
+
         elements.append(PageBreak())
         
         # Tabla de percentiles por evento (formato mejorado: eventos en filas)
@@ -19560,8 +19877,11 @@ class ResultReport:
             for ax, title in zip(fig.get_axes(), axis_titles):
                 ax.set_title(title)
             
-            # Añadir el título como encabezado en el PDF
-            elements.append(Paragraph(titulo, styles['Heading3']))
+            # Añadir el título como encabezado en el PDF.
+            # Fix bug alto #12: algunos títulos de gráfico pueden derivar de
+            # texto de usuario (p.ej. nombres de evento en el eje); escapar
+            # por la misma razón que el nombre del evento, arriba.
+            elements.append(Paragraph(_xml_escape_pdf(titulo), styles['Heading3']))
             elements.append(Spacer(1, 6))
             
             # Calcular dimensiones máximas seguras para la imagen (75% de ancho, 500 pt de alto)

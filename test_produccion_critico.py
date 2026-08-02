@@ -506,6 +506,85 @@ def test_EE_sev_freq_factor_max_menor_a_uno_no_anula_perdida():
                      label="factor_max<1 clipeado a 1.0: no anula la perdida")
 
 
+def test_EE_sev_freq_base_exponencial_menor_a_uno_no_invierte():
+    """Regresion bug alto #6 (QA ronda 2): sev_freq_base (modelo exponencial)
+    documentado como > 1.0, mismo patron que sev_freq_paso/factor_max. Sin
+    piso: base<1 hacia que el multiplicador (base**(n-1)) DISMINUYERA con la
+    reincidencia en vez de aumentar, invirtiendo el efecto pedido. Ahora se
+    clipea a >= 1.0, comportandose como base=1.0 (sin escalamiento) en el
+    caso limite."""
+    evento_base = _build_evento(
+        'e1', 'B', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}}
+    )
+    evento_base_invertida = _build_evento(
+        'e1', 'BaseInvertida', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='exponencial',
+        sev_freq_base=0.5,
+        sev_freq_factor_max=5.0,
+    )
+    perd_b, _, _, _ = _simular([evento_base], num_sims=5000, seed=14036)
+    perd_inv, _, _, _ = _simular([evento_base_invertida], num_sims=5000, seed=14036)
+    assert (perd_inv >= 0).all(), "base<1 produjo perdidas negativas"
+    assert_close_rel(perd_inv.mean(), perd_b.mean(), tol_rel=0.05,
+                     label="base<1 clipeado a 1.0: no invierte la perdida con la reincidencia")
+
+
+def test_EE_sev_freq_base_exponencial_cero_no_anula():
+    """base=0 hacia que base**(n-1) fuera 0 para TODA ocurrencia desde la
+    2da en adelante (0**exponente_positivo=0), anulando por completo la
+    severidad de esas ocurrencias. Ahora se clipea a >= 1.0."""
+    evento_base = _build_evento(
+        'e1', 'B', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}}
+    )
+    evento_base_cero = _build_evento(
+        'e1', 'BaseCero', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='exponencial',
+        sev_freq_base=0.0,
+        sev_freq_factor_max=5.0,
+    )
+    perd_b, _, _, _ = _simular([evento_base], num_sims=5000, seed=14037)
+    perd_cero, _, _, _ = _simular([evento_base_cero], num_sims=5000, seed=14037)
+    assert (perd_cero >= 0).all(), "base=0 produjo perdidas negativas"
+    assert_close_rel(perd_cero.mean(), perd_b.mean(), tol_rel=0.05,
+                     label="base=0 clipeado a 1.0: no anula la perdida de ocurrencias 2da+")
+
+
+def test_EE_sev_freq_base_exponencial_negativa_no_alterna_signo():
+    """base negativo hacia que base**(n-1) alternara de signo segun la
+    paridad del indice de ocurrencia (comportamiento erratico). Ahora se
+    clipea a >= 1.0."""
+    evento_base_neg = _build_evento(
+        'e1', 'BaseNeg', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='exponencial',
+        sev_freq_base=-2.0,
+        sev_freq_factor_max=5.0,
+    )
+    perd_neg, _, _, _ = _simular([evento_base_neg], num_sims=5000, seed=14038)
+    assert (perd_neg >= 0).all(), "base negativa produjo perdidas negativas (signo alternante)"
+    assert np.isfinite(perd_neg).all(), "base negativa produjo NaN/Inf"
+
+
 def test_EE_sistemico_freq_std_cero_no_explota():
     """Sistemico cuando todas las simulaciones tienen la misma frecuencia
     (freq_std=0). Esto sucede si Bernoulli(p=1.0) con tasa=1. El codigo
@@ -527,6 +606,46 @@ def test_EE_sistemico_freq_std_cero_no_explota():
     # Y dado que freq_std=0, no hay amplificacion → perdida = 1000 (E[Bern]*1000)
     assert_close_rel(perd.mean(), 1000, tol_rel=0.05,
                      label="Sistemico con freq_std=0: sin amplificacion")
+
+
+def test_EE_sistemico_factor_max_invalido_no_crashea_ni_invierte_perdida():
+    """Regresion bug #42 (QA ronda 2): sev_freq_sistemico_factor_max
+    documentado como > 1.0 (multiplicador MAXIMO; np.clip usa
+    1/factor_max como minimo). Sin piso: factor_max=0 crasheaba
+    (ZeroDivisionError), factor_max entre 0 y 1 invertia el rango de
+    np.clip forzando TODAS las simulaciones al mismo multiplicador
+    reducido, y factor_max negativo producia severidades negativas.
+    Ahora se clipea a >= 1.0 (equivalente a 'sin escalamiento' para
+    cualquier valor invalido)."""
+    evento_base = _build_evento(
+        'e1', 'Base', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 100}}
+    )
+    perd_base, _, _, _ = _simular([evento_base], num_sims=4000, seed=14036)
+
+    for factor_max_invalido in (0, 0.5, -3.0):
+        evento_malo = _build_evento(
+            'e1', f'Sist_{factor_max_invalido}', 1, {'tasa': 20.0}, 2,
+            {'minimo': None, 'mas_probable': None, 'maximo': None,
+             'input_method': 'direct',
+             'params_direct': {'mean': 1000, 'std': 100}},
+            sev_freq_activado=True,
+            sev_freq_modelo='sistemico',
+            sev_freq_alpha=0.5,
+            sev_freq_solo_aumento=False,
+            sev_freq_sistemico_factor_max=factor_max_invalido,
+        )
+        perd_malo, _, _, _ = _simular([evento_malo], num_sims=4000, seed=14036)
+        assert np.isfinite(perd_malo).all(), (
+            f"factor_max={factor_max_invalido}: produjo NaN/Inf (posible crash silenciado)"
+        )
+        assert (perd_malo >= 0).all(), (
+            f"factor_max={factor_max_invalido}: produjo perdidas negativas"
+        )
+        assert_close_rel(perd_malo.mean(), perd_base.mean(), tol_rel=0.05,
+                         label=f"factor_max={factor_max_invalido} clipeado a 1.0: sin escalamiento")
 
 
 def test_EE_sev_freq_tabla_vacia():
@@ -552,6 +671,44 @@ def test_EE_sev_freq_tabla_vacia():
     perd_t, _, _, _ = _simular([evento], num_sims=5000, seed=14036)
     assert_close_rel(perd_t.mean(), perd_b.mean(), tol_rel=0.05,
                      label="Sev_freq tabla vacia: equivalente a sin escala")
+
+
+def test_EE_sev_freq_tabla_respeta_factor_max():
+    """Regresion bug medio #13 (QA ronda 2): el modo "tabla" de
+    escalamiento por reincidencia ignoraba sev_freq_factor_max (a
+    diferencia de lineal/exponencial, que sí lo respetan), aunque la UI
+    siempre muestra el texto "..., máx x{factor_max}" sin importar el tipo
+    elegido. Una fila de tabla con un multiplicador mayor a factor_max se
+    aplicaba sin capear. Ahora el resultado con un multiplicador de tabla
+    de 50x y factor_max=5.0 debe ser equivalente a usar directamente un
+    multiplicador de 5.0x (el cap)."""
+    evento_sin_cap = _build_evento(
+        'e1', 'TablaCap5', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='tabla',
+        sev_freq_tabla=[{'desde': 1, 'hasta': None, 'multiplicador': 50.0}],
+        sev_freq_factor_max=5.0,
+    )
+    evento_cap_directo = _build_evento(
+        'e1', 'TablaCapDirecto', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='tabla',
+        sev_freq_tabla=[{'desde': 1, 'hasta': None, 'multiplicador': 5.0}],
+        sev_freq_factor_max=5.0,
+    )
+    perd_sin_cap, _, _, _ = _simular([evento_sin_cap], num_sims=8000, seed=14039)
+    perd_cap_directo, _, _, _ = _simular([evento_cap_directo], num_sims=8000, seed=14039)
+    assert_close_rel(perd_sin_cap.mean(), perd_cap_directo.mean(), tol_rel=0.05,
+                     label="Bug medio #13: tabla con multiplicador 50x y factor_max=5.0 "
+                          "se comporta igual que un multiplicador de tabla de 5.0x (capeado)")
 
 
 # ===========================================================================

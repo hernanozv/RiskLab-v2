@@ -2444,7 +2444,13 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         # Ahora usamos check explicito de None.
                                         ded_val = float(f.get('seguro_deducible', 0) or 0)
                                         _cob_raw = f.get('seguro_cobertura_pct', 100)
-                                        cob_val = float(100 if _cob_raw is None else _cob_raw)
+                                        # Fix bug #35: clipear a [0,100]. Sin esto, un
+                                        # seguro_cobertura_pct negativo (via import JSON,
+                                        # fuera del rango [1,100] que impone el spinbox de
+                                        # la UI) hacia que el "pago" del seguro fuera
+                                        # negativo, AUMENTANDO la perdida neta por encima
+                                        # de la perdida bruta en vez de reducirla.
+                                        cob_val = max(0.0, min(100.0, float(100 if _cob_raw is None else _cob_raw)))
                                         lim_val = float(f.get('seguro_limite', 0) or 0)
                                         tipo_ded = f.get('seguro_tipo_deducible', 'agregado')
                                         lim_ocurr = float(f.get('seguro_limite_ocurrencia', 0) or 0)
@@ -2506,7 +2512,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     # cobertura_pct=0 a 100 (0 es falsy en Python).
                                     ded_val_s = float(f.get('seguro_deducible', 0) or 0)
                                     _cob_raw_s = f.get('seguro_cobertura_pct', 100)
-                                    cob_val_s = float(100 if _cob_raw_s is None else _cob_raw_s)
+                                    # Fix bug #35: clipear a [0,100] (ver mismo fix en el
+                                    # path estocastico, arriba).
+                                    cob_val_s = max(0.0, min(100.0, float(100 if _cob_raw_s is None else _cob_raw_s)))
                                     lim_val_s = float(f.get('seguro_limite', 0) or 0)
                                     tipo_ded_s = f.get('seguro_tipo_deducible', 'agregado')
                                     lim_ocurr_s = float(f.get('seguro_limite_ocurrencia', 0) or 0)
@@ -3169,8 +3177,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         _occurrence_idx = np.concatenate([np.arange(1, f+1) for f in _freqs_pos])
                         
                         tipo_esc = evento.get('sev_freq_tipo_escalamiento', 'lineal')
-                        factor_max = float(evento.get('sev_freq_factor_max', 5.0))
-                        
+                        # Fix bug #36: sev_freq_factor_max documentado como > 1.0 (es un
+                        # CAP superior sobre el multiplicador base de 1.0x). Sin este piso,
+                        # un factor_max <= 1 (o <= 0, via import JSON) hacia que
+                        # np.minimum(..., factor_max) anulara o invirtiera el escalamiento
+                        # para TODAS las ocurrencias (no solo las de indice alto), y ademas
+                        # rompia el branch exponencial con log(factor_max<=0) = NaN/inf.
+                        factor_max = max(1.0, float(evento.get('sev_freq_factor_max', 5.0)))
+
                         if tipo_esc == 'tabla':
                             tabla = evento.get('sev_freq_tabla', [])
                             if tabla:
@@ -3184,9 +3198,18 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             _multiplicadores = base ** safe_exponents
                             _multiplicadores = np.minimum(_multiplicadores, factor_max)
                         else:  # lineal (default)
-                            paso = float(evento.get('sev_freq_paso', 0.5))
+                            # Fix bug #36: sev_freq_paso documentado como > 0 (la severidad
+                            # debe ESCALAR con la reincidencia, no reducirse). Un paso
+                            # negativo (via import JSON) hacia que el multiplicador se
+                            # volviera negativo para ocurrencias de indice alto, invirtiendo
+                            # el signo de la perdida en vez de escalarla.
+                            paso = max(0.0, float(evento.get('sev_freq_paso', 0.5)))
                             _multiplicadores = np.minimum(1 + paso * (_occurrence_idx - 1), factor_max)
-                        
+
+                        # Piso defensivo: el multiplicador nunca debe ser negativo,
+                        # cualquiera sea el modelo de escalamiento usado.
+                        _multiplicadores = np.maximum(_multiplicadores, 0.0)
+
                         _media_antes = total_perdidas_del_evento_concatenadas.mean()
                         total_perdidas_del_evento_concatenadas *= _multiplicadores
                         _media_despues = total_perdidas_del_evento_concatenadas.mean()

@@ -9732,9 +9732,25 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # scrolleable: sin esto, scrollear la tabla con el mouse
                 # sobre una celda cambia su valor sin que el usuario haga
                 # clic, y el cambio se persiste silenciosamente.
+                # Fix bug medio #16 (QA ronda 2): setValue() clipea el valor
+                # MOSTRADO al rango del spinbox, pero como .connect() se
+                # llama DESPUÉS de .setValue() acá abajo, ese clampeo inicial
+                # nunca disparaba valueChanged (todavía no había nada
+                # conectado) y por lo tanto nunca sincronizaba de vuelta
+                # vinculos_existentes[idx]. Si un vínculo traía un valor
+                # fuera de rango (p.ej. importado de un JSON con
+                # probabilidad=150), la UI mostraba el valor clampeado
+                # (100%) pero el dato real en memoria seguía siendo 150
+                # hasta que el usuario tocaba el control — y si guardaba sin
+                # tocarlo, se persistía el valor NO mostrado (150), no el
+                # que el usuario vio en pantalla. Ahora se escribe el valor
+                # clampeado de vuelta al dict inmediatamente, sin depender
+                # del orden de conexión de señales.
+                prob_clampeada = max(1, min(100, vinculo.get('probabilidad', 100)))
+                vinculo['probabilidad'] = prob_clampeada
                 prob_spin = NoScrollSpinBox()
                 prob_spin.setRange(1, 100)
-                prob_spin.setValue(max(1, min(100, vinculo.get('probabilidad', 100))))
+                prob_spin.setValue(prob_clampeada)
                 prob_spin.setSuffix("%")
                 prob_spin.setFixedHeight(30)
                 prob_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
@@ -9742,9 +9758,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 2, prob_spin)
 
                 # DoubleSpinbox para factor de severidad
+                factor_sev_clampeado = max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0)))
+                vinculo['factor_severidad'] = factor_sev_clampeado
                 factor_sev_spin = NoScrollDoubleSpinBox()
                 factor_sev_spin.setRange(0.10, 5.00)
-                factor_sev_spin.setValue(max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0))))
+                factor_sev_spin.setValue(factor_sev_clampeado)
                 factor_sev_spin.setSingleStep(0.01)
                 factor_sev_spin.setDecimals(2)
                 factor_sev_spin.setSuffix("x")
@@ -9755,12 +9773,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 if vinculo['tipo'] == 'EXCLUYE':
                     factor_sev_spin.setEnabled(False)
                     factor_sev_spin.setValue(1.00)
+                    vinculo['factor_severidad'] = 1.00
                 vinculos_table.setCellWidget(idx, 3, factor_sev_spin)
 
                 # Spinbox para umbral de severidad del padre
+                umbral_clampeado = max(0, vinculo.get('umbral_severidad', 0))
+                vinculo['umbral_severidad'] = umbral_clampeado
                 umbral_spin = NoScrollSpinBox()
                 umbral_spin.setRange(0, 999999999)
-                umbral_spin.setValue(max(0, vinculo.get('umbral_severidad', 0)))
+                umbral_spin.setValue(umbral_clampeado)
                 umbral_spin.setSingleStep(1000)
                 umbral_spin.setPrefix("$")
                 umbral_spin.setFixedHeight(30)

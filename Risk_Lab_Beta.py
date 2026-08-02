@@ -3347,30 +3347,38 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         seguros = evento.get('_seguros_aplicables', [])
         # Filtrar solo seguros agregados (los de por_ocurrencia ya se aplicaron arriba)
         seguros_agregados = [s for s in seguros if s.get('tipo_deducible', 'agregado') == 'agregado']
-        
+
+        # Fix bug #20: cada póliza agregada debe aplicar su deducible/límite sobre
+        # la pérdida agregada BRUTA (antes de cualquier otra póliza agregada), no
+        # sobre el remanente ya reducido por pólizas anteriores. De lo contrario el
+        # pago total (y por ende la pérdida neta) queda dependiendo del orden en que
+        # las pólizas fueron cargadas, en vez de sumar cada tramo de la torre de
+        # reaseguro de forma independiente sobre la pérdida bruta.
+        perdidas_brutas_agregado = perdidas_para_este_evento.copy()
+        pago_seguro_agregado_total = np.zeros(num_simulaciones)
+
         for seguro in seguros_agregados:
             deducible = seguro['deducible']
             cobertura_pct = seguro['cobertura_pct']
             limite = seguro['limite']
-            
-            # Fórmula: pago_seguro = min((perdida_agregada - deducible) * cobertura%, limite)
+
+            # Fórmula: pago_seguro = min((perdida_agregada_bruta - deducible) * cobertura%, limite)
             # Si limite == 0, significa sin límite (ilimitado)
-            exceso = np.maximum(perdidas_para_este_evento - deducible, 0)
+            exceso = np.maximum(perdidas_brutas_agregado - deducible, 0)
             pago_seguro = exceso * cobertura_pct
             if limite > 0:
                 pago_seguro = np.minimum(pago_seguro, limite)
-            
-            # Restar el pago del seguro de las pérdidas agregadas
-            perdidas_antes = perdidas_para_este_evento.mean()
-            perdidas_para_este_evento -= pago_seguro
-            np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)  # No puede ser negativa
-            perdidas_despues = perdidas_para_este_evento.mean()
-            
+
+            pago_seguro_agregado_total += pago_seguro
+
             nombre_evento = evento.get('nombre', evento_id)
             _dbg(f"[DEBUG SEGURO AGREGADO] Evento '{nombre_evento}': Seguro '{seguro['nombre']}' "
-                  f"(Ded=${deducible:,.0f}/año, Cob={cobertura_pct*100:.0f}%, Lím=${limite:,.0f}/año)")
-            _dbg(f"[DEBUG SEGURO AGREGADO]   Pérdida media anual: ${perdidas_antes:,.0f} → ${perdidas_despues:,.0f} "
+                  f"(Ded=${deducible:,.0f}/año, Cob={cobertura_pct*100:.0f}%, Lím=${limite:,.0f}/año) "
                   f"(Pago medio seguro: ${pago_seguro.mean():,.0f})")
+
+        if seguros_agregados:
+            perdidas_para_este_evento = perdidas_brutas_agregado - pago_seguro_agregado_total
+            np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)  # No puede ser negativa
         
         perdidas_por_evento[idx] = perdidas_para_este_evento
 
@@ -11130,6 +11138,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 padres_ids = evento.get('eventos_padres', [])
 
             for padre_id in padres_ids:
+                # Referencia colgante (id_padre sin evento correspondiente): el
+                # motor de simulacion la ignora silenciosamente (ver linea ~2670),
+                # asi que aqui tambien se ignora en vez de fallar con KeyError.
+                if padre_id not in id_a_evento:
+                    continue
                 if padre_id not in visited:
                     if is_cyclic_util(padre_id):
                         return True
@@ -11613,10 +11626,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
         return filepath
 
     def ejecutar_simulacion(self):
+        # Fix bug #22: guard de re-entrancy. set_interfaz_activa(False) solo
+        # deshabilita la pestaña Simulación; la pestaña Escenarios (y su boton
+        # "Ejecutar Simulación", que llama a este mismo metodo via
+        # ejecutar_simulacion_escenario) queda operativa. Sin este guard, iniciar
+        # una simulacion desde una pestaña mientras la otra ya tiene una corriendo
+        # (o un doble-click) crea un SEGUNDO SimulacionThread que sobreescribe
+        # self.simulation_thread mientras el primero sigue corriendo: ambos quedan
+        # conectados a los mismos slots (actualizar_progreso, simulacion_completada)
+        # y el que termine ultimo "gana" silenciosamente, sin ningun aviso.
+        hilo_actual = getattr(self, 'simulation_thread', None)
+        if hilo_actual is not None and hilo_actual.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación en curso",
+                "Ya hay una simulación en ejecución. Espere a que finalice antes de iniciar otra."
+            )
+            return
         try:
             # Validar número de simulaciones (función centralizada)
             num_simulaciones = validar_num_simulaciones(self.num_simulaciones_var.text())
-            
+
             if not self.eventos_riesgo:
                 raise ValueError("Debe agregar al menos un evento de riesgo.")
 
@@ -11875,6 +11904,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.num_simulaciones_var.setEnabled(estado)
         self.eventos_table.setEnabled(estado)
         self.central_widget.setTabEnabled(self.central_widget.indexOf(self.config_tab), estado)
+        # Fix bug #22: la pestaña Escenarios tiene su propio flujo hacia
+        # ejecutar_simulacion() (via ejecutar_simulacion_escenario); deshabilitarla
+        # tambien evita que el usuario navegue ahi y dispare una simulacion mientras
+        # otra sigue corriendo.
+        self.central_widget.setTabEnabled(self.central_widget.indexOf(self.scenarios_tab), estado)
 
     def generar_resultados(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento,
                            eventos_riesgo, generar_reporte=False, pdf_filename='reporte_simulacion.pdf'):
@@ -18724,6 +18758,27 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
                                 vinculos_actualizados.append({'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'], 'probabilidad': prob, 'factor_severidad': fsev, 'umbral_severidad': umbral})
                             evento_data['vinculos'] = vinculos_actualizados
+
+                # Fix bug #21: validar ciclos de dependencia (vinculos) ANTES de
+                # comprometer la transaccion. tiene_ciclo() ya existia pero solo
+                # estaba conectado al dialogo manual de eventos y a "duplicar
+                # escenario" — el import JSON lo saltaba por completo, permitiendo
+                # que un archivo con un ciclo (p.ej. EXCLUYE mutuo A<->B) se
+                # cargara sin aviso y corrompiera silenciosamente el orden
+                # topologico usado por la simulacion.
+                if self.tiene_ciclo(eventos_riesgo_temp):
+                    raise ValueError(
+                        "El archivo contiene una dependencia cíclica entre eventos "
+                        "vinculados de la simulación principal. Corrija los vínculos "
+                        "en el archivo antes de importarlo."
+                    )
+                for scenario in scenarios_temp:
+                    if self.tiene_ciclo(scenario.eventos_riesgo):
+                        raise ValueError(
+                            f"El escenario '{scenario.nombre}' contiene una "
+                            f"dependencia cíclica entre sus eventos vinculados. "
+                            f"Corrija los vínculos en el archivo antes de importarlo."
+                        )
 
                 # === COMMIT DE TRANSACCIÓN: Todo procesado exitosamente, ahora actualizar la UI ===
                 # Limpiar escenarios y resultados actuales

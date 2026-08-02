@@ -172,6 +172,55 @@ def _indice_actual_avisos_riesgo():
 # UI y el export adviertan al usuario sobre la distorsion.
 MAX_EVENTOS_POR_EVENTO_POR_CHUNK = 500_000_000
 
+# R4 crítico #1: MAX_EVENTOS_POR_EVENTO_POR_CHUNK (arriba) protege contra la
+# DISTORSIÓN ESTADÍSTICA del cap de frecuencia, pero NO contra quedarse sin
+# memoria RAM real -- medido empíricamente: ~200.000 simulaciones totales con
+# un solo evento de tasa=500/año (nada extremo) ya hacen que el proceso sea
+# matado por el sistema operativo (OOM) en una máquina con 15GB libres, muy
+# por debajo de donde MAX_EVENTOS_POR_EVENTO_POR_CHUNK empieza a activarse.
+# Este umbral (en OCURRENCIAS TOTALES estimadas = num_simulaciones x E[N] por
+# evento, sumado entre todos los eventos activos) dispara una confirmación
+# visible ANTES de arrancar el hilo, para que un typo de tasa o un
+# num_simulaciones demasiado alto no termine en un crash silencioso sin
+# ningún diálogo de error ni datos guardados.
+OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA = 15_000_000
+# Estimación empírica de bytes por ocurrencia total (a partir de las
+# mediciones de la auditoría: ~25M ocurrencias ~ 4.9GB de RSS).
+BYTES_ESTIMADOS_POR_OCURRENCIA = 200
+
+
+def _estimar_frecuencia_esperada_evento(evento):
+    """Estima E[N] (ocurrencias esperadas por año) de un evento a partir de
+    sus parámetros crudos, SIN construir el objeto de distribución completo
+    (usado solo para una estimación previa de uso de memoria, no para la
+    simulación real). Devuelve un valor conservador (1.0) si los parámetros
+    no están disponibles o son inválidos, para no subestimar el uso de
+    memoria en casos ambiguos."""
+    freq_opcion = evento.get('freq_opcion', 3)
+    try:
+        if freq_opcion == 1:  # Poisson
+            return max(0.0, float(evento.get('tasa') or 0.0))
+        elif freq_opcion == 2:  # Binomial
+            n = float(evento.get('num_eventos') or 0.0)
+            p = float(evento.get('prob_exito') or 0.0)
+            return max(0.0, n * p)
+        elif freq_opcion == 3:  # Bernoulli
+            return max(0.0, float(evento.get('prob_exito') or 0.0))
+        elif freq_opcion == 4:  # Poisson-Gamma
+            alpha = evento.get('pg_alpha')
+            beta = evento.get('pg_beta')
+            if alpha and beta:
+                return max(0.0, float(alpha) / float(beta))
+        elif freq_opcion == 5:  # Beta (probabilidad anual)
+            alpha = evento.get('beta_alpha')
+            beta = evento.get('beta_beta')
+            if alpha and beta:
+                return max(0.0, float(alpha) / (float(alpha) + float(beta)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 1.0
+
+
 # Fix bug #33: campos internos que el motor de simulación agrega a los dicts
 # de evento en tiempo de ejecución (cache de factores, flags de estado,
 # huella del cap de frecuencia, etc.) y que NUNCA deben persistirse al
@@ -1110,6 +1159,22 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
     error_relativo_max = abs(q_max_ajustado - maximo) / maximo
     peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
 
+    # R4 crítico #6: cuando alpha y beta quedan AMBOS muy cerca de 1 (la
+    # frontera alpha,beta>1 exigida para que la moda exista), la Beta
+    # resultante es prácticamente indistinguible de Uniforme(0,1) sin
+    # importar qué moda/mínimo/máximo se pidieron -- y la fórmula de la
+    # moda, (alpha-1)/(alpha+beta-2), se vuelve numéricamente inestable
+    # (forma 0/0), por lo que error_relativo_moda puede dar un valor
+    # engañosamente bajo por pura coincidencia numérica en ese punto, no
+    # porque el ajuste realmente reproduzca la forma pedida. Verificado
+    # empíricamente: con mínimo=0.2082, más probable=0.5505, máximo=0.6759,
+    # confianza=0.53, el optimizador converge a alpha≈1.0012, beta≈1.0010
+    # (pasando los 3 chequeos puntuales de arriba) pero el 53% de las
+    # muestras reales caen FUERA del rango [mínimo, máximo] pedido -- la
+    # distribución es, en la práctica, un sorteo uniforme sobre [0,1]
+    # completo. Se detecta esta zona degenerada explícitamente.
+    cerca_de_uniforme = (alpha - 1) < 0.05 and (beta - 1) < 0.05
+
     if peor_error > 0.98:
         raise ValueError(
             f"No se pudo ajustar una distribución Beta razonable para "
@@ -1123,19 +1188,37 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
             f"reduzca la amplitud del rango mínimo-máximo."
         )
 
-    if peor_error > 0.30:
-        warnings.warn(
-            f"El ajuste de la distribución Beta no reproduce con precisión "
-            f"los valores pedidos (mínimo={minimo:.4g}, más "
-            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
-            f"confianza={confianza:.2f}): diferencia relativa de "
-            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
-            f"en el percentil inferior y {error_relativo_max:.0%} en el "
-            f"superior. Esto ocurre porque los 3 valores son difíciles de "
-            f"conciliar simultáneamente con una distribución Beta; "
-            f"verifique que sean coherentes entre sí.",
-            RiskLabAjusteImperfectoWarning
-        )
+    if peor_error > 0.30 or cerca_de_uniforme:
+        if cerca_de_uniforme:
+            masa_fuera_rango = (
+                stats.beta.cdf(minimo, alpha, beta)
+                + (1 - stats.beta.cdf(maximo, alpha, beta))
+            )
+            warnings.warn(
+                f"El ajuste de la distribución Beta convergió a alpha≈{alpha:.4f}, "
+                f"beta≈{beta:.4f} (prácticamente Uniforme(0,1)) para mínimo="
+                f"{minimo:.4g}, más probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+                f"confianza={confianza:.2f}. Aproximadamente {masa_fuera_rango:.0%} de "
+                f"las muestras caerán FUERA del rango [mínimo, máximo] pedido -- la "
+                f"distribución resultante NO concentra probabilidad alrededor de "
+                f"'más probable' como se esperaría. Verifique que los 3 valores sean "
+                f"coherentes entre sí (un rango muy amplio combinado con una moda "
+                f"cercana al centro dificulta el ajuste).",
+                RiskLabAjusteImperfectoWarning
+            )
+        else:
+            warnings.warn(
+                f"El ajuste de la distribución Beta no reproduce con precisión "
+                f"los valores pedidos (mínimo={minimo:.4g}, más "
+                f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+                f"confianza={confianza:.2f}): diferencia relativa de "
+                f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+                f"en el percentil inferior y {error_relativo_max:.0%} en el "
+                f"superior. Esto ocurre porque los 3 valores son difíciles de "
+                f"conciliar simultáneamente con una distribución Beta; "
+                f"verifique que sean coherentes entre sí.",
+                RiskLabAjusteImperfectoWarning
+            )
 
     return alpha, beta
 
@@ -3705,7 +3788,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         nombre_evento = evento.get('nombre', evento_id)
                         _dbg(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estático {factor_sev_estatico:.4f} aplicado a pérdidas individuales "
                               f"(media: ${perdidas_antes_factor:,.0f} → ${perdidas_despues_factor:,.0f})")
-                
+
+                # R4 crítico #5: sev_limite_superior se re-aplicaba tras el
+                # escalamiento sev_freq (R3 medio #22, arriba) pero NO tras
+                # el factor de severidad de VÍNCULOS/cascada (que puede
+                # multiplicar hasta 5x por cada vínculo AND, COMPONIÉNDOSE
+                # multiplicativamente entre vínculos -- 5^N con N vínculos,
+                # sin ningún techo) ni tras el factor de ajuste de
+                # severidad (estático/estocástico, sin techo superior vía
+                # import JSON). El cap "máximo posible por ocurrencia"
+                # prometido al usuario podía terminar violado hasta en un
+                # 24x+ observado con solo 2 vínculos. Se re-aplica el clip
+                # una última vez aquí, después de TODOS los factores
+                # multiplicativos de severidad y justo antes de que los
+                # seguros procesen la pérdida ya definitiva.
+                if sev_cap is not None and sev_cap > 0:
+                    np.minimum(total_perdidas_del_evento_concatenadas, sev_cap,
+                               out=total_perdidas_del_evento_concatenadas)
+
                 # =====================================================
                 # APLICAR SEGUROS POR OCURRENCIA a pérdidas mitigadas
                 # DESPUÉS de aplicar factor de severidad
@@ -10513,7 +10613,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             seguro_help = QtWidgets.QLabel(
                 "💡 <b>Por ocurrencia:</b> Deducible/límite se aplica a cada siniestro.<br>"
-                "<b>Agregado:</b> Deducible/límite se aplica al total anual.<br>"
+                "<b>Agregado:</b> Deducible/límite se aplica al total anual DE ESTE EVENTO "
+                "(si la misma póliza cubre otros eventos, se calcula de forma independiente para cada uno).<br>"
                 "Ej: 3 siniestros de $30K c/u, Ded $25K por ocurrencia → Paga 3×$5K"
             )
             seguro_help.setWordWrap(True)
@@ -11039,7 +11140,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             seguro_help_edit = QtWidgets.QLabel(
                 "💡 <b>Por ocurrencia:</b> Deducible/límite se aplica a cada siniestro.<br>"
-                "<b>Agregado:</b> Deducible/límite se aplica al total anual.<br>"
+                "<b>Agregado:</b> Deducible/límite se aplica al total anual DE ESTE EVENTO "
+                "(si la misma póliza cubre otros eventos, se calcula de forma independiente para cada uno).<br>"
                 "Ej: 3 siniestros de $30K c/u, Ded $25K por ocurrencia → Paga 3×$5K"
             )
             seguro_help_edit.setWordWrap(True)
@@ -12300,6 +12402,53 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "como independiente para ese vínculo):\n\n" + detalle
                 )
 
+            # R4 crítico #4: el motor calcula el límite agregado anual (y el
+            # deducible) de una póliza de seguro POR EVENTO, de forma
+            # totalmente independiente -- no existe ningún "pool" cruzado
+            # entre eventos para una misma póliza. Si el usuario configura
+            # la MISMA póliza real (identificada por 'nombre') como factor
+            # de ajuste tipo 'seguro' en 2+ eventos distintos (patrón de
+            # modelado común: una póliza de Crimen/Ciber que cubre varias
+            # categorías de riesgo), esa póliza puede terminar pagando hasta
+            # N veces su límite nominal en la misma simulación, subestimando
+            # la pérdida neta agregada sin ningún aviso. Implementar el
+            # pooling cruzado real requeriría rediseñar el pipeline de
+            # seguros (hoy procesa cada evento de forma aislada) con alto
+            # riesgo de regresión sobre la lógica ya extensamente testeada;
+            # se opta por detectar y advertir explícitamente el patrón de
+            # riesgo en vez de un pago combinado silenciosamente incorrecto.
+            polizas_por_nombre = {}
+            for evento in eventos_activos:
+                for f in evento.get('factores_ajuste', []) or []:
+                    if not f.get('activo', True):
+                        continue
+                    if f.get('tipo_severidad') != 'seguro':
+                        continue
+                    nombre_poliza = f.get('nombre', 'Seguro')
+                    polizas_por_nombre.setdefault(nombre_poliza, set()).add(evento['nombre'])
+            polizas_compartidas = {
+                nombre: eventos_cubiertos
+                for nombre, eventos_cubiertos in polizas_por_nombre.items()
+                if len(eventos_cubiertos) > 1
+            }
+            if polizas_compartidas:
+                detalle = "\n".join(
+                    f"• '{nombre}': {', '.join(sorted(eventos_cubiertos))}"
+                    for nombre, eventos_cubiertos in polizas_compartidas.items()
+                )
+                QtWidgets.QMessageBox.warning(
+                    self, "Póliza de seguro compartida entre eventos",
+                    "La(s) siguiente(s) póliza(s) de seguro están configuradas en "
+                    "MÁS DE UN evento de riesgo:\n\n" + detalle +
+                    "\n\nEl motor calcula el límite/deducible de cada póliza de "
+                    "forma INDEPENDIENTE por evento -- si esta es la MISMA póliza "
+                    "real cubriendo varios riesgos, podría pagar hasta el límite "
+                    "completo una vez POR CADA evento, subestimando la pérdida "
+                    "neta agregada real de la cartera. Si se trata de pólizas "
+                    "distintas que casualmente comparten nombre, puede ignorar "
+                    "este aviso."
+                )
+
             # Mostrar información en status bar
             total_eventos = len(eventos)
             activos_count = len(eventos_activos)
@@ -12340,6 +12489,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     _dbg(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': SIN factores_ajuste")
 
                 eventos_simulacion.append(evento)
+
+            # R4 crítico #1: estimar el uso de memoria ANTES de arrancar el
+            # hilo. num_simulaciones x E[N] (sumado entre eventos activos)
+            # aproxima la cantidad total de ocurrencias que el motor tendrá
+            # que generar en arrays de numpy; por encima de un umbral
+            # empírico esto agota la RAM disponible y el proceso es matado
+            # por el sistema operativo sin ningún diálogo de error ni datos
+            # guardados. Se le da al usuario la chance de cancelar antes de
+            # que eso ocurra.
+            ocurrencias_estimadas = sum(
+                _estimar_frecuencia_esperada_evento(e) for e in eventos_activos
+            ) * num_simulaciones
+            if ocurrencias_estimadas > OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA:
+                gb_estimados = (ocurrencias_estimadas * BYTES_ESTIMADOS_POR_OCURRENCIA) / (1024 ** 3)
+                respuesta = QtWidgets.QMessageBox.question(
+                    self, "Posible uso alto de memoria",
+                    f"Esta configuración generaría aproximadamente "
+                    f"{ocurrencias_estimadas:,.0f} ocurrencias totales "
+                    f"(num. simulaciones x frecuencia esperada por evento), "
+                    f"lo que podría requerir ~{gb_estimados:,.1f} GB de "
+                    f"memoria RAM y hacer que la aplicación se cierre "
+                    f"abruptamente si no hay suficiente disponible.\n\n"
+                    f"Considere reducir el número de simulaciones o revisar "
+                    f"si algún valor de tasa/frecuencia fue tipeado por "
+                    f"error.\n\n¿Desea continuar de todas formas?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No
+                )
+                if respuesta != QtWidgets.QMessageBox.Yes:
+                    self.statusBar().showMessage("Simulación cancelada por uso estimado de memoria.", 5000)
+                    return
 
             # Desactivar la interfaz mientras se ejecuta la simulación
             self.set_interfaz_activa(False)
@@ -12441,24 +12621,51 @@ class RiskLabApp(QtWidgets.QMainWindow):
             pass
 
 
-        # Obtener texto de resultados
-        self.actualizar_progreso_post(72, "Calculando estadísticas agregadas")
-        resultados_texto = self.generar_resultados(
-            perdidas_totales,
-            frecuencias_totales,
-            perdidas_por_evento,
-            frecuencias_por_evento,
-            eventos,
-            generar_reporte=self.generar_reporte,
-            pdf_filename=self.pdf_filename
-        )
+        # R4 crítico #2: generar_resultados/graficar_resultados corrían sin
+        # ningún try/except dentro de este slot, que Qt invoca de forma
+        # cross-thread (conexión "queued") desde SimulacionThread. Una
+        # excepción que escape de un slot conectado así no queda como un
+        # simple traceback recuperable: en PyQt5 puede terminar en un
+        # SIGABRT que mata TODO el proceso (confirmado experimentalmente:
+        # un solo NaN/Inf aislado en perdidas_totales -- posible por
+        # cualquier bug menor en un factor estocástico -- hace que
+        # np.percentile()/pandas.astype(int) o gaussian_kde lancen una
+        # excepción aquí). Se envuelve el pipeline de post-procesamiento
+        # para que un dato corrupto muestre un error legible en vez de
+        # abortar la aplicación entera y perder la sesión completa.
+        try:
+            # Obtener texto de resultados
+            self.actualizar_progreso_post(72, "Calculando estadísticas agregadas")
+            resultados_texto = self.generar_resultados(
+                perdidas_totales,
+                frecuencias_totales,
+                perdidas_por_evento,
+                frecuencias_por_evento,
+                eventos,
+                generar_reporte=self.generar_reporte,
+                pdf_filename=self.pdf_filename
+            )
 
-        # Mostrar resultados en la interfaz
-        self.mostrar_resultados_en_interfaz(resultados_texto)
+            # Mostrar resultados en la interfaz
+            self.mostrar_resultados_en_interfaz(resultados_texto)
 
-        # Graficar resultados en la pestaña de Resultados
-        self.actualizar_progreso_post(90, "Generando gráficos")
-        self.graficar_resultados(perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos)
+            # Graficar resultados en la pestaña de Resultados
+            self.actualizar_progreso_post(90, "Generando gráficos")
+            self.graficar_resultados(perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos)
+        except Exception as e:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
+            if hasattr(self, 'progress_animation_timer'):
+                self.progress_animation_timer.stop()
+            QtWidgets.QMessageBox.critical(
+                self, "Error al procesar resultados",
+                f"La simulación terminó pero ocurrió un error al procesar/graficar "
+                f"los resultados: {traducir_error(e)}\n\n"
+                f"Esto puede deberse a valores no válidos (NaN/Infinito) generados "
+                f"por algún evento o factor de ajuste. Revise la configuración de "
+                f"los eventos e intente nuevamente."
+            )
+            return
 
         # Asegurar que la sección de Excedencia exista y quede habilitada
         try:
@@ -12632,7 +12839,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 event.ignore()
                 return
             hilo.stop()
-            hilo.wait(10_000)
+            # R4 crítico #3: hilo.wait(10_000) puede hacer TIMEOUT (retorna
+            # False) si un chunk individual de la simulación está a mitad de
+            # una llamada al motor no interrumpible (is_running solo se
+            # revisa ENTRE chunks). Antes se ignoraba el valor de retorno y
+            # se llamaba event.accept() igual, permitiendo que la app se
+            # cierre (y el intérprete termine) mientras el QThread real
+            # sigue vivo en otro hilo del SO -- exactamente el escenario
+            # que este mismo método (fix bug #30) buscaba eliminar por
+            # completo. Ahora, si el hilo no llega a detenerse a tiempo, NO
+            # se cierra la aplicación.
+            if not hilo.wait(10_000):
+                QtWidgets.QMessageBox.warning(
+                    self, "Simulación aún en ejecución",
+                    "La simulación no terminó de detenerse a tiempo (puede "
+                    "estar procesando un bloque de cálculo extenso). Por "
+                    "seguridad, la aplicación no se cerrará todavía. "
+                    "Intente cerrar nuevamente en unos segundos."
+                )
+                event.ignore()
+                return
         event.accept()
 
     def generar_resultados(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento,

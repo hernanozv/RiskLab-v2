@@ -6,6 +6,7 @@
 
 import sys
 import os
+import threading
 import numpy as np
 from scipy import stats
 from scipy.stats import gaussian_kde
@@ -101,6 +102,66 @@ class RiskLabAjusteImperfectoWarning(UserWarning):
     pass
 
 
+# Fix crítico #2 (QA ronda 3): en un ejecutable empaquetado con PyInstaller en
+# modo "windowed" (sin consola, como Risk_Lab_Beta.spec con console=False),
+# sys.stderr puede ser None. El módulo warnings de la librería estándar
+# maneja ese caso de forma explícita: si sys.stderr is None, warnings.warn()
+# descarta el aviso EN SILENCIO, sin excepción y sin ningún rastro. Esto
+# volvía invisibles en producción a TODOS los avisos de las categorías
+# RiskLab* (cap de frecuencia, fallback de rejection sampling, fallback
+# genérico, ajuste imperfecto de Gamma/Beta), aunque el motor siguiera
+# aplicando correctamente sus salvaguardas matemáticas. Instalamos un
+# showwarning propio que nunca depende exclusivamente de sys.stderr: además
+# de intentar el comportamiento estándar (para no perder la salida en
+# consola durante desarrollo), siempre deja un rastro en un buffer en
+# memoria que el resto de la app puede inspeccionar de forma explícita
+# (ver _drenar_avisos_riesgo_desde).
+_RISKLAB_WARNING_CATEGORIAS = (
+    RiskLabFrequencyCapWarning, RiskLabRejectionFallbackWarning,
+    RiskLabFallbackWarning, RiskLabAjusteImperfectoWarning,
+)
+_riesgo_warnings_buffer = []
+_riesgo_warnings_lock = threading.Lock()
+_riesgo_warnings_showwarning_original = warnings.showwarning
+
+
+def _riesgo_warnings_showwarning(message, category, filename, lineno, file=None, line=None):
+    if issubclass(category, _RISKLAB_WARNING_CATEGORIAS):
+        with _riesgo_warnings_lock:
+            _riesgo_warnings_buffer.append((category.__name__, str(message)))
+            if len(_riesgo_warnings_buffer) > 500:
+                del _riesgo_warnings_buffer[:len(_riesgo_warnings_buffer) - 500]
+    try:
+        _riesgo_warnings_showwarning_original(message, category, filename, lineno, file, line)
+    except Exception:
+        # sys.stderr puede ser None (build windowed) u otro objeto que no
+        # soporte .write(); el rastro en memoria de arriba ya quedó guardado,
+        # así que un fallo aquí no debe propagarse.
+        pass
+
+
+warnings.showwarning = _riesgo_warnings_showwarning
+
+
+def _drenar_avisos_riesgo_desde(indice_inicio):
+    """Devuelve (y consume) los avisos RiskLab* acumulados desde indice_inicio
+    en adelante, junto con el nuevo índice actual del buffer. Permite a la UI
+    mostrar al usuario los avisos ocurridos durante una operación puntual
+    (p.ej. una simulación) sin depender de que sys.stderr esté disponible."""
+    with _riesgo_warnings_lock:
+        nuevos = list(_riesgo_warnings_buffer[indice_inicio:])
+        indice_actual = len(_riesgo_warnings_buffer)
+    return nuevos, indice_actual
+
+
+def _indice_actual_avisos_riesgo():
+    """Índice actual del buffer de avisos RiskLab*, para usar como marca de
+    inicio antes de una operación cuyos avisos se quieran inspeccionar
+    despues con _drenar_avisos_riesgo_desde."""
+    with _riesgo_warnings_lock:
+        return len(_riesgo_warnings_buffer)
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -136,6 +197,8 @@ _CAMPOS_INTERNOS_SIMULACION = (
     '_cap_frecuencia_suma_capeada',
     '_cap_frecuencia_media_original',
     '_cap_frecuencia_media_capeada',
+    '_cap_perdida_agregada_aplicado',
+    '_cap_perdida_agregada_num_simulaciones',
 )
 
 
@@ -3634,6 +3697,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         if perdidas_para_este_evento is None:
             perdidas_para_este_evento = np.zeros(num_simulaciones)
 
+        _num_excedidas_cap_agregado = int(np.sum(perdidas_para_este_evento > 1e12))
+        if _num_excedidas_cap_agregado > 0:
+            nombre_evento = evento.get('nombre', evento_id)
+            warnings.warn(
+                f"Evento '{nombre_evento}': la pérdida agregada por simulación superó el tope "
+                f"de seguridad de $1e12 en {_num_excedidas_cap_agregado} de {num_simulaciones} simulaciones "
+                f"y fue truncada a ese valor. Los resultados para este evento subestiman la pérdida real "
+                f"en esas simulaciones (severidad de cola muy pesada y/o frecuencia muy alta).",
+                RiskLabFallbackWarning,
+                stacklevel=2
+            )
+            evento['_cap_perdida_agregada_aplicado'] = True
+            evento['_cap_perdida_agregada_num_simulaciones'] = _num_excedidas_cap_agregado
         np.clip(perdidas_para_este_evento, 0, 1e12, out=perdidas_para_este_evento)
         
         # =====================================================
@@ -3739,6 +3815,12 @@ class SimulacionThread(QThread):
         self.is_running = True
 
     def run(self):
+        # R3 crítico #2: marca de inicio en el buffer global de avisos RiskLab*,
+        # para poder mostrarle al usuario (al terminar) los avisos de
+        # RiskLabRejectionFallbackWarning/RiskLabAjusteImperfectoWarning que
+        # antes solo iban a warnings.warn() y podian perderse en silencio en
+        # un build empaquetado (sys.stderr=None).
+        self.avisos_riesgo_indice_inicio = _indice_actual_avisos_riesgo()
         try:
             total = self.num_simulaciones
             if total <= 0:
@@ -11246,6 +11328,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             beta_minimo_ui, beta_mas_probable_ui, beta_maximo_ui, beta_confianza_ui = None, None, None, None
             calculated_alpha, calculated_beta = None, None
 
+            _indice_avisos_ajuste = _indice_actual_avisos_riesgo()
             if freq_opcion == 1: # Poisson
                  if not tasa_var.text(): raise ValueError("La tasa media (λ) no puede estar vacía.")
                  tasa = float(tasa_var.text())
@@ -11315,6 +11398,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             if dist_freq is None:
                  raise ValueError("No se pudo crear la distribución de frecuencia.")
+
+            # R3 crítico #2: si el ajuste Gamma/Beta de arriba fue imperfecto
+            # (RiskLabAjusteImperfectoWarning), avisar de forma explícita: antes
+            # dependía únicamente de warnings.warn(), invisible en un build
+            # empaquetado con sys.stderr=None.
+            _avisos_ajuste, _ = _drenar_avisos_riesgo_desde(_indice_avisos_ajuste)
+            _msgs_ajuste = [m for c, m in _avisos_ajuste if c == 'RiskLabAjusteImperfectoWarning']
+            if _msgs_ajuste:
+                QtWidgets.QMessageBox.warning(
+                    dialog, "Ajuste estadístico imperfecto",
+                    "\n\n".join(_msgs_ajuste)
+                )
 
             # Parsear límites superiores opcionales
             sev_limite_superior = None
@@ -12261,6 +12356,58 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 "frecuencia de estos eventos para evitar esta distorsión."
             )
             QtWidgets.QMessageBox.warning(self, "Frecuencia Reescalada (resultados distorsionados)", mensaje)
+
+        # R3 crítico #1: mismo patrón que el aviso de cap de frecuencia arriba,
+        # pero para el tope de seguridad de pérdida agregada por evento (1e12),
+        # que antes se truncaba sin ningún aviso visible al usuario.
+        eventos_cap_perdida = [e for e in eventos if e.get('_cap_perdida_agregada_aplicado')]
+        if eventos_cap_perdida:
+            lineas = []
+            for e in eventos_cap_perdida[:10]:
+                lineas.append(
+                    f"• {e.get('nombre', 'N/A')}: {e.get('_cap_perdida_agregada_num_simulaciones', 0):,} "
+                    f"simulación(es) truncada(s) a $1.000.000.000.000"
+                )
+            mensaje = (
+                f"{len(eventos_cap_perdida)} evento(s) tuvieron pérdidas agregadas por simulación que "
+                f"superaron el tope interno de seguridad ($1e12) y fueron truncadas a ese valor, lo cual "
+                f"SUBESTIMA las pérdidas en esas simulaciones:\n\n" + "\n".join(lineas)
+            )
+            if len(eventos_cap_perdida) > 10:
+                mensaje += f"\n\n... y {len(eventos_cap_perdida) - 10} evento(s) adicional(es)."
+            mensaje += (
+                "\n\nRevise los parámetros de severidad de estos eventos (posible cola demasiado pesada) "
+                "para evitar esta distorsión."
+            )
+            QtWidgets.QMessageBox.warning(self, "Pérdida Truncada (resultados distorsionados)", mensaje)
+
+        # R3 crítico #2: RiskLabRejectionFallbackWarning (rejection sampling
+        # que no convergió para un límite superior de freq/sev) y
+        # RiskLabAjusteImperfectoWarning (ajuste Gamma/Beta de mala calidad)
+        # no tenían, hasta ahora, ningún mecanismo de respaldo si
+        # warnings.warn() no llegaba a mostrarse (build empaquetado con
+        # sys.stderr=None). Ahora se leen desde el buffer global que
+        # warnings.showwarning captura siempre, sin depender de stderr.
+        indice_inicio = getattr(getattr(self, 'simulation_thread', None), 'avisos_riesgo_indice_inicio', None)
+        if indice_inicio is not None:
+            avisos_nuevos, _ = _drenar_avisos_riesgo_desde(indice_inicio)
+            categorias_ya_cubiertas = ('RiskLabFrequencyCapWarning',)
+            mensajes_unicos = []
+            vistos = set()
+            for categoria, mensaje_aviso in avisos_nuevos:
+                if categoria in categorias_ya_cubiertas or mensaje_aviso in vistos:
+                    continue
+                vistos.add(mensaje_aviso)
+                mensajes_unicos.append(mensaje_aviso)
+            if mensajes_unicos:
+                cuerpo = "\n\n".join(f"• {m}" for m in mensajes_unicos[:10])
+                if len(mensajes_unicos) > 10:
+                    cuerpo += f"\n\n... y {len(mensajes_unicos) - 10} aviso(s) adicional(es)."
+                QtWidgets.QMessageBox.warning(
+                    self, "Avisos del motor de simulación",
+                    "El motor de simulación emitió los siguientes avisos durante esta corrida:\n\n"
+                    + cuerpo
+                )
 
     def simulacion_error(self, mensaje_error):
         # Reactivar la interfaz
@@ -13942,6 +14089,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     cambios = {}
 
                     # Validar y preparar parámetros de frecuencia
+                    _indice_avisos_ajuste = _indice_actual_avisos_riesgo()
                     if evento['freq_opcion'] == 1:  # Poisson
                         if not tasa_var.text().strip():
                             raise ValueError("La tasa media (λ) no puede estar vacía.")
@@ -14041,6 +14189,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         cambios['beta_confianza'] = beta_confianza * 100
                         cambios['beta_alpha'] = alpha
                         cambios['beta_beta'] = beta
+
+                    # R3 crítico #2: mismo aviso que en el diálogo principal de
+                    # eventos si el ajuste Gamma/Beta de arriba fue imperfecto.
+                    _avisos_ajuste, _ = _drenar_avisos_riesgo_desde(_indice_avisos_ajuste)
+                    _msgs_ajuste = [m for c, m in _avisos_ajuste if c == 'RiskLabAjusteImperfectoWarning']
+                    if _msgs_ajuste:
+                        QtWidgets.QMessageBox.warning(
+                            evento_dialog, "Ajuste estadístico imperfecto",
+                            "\n\n".join(_msgs_ajuste)
+                        )
 
                     # Helper para leer de cambios con fallback a evento
                     def _get(key, default=None):
@@ -16573,8 +16731,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
         ax_escenarios = fig_escenarios.add_subplot(111)
 
         # Obtener pérdidas para diferentes percentiles (ordenados de menor a mayor impacto)
+        # R3 crítico #6: la Media se etiquetaba como "50% prob.", lo cual es
+        # estadísticamente falso salvo que media==mediana (no ocurre en
+        # distribuciones sesgadas, la norma en riesgo operacional). Contradecía
+        # tanto a la pestaña Excedencia (que muestra P50 real, distinto de la
+        # media) como al export IA (_build_scenario_impacts ya usa la etiqueta
+        # "promedio" para este mismo valor). Se usa la misma etiqueta aquí.
         escenarios = [
-            ("Típico (Media)", np.mean(perdidas_totales), "50% prob.", '#4CAF50'),
+            ("Típico (Media)", np.mean(perdidas_totales), "promedio", '#4CAF50'),
             ("Adverso (P90)", np.percentile(perdidas_totales, 90), "10% prob.", '#FFC107'),
             ("Muy Adverso (P95)", np.percentile(perdidas_totales, 95), "5% prob.", '#FF9800'),
             ("Extremo (P99)", np.percentile(perdidas_totales, 99), "1% prob.", '#F44336')
@@ -17449,12 +17613,30 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     continue
                 impacto_medio = float(np.mean(p_arr))
                 impacto_p90 = float(np.percentile(p_arr, 90))
-                if f_arr.size > 0 and int(np.max(f_arr)) <= 100000:
-                    freq_modo = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                if f_arr.size > 0:
+                    if int(np.max(f_arr)) <= 100000:
+                        freq_modo = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                    else:
+                        # R3 crítico #5: antes se fijaba en 0 (dato falso, no un
+                        # "N/A") cuando la frecuencia máxima superaba 100.000,
+                        # distorsionando cuadrante e importancia. Mismo fallback
+                        # que ya usan generar_resultados y _build_results_section
+                        # para este caso (moda vía scipy en vez de bincount).
+                        freq_modo = int(stats.mode(f_arr, keepdims=True).mode[0])
                 else:
                     freq_modo = 0
                 freq_media = float(np.mean(f_arr)) if f_arr.size > 0 else 0.0
-                importancia = impacto_p90 * max(freq_modo, 1e-9)
+                # R3 crítico #4: la fórmula anterior (ImpactoP90 x FrecuenciaModo)
+                # colapsaba a 0 para cualquier evento con probabilidad de
+                # ocurrencia anual < 50% (frecuencia_modo=0) o < 10%
+                # (impacto_p90=0 también) — exactamente el perfil de riesgo de
+                # baja frecuencia/alta severidad que Risk Lab está pensado para
+                # modelar, y contradecía al executive_summary (basado en la
+                # media) para el mismo evento. Se usa impacto_medio (pérdida
+                # esperada anual, ya incorpora la frecuencia real de cada
+                # evento) como score de importancia, consistente con el
+                # ranking de "concentracion_riesgo" del resumen ejecutivo.
+                importancia = impacto_medio
                 registros.append({
                     "event_id": ev.get("id"),
                     "event_name": ev.get("nombre"),
@@ -17463,7 +17645,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "frecuencia_modo": freq_modo,
                     "frecuencia_media": freq_media,
                     "importancia_score": importancia,
-                    "importancia_formula": "ImpactoP90 x FrecuenciaModo"
+                    "importancia_formula": "ImpactoMedio (pérdida esperada anual, consistente con el resumen ejecutivo)"
                 })
             if not registros:
                 return None
@@ -18253,8 +18435,25 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         n_sim = int(perdidas_totales.size)
 
+        # R3 crítico #3: 'eventos' (arriba) es res['eventos_riesgo'], que
+        # ejecutar_simulacion ya pre-filtra a solo los eventos ACTIVOS antes
+        # de simular (eventos_activos_originales). Los eventos desactivados
+        # por el usuario nunca llegan a 'eventos' y por lo tanto antes
+        # desaparecían por completo del export (ni se contaban ni se
+        # listaban en input_events), aunque siguieran configurados en el
+        # modelo. 'eventos_todos' es la lista completa (activos + inactivos)
+        # tal como está configurada hoy en la app, usada solo para el conteo
+        # y el listado de input_events; las secciones de resultados siguen
+        # basadas en 'eventos' (los que realmente se simularon).
+        if getattr(self, "current_scenario", None) is not None:
+            eventos_todos = list(getattr(self.current_scenario, "eventos_riesgo", []) or [])
+        else:
+            eventos_todos = list(getattr(self, "eventos_riesgo", []) or [])
+        if not eventos_todos:
+            eventos_todos = list(eventos)
+
         # Mapa id->nombre para resolver vínculos
-        mapa_nombres = {e.get("id"): e.get("nombre") for e in eventos if e.get("id")}
+        mapa_nombres = {e.get("id"): e.get("nombre") for e in eventos_todos if e.get("id")}
 
         # ---- Metadata raíz ----
         try:
@@ -18348,15 +18547,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 ),
                 "eventos_con_cap_aplicado": eventos_con_cap
             },
-            "active_events_count": sum(1 for e in eventos if e.get("activo", True)),
-            "total_events_count": len(eventos),
+            "active_events_count": sum(1 for e in eventos_todos if e.get("activo", True)),
+            "total_events_count": len(eventos_todos),
             "topological_order": topological_order
         }
 
         # ---- Input events (decodificados con descripciones) ----
+        # Incluye TODOS los eventos configurados (activos e inactivos): un
+        # evento inactivo no se simuló (no tiene datos en 'results'), pero
+        # sigue formando parte del modelo y el agente IA debe poder verlo.
         payload["input_events"] = [
             self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
-            for e in eventos
+            for e in eventos_todos
         ]
 
         # ---- Input scenarios ----
@@ -19106,6 +19308,31 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             f"dependencia cíclica entre sus eventos vinculados. "
                             f"Corrija los vínculos en el archivo antes de importarlo."
                         )
+
+                # R3 crítico #7: validar que TODOS los eventos tengan 'nombre'
+                # ANTES de comprometer la transacción. El bloque de "commit" de
+                # abajo ya limpia self.eventos_riesgo/self.scenarios y recién
+                # ahí accede a evento_data['nombre'] sin protección (para
+                # poblar la tabla); si esa clave faltaba, el KeyError ocurría
+                # DESPUÉS de que la configuración previa (válida) del usuario ya
+                # había sido destruida y reemplazada a medias, violando por
+                # completo el diseño transaccional ("todo o nada") que el resto
+                # de esta función respeta.
+                for evento_data in eventos_riesgo_temp:
+                    if not evento_data.get('nombre'):
+                        raise ValueError(
+                            "El archivo contiene un evento sin nombre (o con nombre "
+                            "vacío) en la simulación principal. Corrija el archivo "
+                            "antes de importarlo."
+                        )
+                for scenario in scenarios_temp:
+                    for evento_data in scenario.eventos_riesgo:
+                        if not evento_data.get('nombre'):
+                            raise ValueError(
+                                f"El escenario '{scenario.nombre}' contiene un evento "
+                                f"sin nombre (o con nombre vacío). Corrija el archivo "
+                                f"antes de importarlo."
+                            )
 
                 # === COMMIT DE TRANSACCIÓN: Todo procesado exitosamente, ahora actualizar la UI ===
                 # Limpiar escenarios y resultados actuales

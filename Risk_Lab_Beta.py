@@ -12066,25 +12066,46 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Crear un set con los IDs de eventos activos para filtrar vínculos
             ids_eventos_activos = {e['id'] for e in eventos_activos}
-            
+
             # Filtrar vínculos: eliminar vínculos que apuntan a eventos inactivos
+            # Fix bug medio #17 (QA ronda 2): antes, cuando un vínculo apuntaba a
+            # un evento padre desactivado (ya sea en la pestaña Simulación o
+            # dentro de un Escenario, que reutiliza este mismo flujo), el aviso
+            # de que ese vínculo se ignoraría era solo un print() a consola —
+            # invisible en un build de producción con consola oculta. El
+            # usuario no tenía forma de saber que su evento hijo pasaba a
+            # comportarse como independiente. Se recolectan los eventos
+            # afectados y se muestra un aviso visible en la UI.
+            eventos_con_vinculos_ignorados = []
             for evento in eventos_activos:
                 if 'vinculos' in evento and evento['vinculos']:
                     # Guardar cantidad original para el reporte
                     vinculos_originales = len(evento['vinculos'])
-                    
+
                     # Mantener solo vínculos cuyos padres están activos
                     vinculos_validos = [
-                        v for v in evento['vinculos'] 
+                        v for v in evento['vinculos']
                         if v.get('id_padre') in ids_eventos_activos
                     ]
                     evento['vinculos'] = vinculos_validos
-                    
+
                     # Informar si se filtraron vínculos
                     vinculos_filtrados = vinculos_originales - len(vinculos_validos)
                     if vinculos_filtrados > 0:
-                        print(f"[DEBUG] Evento '{evento['nombre']}': se ignoraron {vinculos_filtrados} vínculo(s) a eventos inactivos")
-            
+                        eventos_con_vinculos_ignorados.append((evento['nombre'], vinculos_filtrados))
+
+            if eventos_con_vinculos_ignorados:
+                detalle = "\n".join(
+                    f"• {nombre}: {n} vínculo(s) ignorado(s)"
+                    for nombre, n in eventos_con_vinculos_ignorados
+                )
+                QtWidgets.QMessageBox.warning(
+                    self, "Vínculos ignorados",
+                    "Algunos vínculos apuntan a eventos padre desactivados y se "
+                    "ignorarán en esta simulación (el evento hijo se comportará "
+                    "como independiente para ese vínculo):\n\n" + detalle
+                )
+
             # Mostrar información en status bar
             total_eventos = len(eventos)
             activos_count = len(eventos_activos)

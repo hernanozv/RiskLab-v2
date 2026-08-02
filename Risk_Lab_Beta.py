@@ -16435,12 +16435,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         p90 = np.percentile(perdidas_totales, 90)
         p99 = np.percentile(perdidas_totales, 99)
         
-        # Definir rangos con los umbrales fijos
+        # Definir rangos con los umbrales fijos.
+        # Fix bug alto #10 (QA ronda 2): el bin "Crítico" usaba
+        # np.max(perdidas_totales) como límite superior junto con una máscara
+        # "< max_val" (comparación estricta), igual que los demás bins. Si hay
+        # una masa puntual en el máximo (p.ej. severidad determinista, o un
+        # límite de póliza que satura muchas simulaciones exactamente en el
+        # mismo valor), esas simulaciones quedaban excluidas de TODOS los
+        # bins (ni siquiera "Crítico" las contaba), haciendo que las 4
+        # probabilidades sumaran menos de 100% — en el caso extremo, 0% si
+        # TODA la masa crítica está en ese máximo. Se usa np.inf como límite
+        # superior del último bin (sin masa puntual puede caer ahí), igual
+        # que hace la referencia _build_risk_classification (">= umbral_alto"
+        # sin límite superior).
         rangos = [
             (0, umbral_bajo, "Bajo"),
             (umbral_bajo, umbral_moderado, "Moderado"),
             (umbral_moderado, umbral_alto, "Alto"),
-            (umbral_alto, np.max(perdidas_totales), "Crítico")
+            (umbral_alto, np.inf, "Crítico")
         ]
         
         # Calcular probabilidad para cada rango con visualización mejorada

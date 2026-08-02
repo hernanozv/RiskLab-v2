@@ -98,183 +98,6 @@ class InteractiveFigureCanvas(FigureCanvas):
             formatter (func, optional): Función para formatear los valores en el tooltip
             highlight_colors (list, optional): Colores específicos para resaltar cada punto
         """
-        self.tooltip_labels.append({
-            'ax': ax,
-            'x_data': np.asarray(x_data),
-            'y_data': np.asarray(y_data),
-            'labels': labels,
-            'artists': artists,
-            'formatter': formatter
-        })
-        
-        # Identificador único para este eje
-        ax_id = id(ax)
-        
-        # Crear o actualizar los datos de tooltip para este eje
-        if ax_id not in self.tooltip_data:
-            self.tooltip_data[ax_id] = {'x': [], 'y': [], 'labels': [], 'highlight_colors': []}
-            
-        # Agregar los nuevos datos
-        self.tooltip_data[ax_id]['x'].extend(x_data)
-        self.tooltip_data[ax_id]['y'].extend(y_data)
-        
-        # Manejar el caso donde labels es None
-        if labels is not None:
-            self.tooltip_data[ax_id]['labels'].extend(labels)
-        else:
-            # Si no hay etiquetas, crear etiquetas vacías o basadas en el formatter
-            if formatter is not None:
-                self.tooltip_data[ax_id]['labels'].extend([None] * len(x_data))
-            else:
-                # Etiquetas genéricas si no hay formatter ni labels
-                self.tooltip_data[ax_id]['labels'].extend([f"Punto {i+1}" for i in range(len(x_data))])
-        
-        # Manejar colores de resaltado
-        if highlight_colors is not None:
-            # Verificar si highlight_colors es una lista o un solo color
-            if isinstance(highlight_colors, list):
-                self.tooltip_data[ax_id]['highlight_colors'].extend(highlight_colors)
-            else:
-                # Si es un solo color, aplicarlo a todos los puntos
-                self.tooltip_data[ax_id]['highlight_colors'].extend([highlight_colors] * len(x_data))
-        else:
-            # Valor por defecto si no se especifican colores
-            self.tooltip_data[ax_id]['highlight_colors'].extend([None] * len(x_data))
-        
-        # Actualizar contador de datos para optimizar rendimiento
-        self._dataset_size += len(x_data)
-        
-        # Optimizar umbral de distancia basado en el tamaño del dataset
-        if self._dataset_size > 500:
-            self._optimize_tooltip_data(ax_id)
-    
-    def _optimize_tooltip_data(self, ax_id):
-        """Optimiza los datos de tooltip para grandes conjuntos de datos usando KD-Tree."""
-        try:
-            data = self.tooltip_data[ax_id]
-            points = np.column_stack([data['x'], data['y']])
-            
-            # Crear KD-Tree para búsquedas eficientes de puntos cercanos
-            if len(points) > 0:
-                data['kdtree'] = cKDTree(points)
-                data['using_kdtree'] = True
-        except ImportError:
-            # Si scipy no está disponible, usar el método estándar
-            data['using_kdtree'] = False
-    
-    def _on_mouse_move(self, event):
-        """Maneja el evento de movimiento del mouse para mostrar tooltips."""
-        if not event.inaxes or not self.tooltip_enabled:
-            self._clear_hover_annotation()
-            return
-            
-        # Guardar posición del mouse para uso futuro
-        self._mouse_position = event
-        
-        # Implementar throttling para evitar demasiadas actualizaciones
-        current_time = time.time() * 1000  # Convertir a ms
-        if current_time - self.last_tooltip_time < self.tooltip_delay:
-            return
-        
-        self.last_tooltip_time = current_time
-        self._process_tooltip(event)
-    
-    def _process_tooltip(self, event):
-        """Procesa lógica de tooltips con optimizaciones de rendimiento."""
-        if not event or not event.inaxes:
-            self._clear_hover_annotation()
-            return
-            
-        # Ocultar cualquier tooltip anterior
-        self._clear_hover_annotation()
-        
-        # Verificar todos los conjuntos de datos registrados
-        for data_set in self.tooltip_labels:
-            if event.inaxes != data_set['ax']:
-                continue
-                
-            # Encontrar el punto más cercano al cursor
-            x, y = event.xdata, event.ydata
-            x_data = data_set['x_data']
-            y_data = data_set['y_data']
-            
-            # Solo procesar si tenemos datos
-            if len(x_data) == 0 or len(y_data) == 0:
-                continue
-            
-            # Optimizar búsqueda para grandes conjuntos de datos
-            if len(x_data) > 500 and KDTREE_AVAILABLE:
-                # Usar KDTree para búsqueda eficiente de vecinos más cercanos
-                points = np.column_stack([x_data, y_data])
-                tree = cKDTree(points)
-                dist, min_idx = tree.query([x, y], k=1)
-            else:
-                # Método estándar para conjuntos pequeños
-                distances = np.sqrt((x_data - x)**2 + (y_data - y)**2)
-                min_idx = np.argmin(distances)
-                dist = distances[min_idx]
-            
-            # Solo mostrar tooltip si el punto está lo suficientemente cerca
-            # Adaptamos el umbral según el tamaño del gráfico
-            threshold = 0.02 * max(
-                event.inaxes.get_xlim()[1] - event.inaxes.get_xlim()[0],
-                event.inaxes.get_ylim()[1] - event.inaxes.get_ylim()[0]
-            )
-            
-            if dist > threshold:
-                continue
-            
-            # Obtener los valores del punto más cercano
-            point_x = x_data[min_idx]
-            point_y = y_data[min_idx]
-            
-            # Formatear el texto del tooltip
-            formatter = data_set.get('formatter')
-            if formatter:
-                tooltip_text = formatter(point_x, point_y)
-            else:
-                x_value = point_x
-                y_value = point_y
-                
-                # Aplicar formato específico si es monetario
-                if self.tooltip_format.startswith('$'):
-                    y_value = self.tooltip_format.format(value=y_value)
-                
-                tooltip_text = f"X: {x_value}\nY: {y_value}"
-                
-                # Usar etiquetas personalizadas si están disponibles
-                if data_set.get('labels') and min_idx < len(data_set['labels']):
-                    label = data_set['labels'][min_idx]
-                    if label:
-                        tooltip_text = f"{label}\n{tooltip_text}"
-            
-            # Verificar si hay un color de resaltado específico
-            highlight_color = None
-            if data_set.get('highlight_colors') and min_idx < len(data_set['highlight_colors']):
-                highlight_color = data_set['highlight_colors'][min_idx]
-            
-            # Crear anotación del tooltip
-            self._show_tooltip(event.inaxes, point_x, point_y, tooltip_text, highlight_color)
-            
-            # Resaltar el artista correspondiente si está disponible
-            if data_set.get('artists') and min_idx < len(data_set['artists']):
-                self._highlight_artist(data_set['artists'][min_idx])
-            
-            break  # Solo mostramos un tooltip a la vez
-            
-    def add_tooltip_data(self, ax, x_data, y_data, labels=None, artists=None, formatter=None, highlight_colors=None, highlight_color=None):
-        """
-        Agrega datos para mostrar en tooltips cuando el usuario pasa el mouse sobre ellos.
-        
-        Args:
-            ax (Axes): Objeto Axes al que pertenecen los datos
-            x_data (array-like): Datos del eje X
-            y_data (array-like): Datos del eje Y
-            labels (list, optional): Etiquetas para cada punto de datos
-            artists (list, optional): Artistas de matplotlib asociados con los datos
-            formatter (func, optional): Función para formatear los valores en el tooltip
-            highlight_colors (list, optional): Colores específicos para resaltar cada punto
-        """
         # Manejar el caso donde se proporciona highlight_color (singular) en lugar de highlight_colors (plural)
         if highlight_color is not None and highlight_colors is None:
             highlight_colors = highlight_color
@@ -379,30 +202,44 @@ class InteractiveFigureCanvas(FigureCanvas):
             x, y = event.xdata, event.ydata
             x_data = data_set['x_data']
             y_data = data_set['y_data']
-            
+
             # Solo procesar si tenemos datos
             if len(x_data) == 0 or len(y_data) == 0:
                 continue
-            
+
+            # Fix bug #25: normalizar ambos ejes por su rango antes de calcular
+            # distancia. Sin esto, la distancia euclidiana en unidades de datos
+            # queda dominada por el eje con mayor magnitud absoluta (p.ej.
+            # frecuencia 0-30 vs pérdida en millones), pudiendo seleccionar el
+            # punto equivocado como "más cercano" al cursor.
+            xlim = event.inaxes.get_xlim()
+            ylim = event.inaxes.get_ylim()
+            x_range = (xlim[1] - xlim[0]) or 1.0
+            y_range = (ylim[1] - ylim[0]) or 1.0
+
+            x_data_norm = (x_data - xlim[0]) / x_range
+            y_data_norm = (y_data - ylim[0]) / y_range
+            x_norm = (x - xlim[0]) / x_range
+            y_norm = (y - ylim[0]) / y_range
+
             # Optimizar búsqueda para grandes conjuntos de datos
             if len(x_data) > 500 and KDTREE_AVAILABLE:
                 # Usar KDTree para búsqueda eficiente de vecinos más cercanos
-                points = np.column_stack([x_data, y_data])
+                points = np.column_stack([x_data_norm, y_data_norm])
                 tree = cKDTree(points)
-                dist, min_idx = tree.query([x, y], k=1)
+                dist, min_idx = tree.query([x_norm, y_norm], k=1)
             else:
                 # Método estándar para conjuntos pequeños
-                distances = np.sqrt((x_data - x)**2 + (y_data - y)**2)
+                distances = np.sqrt((x_data_norm - x_norm)**2 + (y_data_norm - y_norm)**2)
                 min_idx = np.argmin(distances)
                 dist = distances[min_idx]
-            
-            # Solo mostrar tooltip si el punto está lo suficientemente cerca
-            # Adaptamos el umbral según el tamaño del gráfico
-            threshold = 0.02 * max(
-                event.inaxes.get_xlim()[1] - event.inaxes.get_xlim()[0],
-                event.inaxes.get_ylim()[1] - event.inaxes.get_ylim()[0]
-            )
-            
+
+            # Solo mostrar tooltip si el punto está lo suficientemente cerca.
+            # El umbral ahora es una fracción fija del rango normalizado (0-1
+            # en cada eje), equivalente al 2% original pero aplicado por igual
+            # a ambas dimensiones en vez de quedar dominado por una sola.
+            threshold = 0.02
+
             if dist > threshold:
                 continue
             

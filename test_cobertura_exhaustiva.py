@@ -159,6 +159,21 @@ def test_O_sev_normal_direct_std_negativo_rechazado():
     raise AssertionError("Normal con std<0 deberia ser rechazada")
 
 
+def test_O_sev_normal_min_mode_max_moda_fuera_de_rango_rechazada():
+    """Regresion bug #23: a diferencia de PERT/GPD/Lognormal, la Normal con
+    input_method='min_mode_max' no validaba que mas_probable estuviera
+    dentro de [minimo, maximo]."""
+    gen = ENGINE['generar_distribucion_severidad']
+    try:
+        gen(1, 100, 500, 200, input_method='min_mode_max')
+    except (ValueError, Exception):
+        pass
+    else:
+        raise AssertionError("Normal con moda fuera de [min,max] deberia ser rechazada")
+    # Caso valido (moda dentro de rango) no debe fallar
+    gen(1, 100, 150, 200, input_method='min_mode_max')
+
+
 def test_O_sev_lognormal_mean_negativo_rechazado():
     gen = ENGINE['generar_distribucion_severidad']
     try:

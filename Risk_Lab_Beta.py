@@ -488,6 +488,8 @@ def obtener_parametros_normal(minimo, mas_probable, maximo):
     """Calcula los parámetros mu y sigma para la distribución Normal utilizando mínimos y máximos."""
     if minimo >= maximo:
         raise ValueError("El valor mínimo debe ser menor que el máximo.")
+    if not (minimo <= mas_probable <= maximo):
+        raise ValueError("Los valores deben cumplir que mínimo <= más probable <= máximo.")
     mu = mas_probable
     sigma = (maximo - minimo) / (2 * 3)
     return mu, sigma
@@ -16056,10 +16058,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
         canvas_term = InteractiveFigureCanvas(fig_term)
         ax_term = fig_term.add_subplot(111)
 
-        # Definir umbrales de riesgo FIJOS
-        umbral_bajo = 3_000_000        # Bajo: menos de 3 millones
-        umbral_moderado = 32_000_000   # Moderado: entre 3 y 32 millones
-        umbral_alto = 110_000_000      # Alto: entre 32 y 110 millones
+        # Definir umbrales de riesgo FIJOS (fuente única: _UMBRALES_RIESGO_USD,
+        # fix bug #24: antes hardcodeados por separado en cada gráfico, con
+        # riesgo de desincronizarse)
+        umbral_bajo = _UMBRALES_RIESGO_USD["bajo"]
+        umbral_moderado = _UMBRALES_RIESGO_USD["moderado"]
+        umbral_alto = _UMBRALES_RIESGO_USD["alto"]
         # Crítico: más de 110 millones
 
         # Calcular estadísticas de la distribución para contextualizar
@@ -16227,9 +16231,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
         ax_semaforo = fig_semaforo.add_subplot(111)
         
         # Usar los mismos umbrales fijos que en el termómetro de riesgo
-        umbral_bajo = 3_000_000        # Bajo: menos de 3 millones
-        umbral_moderado = 32_000_000   # Moderado: entre 3 y 32 millones
-        umbral_alto = 110_000_000      # Alto: entre 32 y 110 millones
+        # (fuente única: _UMBRALES_RIESGO_USD, fix bug #24)
+        umbral_bajo = _UMBRALES_RIESGO_USD["bajo"]
+        umbral_moderado = _UMBRALES_RIESGO_USD["moderado"]
+        umbral_alto = _UMBRALES_RIESGO_USD["alto"]
         # Crítico: más de 110 millones
         
         # Calcular los percentiles P90 y P99 para referencia
@@ -16502,9 +16507,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
         ax_calendario = fig_calendario.add_subplot(111)
 
         # Usar los mismos 4 umbrales que en otros gráficos (Termómetro, Semáforo)
-        umbral_bajo = 3_000_000
-        umbral_moderado = 32_000_000
-        umbral_alto = 110_000_000
+        # (fuente única: _UMBRALES_RIESGO_USD, fix bug #24)
+        umbral_bajo = _UMBRALES_RIESGO_USD["bajo"]
+        umbral_moderado = _UMBRALES_RIESGO_USD["moderado"]
+        umbral_alto = _UMBRALES_RIESGO_USD["alto"]
 
         # 4 niveles consistentes con otros gráficos
         niveles = [
@@ -17355,6 +17361,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         u_sup2 = float(np.percentile(perdidas_totales, min(100, pct + 5)))
                         mascara = (perdidas_totales >= u_inf2) & (perdidas_totales <= u_sup2)
                         indices = np.where(mascara)[0]
+                    # Fix bug #26 (recurrencia del bug de CVaR/media_cola_condicional):
+                    # cuando hay una masa puntual grande en 0 (p.ej. 97% de años sin
+                    # pérdida), el limite inferior de la ventana (percentil pct-2.5 o
+                    # pct-5) puede caer dentro de esa masa y quedar en 0, haciendo que
+                    # la mascara ">= u_inf" incluya TODAS las simulaciones en cero,
+                    # no solo las cercanas al percentil objetivo. Esto colapsaba la
+                    # "contribución marginal en P99" a la contribución promedio general.
+                    # Si el percentil objetivo es estrictamente positivo, excluimos las
+                    # simulaciones en cero de la ventana (no son parte de la cola real).
+                    if valor_p > 0:
+                        indices = indices[perdidas_totales[indices] > 0]
                 # Total agregado en ese rango
                 if pct is None:
                     total_rango = float(np.mean(perdidas_totales))

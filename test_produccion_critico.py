@@ -673,6 +673,44 @@ def test_EE_sev_freq_tabla_vacia():
                      label="Sev_freq tabla vacia: equivalente a sin escala")
 
 
+def test_EE_sev_freq_tabla_respeta_factor_max():
+    """Regresion bug medio #13 (QA ronda 2): el modo "tabla" de
+    escalamiento por reincidencia ignoraba sev_freq_factor_max (a
+    diferencia de lineal/exponencial, que sí lo respetan), aunque la UI
+    siempre muestra el texto "..., máx x{factor_max}" sin importar el tipo
+    elegido. Una fila de tabla con un multiplicador mayor a factor_max se
+    aplicaba sin capear. Ahora el resultado con un multiplicador de tabla
+    de 50x y factor_max=5.0 debe ser equivalente a usar directamente un
+    multiplicador de 5.0x (el cap)."""
+    evento_sin_cap = _build_evento(
+        'e1', 'TablaCap5', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='tabla',
+        sev_freq_tabla=[{'desde': 1, 'hasta': None, 'multiplicador': 50.0}],
+        sev_freq_factor_max=5.0,
+    )
+    evento_cap_directo = _build_evento(
+        'e1', 'TablaCapDirecto', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='tabla',
+        sev_freq_tabla=[{'desde': 1, 'hasta': None, 'multiplicador': 5.0}],
+        sev_freq_factor_max=5.0,
+    )
+    perd_sin_cap, _, _, _ = _simular([evento_sin_cap], num_sims=8000, seed=14039)
+    perd_cap_directo, _, _, _ = _simular([evento_cap_directo], num_sims=8000, seed=14039)
+    assert_close_rel(perd_sin_cap.mean(), perd_cap_directo.mean(), tol_rel=0.05,
+                     label="Bug medio #13: tabla con multiplicador 50x y factor_max=5.0 "
+                          "se comporta igual que un multiplicador de tabla de 5.0x (capeado)")
+
+
 # ===========================================================================
 # FF. VINCULO EDGE CASES (clipping de inputs)
 # ===========================================================================

@@ -3360,9 +3360,20 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         factor_max = max(1.0, float(evento.get('sev_freq_factor_max', 5.0)))
 
                         if tipo_esc == 'tabla':
+                            # Fix bug medio #13 (QA ronda 2): sev_freq_factor_max está
+                            # documentado como el cap del modelo "reincidencia" en
+                            # general (no solo lineal/exponencial), y la UI siempre
+                            # muestra el texto "..., máx ×{factor_max}" sin importar el
+                            # tipo de escalamiento elegido — incluyendo "tabla". Sin
+                            # aplicar este cap acá, ese texto era engañoso: un
+                            # multiplicador de tabla más alto que factor_max se usaba
+                            # sin capear, a diferencia de lineal/exponencial (que sí
+                            # respetan el cap mostrado en pantalla).
                             tabla = evento.get('sev_freq_tabla', [])
                             if tabla:
-                                _multiplicadores = _aplicar_tabla_escalamiento(_occurrence_idx, tabla)
+                                _multiplicadores = np.minimum(
+                                    _aplicar_tabla_escalamiento(_occurrence_idx, tabla), factor_max
+                                )
                             else:
                                 _multiplicadores = np.ones(len(_occurrence_idx))
                         elif tipo_esc == 'exponencial':

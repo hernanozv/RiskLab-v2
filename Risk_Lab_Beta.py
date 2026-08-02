@@ -1601,12 +1601,25 @@ def ordenar_eventos_por_dependencia(eventos_riesgo):
     visitados = set()
     stack = []
 
-    def dfs(evento_id):
-        visitados.add(evento_id)
-        for hijo_id in hijos_map.get(evento_id, ()):
-            if hijo_id not in visitados:
-                dfs(hijo_id)
-        stack.append(evento_id)
+    def dfs(evento_id_inicial):
+        # Fix bug #31: DFS iterativo (pila explícita) en vez de recursivo.
+        # Con cadenas de dependencia largas (p.ej. ~1000+ eventos en serie
+        # A→B→...→Z, válidas y sin ciclos), la versión recursiva excedía el
+        # límite de recursión de Python (RecursionError) aun sin haber ningún
+        # ciclo. Cada elemento de la pila guarda su propio iterador de hijos
+        # para replicar exactamente el orden de visita post-order de la
+        # versión recursiva original.
+        pila = [(evento_id_inicial, iter(hijos_map.get(evento_id_inicial, ())))]
+        visitados.add(evento_id_inicial)
+        while pila:
+            nodo_id, hijos_iter = pila[-1]
+            siguiente_hijo = next((h for h in hijos_iter if h not in visitados), None)
+            if siguiente_hijo is not None:
+                visitados.add(siguiente_hijo)
+                pila.append((siguiente_hijo, iter(hijos_map.get(siguiente_hijo, ()))))
+            else:
+                stack.append(nodo_id)
+                pila.pop()
 
     for evento in eventos_riesgo:
         if evento['id'] not in visitados:
@@ -11888,6 +11901,35 @@ class RiskLabApp(QtWidgets.QMainWindow):
         
         # Refrescar layout si la ventana está maximizada (fix bug de alineación)
         self._refrescar_ventana_maximizada()
+
+        # Fix bug #32: el warning de cap de frecuencia (RiskLabFrequencyCapWarning)
+        # solo se emitía via warnings.warn desde el hilo de fondo, sin ningún
+        # receptor que lo mostrara en la UI. En un build de producción
+        # (consola oculta) ese warning no llega a ningún lado visible, y la
+        # única forma de enterarse de que los resultados están distorsionados
+        # era abrir el export JSON opcional y buscar el campo
+        # '_cap_frecuencia_aplicado'. Ahora se revisa directamente sobre los
+        # eventos de esta corrida y se avisa al usuario en la propia UI.
+        eventos_capeados = [e for e in eventos if e.get('_cap_frecuencia_aplicado')]
+        if eventos_capeados:
+            lineas = []
+            for e in eventos_capeados[:10]:
+                lineas.append(
+                    f"• {e.get('nombre', 'N/A')}: media de {e.get('_cap_frecuencia_media_original', 0):,.1f} "
+                    f"→ ~{e.get('_cap_frecuencia_media_capeada', 0):,.1f} eventos/simulación"
+                )
+            mensaje = (
+                f"{len(eventos_capeados)} evento(s) superaron el límite interno de frecuencia "
+                f"del motor y sus frecuencias fueron reescaladas hacia abajo, lo cual SUBESTIMA "
+                f"las pérdidas:\n\n" + "\n".join(lineas)
+            )
+            if len(eventos_capeados) > 10:
+                mensaje += f"\n\n... y {len(eventos_capeados) - 10} evento(s) adicional(es)."
+            mensaje += (
+                "\n\nReduzca el número de simulaciones o revise los parámetros de "
+                "frecuencia de estos eventos para evitar esta distorsión."
+            )
+            QtWidgets.QMessageBox.warning(self, "Frecuencia Reescalada (resultados distorsionados)", mensaje)
 
     def simulacion_error(self, mensaje_error):
         # Reactivar la interfaz

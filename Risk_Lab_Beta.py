@@ -3365,7 +3365,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             else:
                                 _multiplicadores = np.ones(len(_occurrence_idx))
                         elif tipo_esc == 'exponencial':
-                            base = float(evento.get('sev_freq_base', 1.5))
+                            # Fix bug #49 (QA ronda 2, alto #6): sev_freq_base documentado
+                            # como > 1.0 (mismo patrón que sev_freq_paso/sev_freq_factor_max).
+                            # Sin este piso: base<1 hacia que el multiplicador DISMINUYERA con
+                            # la reincidencia (invirtiendo la severidad en vez de escalarla);
+                            # base=0 anulaba (multiplicador=0) todas las ocurrencias desde la
+                            # 2da en adelante; base negativo producia signo alternante segun
+                            # la paridad del indice de ocurrencia (comportamiento erratico).
+                            base = max(1.0, float(evento.get('sev_freq_base', 1.5)))
                             max_exp = np.log(factor_max) / np.log(base) if base > 1 else 100
                             safe_exponents = np.minimum(_occurrence_idx - 1, max_exp)
                             _multiplicadores = base ** safe_exponents

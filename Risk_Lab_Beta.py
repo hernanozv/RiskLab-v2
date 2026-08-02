@@ -9552,8 +9552,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             tipo_combo.currentTextChanged.connect(on_tipo_changed_dialog)
 
             # Probabilidad de activación del vínculo
+            # Fix bug alto #9 (QA ronda 2): usar NoScrollSpinBox/
+            # NoScrollDoubleSpinBox (ya definidas en el proyecto para este
+            # propósito) en vez de QSpinBox/QDoubleSpinBox crudos. Sin esto,
+            # un scroll del mouse sin clic sobre el spinbox cambia su valor
+            # y lo persiste silenciosamente.
             sel_layout.addWidget(QtWidgets.QLabel("Probabilidad de activación (%):"))
-            prob_spinbox = QtWidgets.QSpinBox()
+            prob_spinbox = NoScrollSpinBox()
             prob_spinbox.setRange(1, 100)
             prob_spinbox.setValue(100)
             prob_spinbox.setSuffix("%")
@@ -9562,7 +9567,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             # Factor de severidad condicional
             sel_layout.addWidget(QtWidgets.QLabel("Factor de severidad:"))
-            factor_sev_spinbox = QtWidgets.QDoubleSpinBox()
+            factor_sev_spinbox = NoScrollDoubleSpinBox()
             factor_sev_spinbox.setRange(0.10, 5.00)
             factor_sev_spinbox.setValue(1.00)
             factor_sev_spinbox.setSingleStep(0.01)
@@ -9573,7 +9578,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             # Umbral de severidad del padre
             sel_layout.addWidget(QtWidgets.QLabel("Umbral de severidad del padre ($):"))
-            umbral_sev_spinbox = QtWidgets.QSpinBox()
+            umbral_sev_spinbox = NoScrollSpinBox()
             umbral_sev_spinbox.setRange(0, 999999999)
             umbral_sev_spinbox.setValue(0)
             umbral_sev_spinbox.setSingleStep(1000)
@@ -9641,7 +9646,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 1, tipo_combo)
 
                 # Spinbox para probabilidad de activación
-                prob_spin = QtWidgets.QSpinBox()
+                # Fix bug alto #9 (QA ronda 2): NoScrollSpinBox/
+                # NoScrollDoubleSpinBox en vez de QSpinBox/QDoubleSpinBox
+                # crudos (ver mismo fix arriba, en el diálogo de agregar
+                # vínculo). Estos spinboxes viven embebidos en una tabla
+                # scrolleable: sin esto, scrollear la tabla con el mouse
+                # sobre una celda cambia su valor sin que el usuario haga
+                # clic, y el cambio se persiste silenciosamente.
+                prob_spin = NoScrollSpinBox()
                 prob_spin.setRange(1, 100)
                 prob_spin.setValue(max(1, min(100, vinculo.get('probabilidad', 100))))
                 prob_spin.setSuffix("%")
@@ -9651,7 +9663,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 2, prob_spin)
 
                 # DoubleSpinbox para factor de severidad
-                factor_sev_spin = QtWidgets.QDoubleSpinBox()
+                factor_sev_spin = NoScrollDoubleSpinBox()
                 factor_sev_spin.setRange(0.10, 5.00)
                 factor_sev_spin.setValue(max(0.10, min(5.00, vinculo.get('factor_severidad', 1.0))))
                 factor_sev_spin.setSingleStep(0.01)
@@ -9667,7 +9679,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_table.setCellWidget(idx, 3, factor_sev_spin)
 
                 # Spinbox para umbral de severidad del padre
-                umbral_spin = QtWidgets.QSpinBox()
+                umbral_spin = NoScrollSpinBox()
                 umbral_spin.setRange(0, 999999999)
                 umbral_spin.setValue(max(0, vinculo.get('umbral_severidad', 0)))
                 umbral_spin.setSingleStep(1000)

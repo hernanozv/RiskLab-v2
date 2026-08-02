@@ -31,6 +31,7 @@ import io
 import traceback
 import uuid
 import copy
+from xml.sax.saxutils import escape as _xml_escape_pdf
 
 # Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
 from log_odds_utils import (
@@ -19689,9 +19690,17 @@ class ResultReport:
                 nombre_evento_display = nombre_evento[:57] + "..."
             else:
                 nombre_evento_display = nombre_evento
-            
-            elements.append(Paragraph(f"<b>{i+1}. {nombre_evento_display}</b>", event_title_style))
-            
+            # Fix bug alto #12 (QA ronda 2): escapar el nombre del evento
+            # antes de insertarlo en el markup de reportlab. Paragraph()
+            # interpreta el texto como XML/HTML simplificado (<b>, <i>,
+            # etc.); un nombre con un patrón como "<br" sin cerrar (plausible
+            # si se copia desde Excel/HTML) rompía el parseo y abortaba
+            # doc.build() COMPLETO, sin ninguna pista de qué evento o
+            # carácter lo causó.
+            nombre_evento_escapado = _xml_escape_pdf(nombre_evento_display)
+
+            elements.append(Paragraph(f"<b>{i+1}. {nombre_evento_escapado}</b>", event_title_style))
+
             # Info de vínculos si existen
             vinculos_evt = evento.get('vinculos', [])
             if vinculos_evt:
@@ -19702,6 +19711,9 @@ class ResultReport:
                         if e['id'] == v.get('id_padre'):
                             nombre_padre = e['nombre'][:25]
                             break
+                    # Fix bug alto #12: mismo escape para el nombre del
+                    # evento padre (también texto de usuario).
+                    nombre_padre = _xml_escape_pdf(nombre_padre)
                     desc = f"{v.get('tipo', '?')} → {nombre_padre} ({v.get('probabilidad', 100)}%"
                     fsev = v.get('factor_severidad', 1.0)
                     umbral = v.get('umbral_severidad', 0)
@@ -19856,8 +19868,11 @@ class ResultReport:
             for ax, title in zip(fig.get_axes(), axis_titles):
                 ax.set_title(title)
             
-            # Añadir el título como encabezado en el PDF
-            elements.append(Paragraph(titulo, styles['Heading3']))
+            # Añadir el título como encabezado en el PDF.
+            # Fix bug alto #12: algunos títulos de gráfico pueden derivar de
+            # texto de usuario (p.ej. nombres de evento en el eje); escapar
+            # por la misma razón que el nombre del evento, arriba.
+            elements.append(Paragraph(_xml_escape_pdf(titulo), styles['Heading3']))
             elements.append(Spacer(1, 6))
             
             # Calcular dimensiones máximas seguras para la imagen (75% de ancho, 500 pt de alto)

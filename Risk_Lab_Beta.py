@@ -6,6 +6,7 @@
 
 import sys
 import os
+import threading
 import numpy as np
 from scipy import stats
 from scipy.stats import gaussian_kde
@@ -101,6 +102,66 @@ class RiskLabAjusteImperfectoWarning(UserWarning):
     pass
 
 
+# Fix crítico #2 (QA ronda 3): en un ejecutable empaquetado con PyInstaller en
+# modo "windowed" (sin consola, como Risk_Lab_Beta.spec con console=False),
+# sys.stderr puede ser None. El módulo warnings de la librería estándar
+# maneja ese caso de forma explícita: si sys.stderr is None, warnings.warn()
+# descarta el aviso EN SILENCIO, sin excepción y sin ningún rastro. Esto
+# volvía invisibles en producción a TODOS los avisos de las categorías
+# RiskLab* (cap de frecuencia, fallback de rejection sampling, fallback
+# genérico, ajuste imperfecto de Gamma/Beta), aunque el motor siguiera
+# aplicando correctamente sus salvaguardas matemáticas. Instalamos un
+# showwarning propio que nunca depende exclusivamente de sys.stderr: además
+# de intentar el comportamiento estándar (para no perder la salida en
+# consola durante desarrollo), siempre deja un rastro en un buffer en
+# memoria que el resto de la app puede inspeccionar de forma explícita
+# (ver _drenar_avisos_riesgo_desde).
+_RISKLAB_WARNING_CATEGORIAS = (
+    RiskLabFrequencyCapWarning, RiskLabRejectionFallbackWarning,
+    RiskLabFallbackWarning, RiskLabAjusteImperfectoWarning,
+)
+_riesgo_warnings_buffer = []
+_riesgo_warnings_lock = threading.Lock()
+_riesgo_warnings_showwarning_original = warnings.showwarning
+
+
+def _riesgo_warnings_showwarning(message, category, filename, lineno, file=None, line=None):
+    if issubclass(category, _RISKLAB_WARNING_CATEGORIAS):
+        with _riesgo_warnings_lock:
+            _riesgo_warnings_buffer.append((category.__name__, str(message)))
+            if len(_riesgo_warnings_buffer) > 500:
+                del _riesgo_warnings_buffer[:len(_riesgo_warnings_buffer) - 500]
+    try:
+        _riesgo_warnings_showwarning_original(message, category, filename, lineno, file, line)
+    except Exception:
+        # sys.stderr puede ser None (build windowed) u otro objeto que no
+        # soporte .write(); el rastro en memoria de arriba ya quedó guardado,
+        # así que un fallo aquí no debe propagarse.
+        pass
+
+
+warnings.showwarning = _riesgo_warnings_showwarning
+
+
+def _drenar_avisos_riesgo_desde(indice_inicio):
+    """Devuelve (y consume) los avisos RiskLab* acumulados desde indice_inicio
+    en adelante, junto con el nuevo índice actual del buffer. Permite a la UI
+    mostrar al usuario los avisos ocurridos durante una operación puntual
+    (p.ej. una simulación) sin depender de que sys.stderr esté disponible."""
+    with _riesgo_warnings_lock:
+        nuevos = list(_riesgo_warnings_buffer[indice_inicio:])
+        indice_actual = len(_riesgo_warnings_buffer)
+    return nuevos, indice_actual
+
+
+def _indice_actual_avisos_riesgo():
+    """Índice actual del buffer de avisos RiskLab*, para usar como marca de
+    inicio antes de una operación cuyos avisos se quieran inspeccionar
+    despues con _drenar_avisos_riesgo_desde."""
+    with _riesgo_warnings_lock:
+        return len(_riesgo_warnings_buffer)
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -136,6 +197,8 @@ _CAMPOS_INTERNOS_SIMULACION = (
     '_cap_frecuencia_suma_capeada',
     '_cap_frecuencia_media_original',
     '_cap_frecuencia_media_capeada',
+    '_cap_perdida_agregada_aplicado',
+    '_cap_perdida_agregada_num_simulaciones',
 )
 
 
@@ -332,6 +395,15 @@ def media_cola_condicional(arr, umbral):
     arr = np.asarray(arr)
     cola = arr[arr > umbral]
     return float(cola.mean()) if cola.size > 0 else float(umbral)
+
+# R3 alto #11: helper para leer campos numéricos opcionales del export IA.
+# dict.get(clave, default) SOLO aplica el default si la clave está AUSENTE;
+# si el valor es un None EXPLÍCITO (posible vía import de JSON externo con
+# 'null' literal en un campo numérico), .get() devuelve None igual, y un
+# f-string con formato numérico (p.ej. f"{v:,.0f}") revienta con TypeError.
+def _valor_o_default(valor, default):
+    return default if valor is None else valor
+
 
 # Función para formatear números en formato contable personalizado
 def currency_format(value):
@@ -1470,6 +1542,19 @@ def normalizar_factor_global(factor):
     # NUEVO: Tipo de deducible - 'agregado' (default, backward compat) o 'por_ocurrencia'
     if 'seguro_tipo_deducible' not in factor_norm:
         factor_norm['seguro_tipo_deducible'] = 'agregado'
+    else:
+        # R3 alto #10: el motor filtra pólizas comparando este valor con "==
+        # 'por_ocurrencia'"/"== 'agregado'" EXACTOS (sin normalizar mayúsculas
+        # ni espacios). Un valor como "Agregado" o "POR_OCURRENCIA" (posible
+        # vía import de JSON externo, p.ej. generado por el skill
+        # risk-lab-modeler) no calzaba con NINGUNO de los dos filtros y la
+        # póliza se descartaba en silencio, sin reducir la pérdida ni avisar
+        # al usuario. Se normaliza aquí (único punto canónico) para que
+        # cualquier grafía razonable resuelva al valor exacto esperado.
+        _tipo_ded_raw = str(factor_norm.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+        factor_norm['seguro_tipo_deducible'] = (
+            'por_ocurrencia' if _tipo_ded_raw == 'por_ocurrencia' else 'agregado'
+        )
     
     # NUEVO: Límite por ocurrencia (0 = sin límite por ocurrencia)
     if 'seguro_limite_ocurrencia' not in factor_norm:
@@ -2076,12 +2161,16 @@ def _crear_seccion_escalamiento_ui(parent_layout, evento_data):
         modo_idx_val = modo_combo.currentIndex()
         try:
             if modo_idx_val == 0:  # Lineal
-                p = float(paso_var.text())
-                fm = float(factor_max_lineal_var.text())
+                # R3 medio #19: aplicar los mismos pisos que el motor
+                # (generar_lda_con_secuencialidad), para que la vista previa
+                # muestre lo que realmente va a calcular la simulación, no una
+                # curva decreciente/negativa que en la práctica nunca ocurre.
+                p = max(0.0, float(paso_var.text()))
+                fm = max(1.0, float(factor_max_lineal_var.text()))
                 mults = [min(1 + p * (n - 1), fm) for n in range(1, 8)]
             elif modo_idx_val == 1:  # Exponencial
-                b = float(base_var.text())
-                fm = float(factor_max_exp_var.text())
+                b = max(1.0, float(base_var.text()))
+                fm = max(1.0, float(factor_max_exp_var.text()))
                 mults = [min(b ** (n - 1), fm) for n in range(1, 8)]
             else:  # Tabla
                 mults = []
@@ -2471,6 +2560,12 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
     frecuencias_totales = np.zeros(num_simulaciones, dtype=np.int32)
     perdidas_por_evento = [np.zeros(num_simulaciones) for _ in range(num_eventos)]
     frecuencias_por_evento = [np.zeros(num_simulaciones, dtype=np.int32) for _ in range(num_eventos)]
+    # R3 alto #8: pérdida BRUTA por evento (antes de aplicar cualquier seguro),
+    # usada exclusivamente para evaluar 'umbral_severidad' de los vínculos. Un
+    # vínculo debe dispararse por la magnitud real del incidente del padre, no
+    # por su remanente contable tras el reaseguro (perdidas_por_evento SÍ queda
+    # neta de seguros, como corresponde para las estadísticas reportadas).
+    perdidas_brutas_por_evento = [np.zeros(num_simulaciones) for _ in range(num_eventos)]
     
     # DEBUG: Inspeccionar TODOS los eventos
     if _DEBUG_SIM:
@@ -2505,6 +2600,27 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         
         # Procesando evento para aplicar factores de ajuste si existen
         
+        # R3 medio #21: el motor no era idempotente sobre el MISMO dict de
+        # evento reutilizado entre llamadas. Los campos '_seguros_aplicables'/
+        # '_factores_vector'/etc. solo se (re)calculaban dentro del bloque de
+        # abajo, que no se ejecuta si el evento ya no tiene factores activos
+        # (lista vacía o todos con 'activo': False). Si una llamada anterior
+        # SÍ tenía factores activos sobre este mismo dict, esos campos
+        # quedaban "fantasma" y se seguían aplicando en la llamada siguiente
+        # aunque ya no correspondiera. Se limpian explícitamente antes de
+        # decidir si hay factores activos, para que el resultado de esta
+        # llamada nunca dependa de una llamada previa sobre el mismo dict.
+        # (Mitigado hoy en la práctica porque ejecutar_simulacion siempre
+        # pasa copias frescas de los eventos, pero es un invariante del motor
+        # que cualquier otro caller -- tests, un futuro modo batch -- podría
+        # violar en silencio.)
+        if not any(f.get('activo', True) for f in evento.get('factores_ajuste', [])):
+            for _campo_stale in ('_factores_vector', '_factores_severidad_vector',
+                                  '_usa_estocastico', '_seguros_aplicables',
+                                  '_factores_severidad_vector_es_unidad',
+                                  '_factor_severidad_estatico'):
+                evento.pop(_campo_stale, None)
+
         # ====================================================================
         # APLICAR AJUSTES DE PROBABILIDAD SI EXISTEN FACTORES ACTIVOS
         # ====================================================================
@@ -2626,8 +2742,27 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                         # de la perdida bruta en vez de reducirla.
                                         cob_val = max(0.0, min(100.0, float(100 if _cob_raw is None else _cob_raw)))
                                         lim_val = float(f.get('seguro_limite', 0) or 0)
-                                        tipo_ded = f.get('seguro_tipo_deducible', 'agregado')
+                                        # R3 alto #10: normalizar defensivamente en el propio
+                                        # motor (ver misma normalización en normalizar_factor_global).
+                                        tipo_ded = str(f.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+                                        tipo_ded = 'por_ocurrencia' if tipo_ded == 'por_ocurrencia' else 'agregado'
                                         lim_ocurr = float(f.get('seguro_limite_ocurrencia', 0) or 0)
+                                        # R3 bajo #43: un límite negativo (solo posible vía
+                                        # JSON editado a mano, el spinbox de la UI ya lo
+                                        # restringe a >= 0) era neutralizado en silencio por
+                                        # el guard `if limite > 0` más abajo (se comportaba
+                                        # como "sin límite", igual que 0, pero sin avisar al
+                                        # usuario). Se normaliza explícitamente a 0 y se emite
+                                        # un aviso visible.
+                                        if lim_val < 0 or lim_ocurr < 0:
+                                            warnings.warn(
+                                                f"El seguro '{f.get('nombre', 'Seguro')}' tiene un límite "
+                                                f"negativo (límite agregado=${lim_val:,.0f}, límite por "
+                                                f"ocurrencia=${lim_ocurr:,.0f}); se trata como 'sin límite' (0).",
+                                                RiskLabFallbackWarning, stacklevel=2
+                                            )
+                                            lim_val = max(0.0, lim_val)
+                                            lim_ocurr = max(0.0, lim_ocurr)
                                         seguros_aplicables.append({
                                             'nombre': f.get('nombre', 'Seguro'),
                                             'deducible': ded_val,
@@ -2706,8 +2841,21 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                                     # path estocastico, arriba).
                                     cob_val_s = max(0.0, min(100.0, float(100 if _cob_raw_s is None else _cob_raw_s)))
                                     lim_val_s = float(f.get('seguro_limite', 0) or 0)
-                                    tipo_ded_s = f.get('seguro_tipo_deducible', 'agregado')
+                                    # R3 alto #10: mismo defensivo que en el path estocástico.
+                                    tipo_ded_s = str(f.get('seguro_tipo_deducible', 'agregado')).strip().lower()
+                                    tipo_ded_s = 'por_ocurrencia' if tipo_ded_s == 'por_ocurrencia' else 'agregado'
                                     lim_ocurr_s = float(f.get('seguro_limite_ocurrencia', 0) or 0)
+                                    # R3 bajo #43: mismo caso de límite negativo documentado
+                                    # arriba en el path estocástico.
+                                    if lim_val_s < 0 or lim_ocurr_s < 0:
+                                        warnings.warn(
+                                            f"El seguro '{f.get('nombre', 'Seguro')}' tiene un límite "
+                                            f"negativo (límite agregado=${lim_val_s:,.0f}, límite por "
+                                            f"ocurrencia=${lim_ocurr_s:,.0f}); se trata como 'sin límite' (0).",
+                                            RiskLabFallbackWarning, stacklevel=2
+                                        )
+                                        lim_val_s = max(0.0, lim_val_s)
+                                        lim_ocurr_s = max(0.0, lim_ocurr_s)
                                     seguros_aplicables.append({
                                         'nombre': f.get('nombre', 'Seguro'),
                                         'deducible': ded_val_s,
@@ -2914,9 +3062,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 padre_idx = id_a_index[id_padre]
                 padre_ocurrio = frecuencias_por_evento[padre_idx] > 0
 
-                # Aplicar umbral de severidad del padre si está configurado
+                # Aplicar umbral de severidad del padre si está configurado.
+                # R3 alto #8: se evalúa sobre la pérdida BRUTA del padre (antes
+                # de seguros), no sobre perdidas_por_evento (que ya es neta de
+                # seguros) — de lo contrario un incidente real siempre grave
+                # podía no disparar la cascada solo porque el seguro redujo el
+                # valor comparado contra el umbral.
                 if umbral > 0:
-                    padre_ocurrio = padre_ocurrio & (perdidas_por_evento[padre_idx] >= umbral)
+                    padre_ocurrio = padre_ocurrio & (perdidas_brutas_por_evento[padre_idx] >= umbral)
 
                 # Generar vector de activación probabilística
                 if prob >= 1.0:
@@ -3288,12 +3441,21 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
             )
             warnings.warn(mensaje_cap, RiskLabFrequencyCapWarning, stacklevel=2)
             # Marcar el evento para que el export/UI puedan reportar la distorsion.
-            evento['_cap_frecuencia_aplicado'] = True
-            evento['_cap_frecuencia_factor'] = float(factor)
-            evento['_cap_frecuencia_suma_original'] = int(sum_final_event_frequencies)
-            evento['_cap_frecuencia_suma_capeada'] = int(max_eventos_simulacion)
-            evento['_cap_frecuencia_media_original'] = float(media_original)
-            evento['_cap_frecuencia_media_capeada'] = float(media_capeada)
+            # R3 alto #14: SimulacionThread llama a este motor 10 veces (una por
+            # chunk) reutilizando el MISMO dict de evento. Antes, estos campos se
+            # sobreescribian en cada chunk sin acumular, por lo que al terminar la
+            # corrida completa solo quedaba el factor del ULTIMO chunk que disparo
+            # el cap -- pudiendo ocultar una distorsion mucho mas severa ocurrida
+            # en un chunk anterior. Ahora se conserva el PEOR caso (factor mas
+            # chico = mayor distorsion) de todos los chunks de la corrida.
+            factor_previo = evento.get('_cap_frecuencia_factor')
+            if factor_previo is None or factor < factor_previo:
+                evento['_cap_frecuencia_aplicado'] = True
+                evento['_cap_frecuencia_factor'] = float(factor)
+                evento['_cap_frecuencia_suma_original'] = int(sum_final_event_frequencies)
+                evento['_cap_frecuencia_suma_capeada'] = int(max_eventos_simulacion)
+                evento['_cap_frecuencia_media_original'] = float(media_original)
+                evento['_cap_frecuencia_media_capeada'] = float(media_capeada)
             # Escalar y aplicar redondeo estocástico sin sesgo, preservando la suma exacta al tope
             scaled = final_event_frequencies.astype(np.float64) * factor
             floored = np.floor(scaled).astype(np.int32)
@@ -3339,6 +3501,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         
         # PASO 2: Generar pérdidas basadas en las frecuencias finales.
         perdidas_para_este_evento = None  # Se asignará vectorizado si hay pérdidas; si no, será un vector de ceros
+        perdidas_brutas_este_evento = None  # R3 alto #8: pérdida bruta (pre-seguros), para vínculos
 
         if sum_final_event_frequencies > 0:
             try:
@@ -3480,7 +3643,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         _dbg(f"[DEBUG SEV_FREQ] Evento '{nombre_evento}': Sistémico (alpha={alpha}) aplicado "
                               f"(media: ${_media_antes:,.0f} → ${_media_despues:,.0f}, "
                               f"factor rango: {sev_freq_factor[_indices_pos].min():.3f}-{sev_freq_factor[_indices_pos].max():.3f})")
-                
+
+                    # R3 medio #22: sev_limite_superior se aplicaba (rejection
+                    # sampling) ANTES de este escalamiento por reincidencia/
+                    # sistémico, que multiplica esas mismas pérdidas hasta por
+                    # factor_max. El resultado final podía terminar bien por
+                    # encima del cap declarado, contradiciendo la promesa de
+                    # que ninguna severidad individual supera
+                    # sev_limite_superior. Se re-aplica el cap (clip directo,
+                    # no rejection sampling) sobre el resultado ya escalado.
+                    if sev_cap is not None and sev_cap > 0:
+                        np.minimum(total_perdidas_del_evento_concatenadas, sev_cap,
+                                   out=total_perdidas_del_evento_concatenadas)
+
                 # =====================================================
                 # APLICAR FACTOR DE SEVERIDAD DE VÍNCULOS (cascada)
                 # ANTES de aplicar controles y seguros
@@ -3553,6 +3728,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     limite_ocurr = seguro.get('limite_ocurrencia', 0)
                     limite_agregado = seguro.get('limite', 0)  # Limite agregado anual de ESTA aseguradora
 
+                    # NOTA (R3 bajo #42, deuda técnica documentada, sin fix):
+                    # un 'deducible' NEGATIVO (solo posible vía un JSON
+                    # editado a mano -- el spinbox de la UI lo restringe a
+                    # [0, 999999999]) hace que 'exceso' > pérdida bruta, y el
+                    # pago del seguro puede superarla. El resultado neto
+                    # queda clipeado a >= 0 más abajo en el pipeline (nunca
+                    # se generan pérdidas netas negativas), comportamiento
+                    # ya cubierto y aceptado explícitamente por
+                    # test_GG_seguro_deducible_negativo_no_genera_pagos_negativos
+                    # en test_produccion_critico.py. No se valida/rechaza un
+                    # deducible negativo en el motor porque un archivo JSON
+                    # hecho a mano es la única vía de entrada (fuera del
+                    # alcance normal de la UI).
                     # Calcular pago del seguro para cada perdida individual (ya mitigada)
                     exceso = np.maximum(total_perdidas_del_evento_concatenadas - deducible, 0)
                     pago_seguro = exceso * cobertura_pct
@@ -3582,6 +3770,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         weights=total_perdidas_del_evento_concatenadas,
                         minlength=num_simulaciones
                     )
+                    perdidas_brutas_este_evento = perdidas_brutas_por_sim
 
                     # Fix bug #14: por cada aseguradora, computar su pago por simulacion,
                     # aplicar SU limite agregado, y solo despues acumular en el total.
@@ -3608,6 +3797,15 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             'limite_agregado': limite_agregado_aseg
                         })
 
+                    # R3 alto #9: si el usuario configura pólizas superpuestas (misma
+                    # capa/deducible en más de una aseguradora), la suma de sus pagos
+                    # individuales puede superar la propia pérdida bruta del evento.
+                    # El resultado final ya quedaba protegido por el np.maximum(...,0)
+                    # de abajo, pero el pago combinado reportado (usado en el debug y
+                    # potencialmente en futuros reportes) resultaba económicamente
+                    # incoherente (más pagado que lo que efectivamente se perdió).
+                    np.minimum(pagos_seguro_por_sim, perdidas_brutas_por_sim, out=pagos_seguro_por_sim)
+
                     # Perdidas netas = brutas - pago del seguro (respetando limite agregado)
                     # (el limite agregado ya fue aplicado por aseguradora en el bucle anterior)
                     perdidas_para_este_evento = perdidas_brutas_por_sim - pagos_seguro_por_sim
@@ -3633,7 +3831,22 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
         if perdidas_para_este_evento is None:
             perdidas_para_este_evento = np.zeros(num_simulaciones)
+        if perdidas_brutas_este_evento is None:
+            perdidas_brutas_este_evento = np.zeros(num_simulaciones)
 
+        _num_excedidas_cap_agregado = int(np.sum(perdidas_para_este_evento > 1e12))
+        if _num_excedidas_cap_agregado > 0:
+            nombre_evento = evento.get('nombre', evento_id)
+            warnings.warn(
+                f"Evento '{nombre_evento}': la pérdida agregada por simulación superó el tope "
+                f"de seguridad de $1e12 en {_num_excedidas_cap_agregado} de {num_simulaciones} simulaciones "
+                f"y fue truncada a ese valor. Los resultados para este evento subestiman la pérdida real "
+                f"en esas simulaciones (severidad de cola muy pesada y/o frecuencia muy alta).",
+                RiskLabFallbackWarning,
+                stacklevel=2
+            )
+            evento['_cap_perdida_agregada_aplicado'] = True
+            evento['_cap_perdida_agregada_num_simulaciones'] = _num_excedidas_cap_agregado
         np.clip(perdidas_para_este_evento, 0, 1e12, out=perdidas_para_este_evento)
         
         # =====================================================
@@ -3665,6 +3878,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
             # Fórmula: pago_seguro = min((perdida_agregada_bruta - deducible) * cobertura%, limite)
             # Si limite == 0, significa sin límite (ilimitado)
+            # NOTA (R3 bajo #42): mismo caso de deducible negativo documentado
+            # arriba en la rama 'por_ocurrencia' -- el resultado neto se
+            # clipea a >= 0 más abajo, comportamiento ya aceptado por test.
             exceso = np.maximum(perdidas_brutas_agregado - deducible, 0)
             pago_seguro = exceso * cobertura_pct
             if limite > 0:
@@ -3678,10 +3894,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                   f"(Pago medio seguro: ${pago_seguro.mean():,.0f})")
 
         if seguros_agregados:
+            # R3 alto #9: mismo cap que en seguros por_ocurrencia, para pólizas
+            # agregadas superpuestas (misma capa en más de una aseguradora).
+            np.minimum(pago_seguro_agregado_total, perdidas_brutas_agregado, out=pago_seguro_agregado_total)
             perdidas_para_este_evento = perdidas_brutas_agregado - pago_seguro_agregado_total
             np.maximum(perdidas_para_este_evento, 0, out=perdidas_para_este_evento)  # No puede ser negativa
         
         perdidas_por_evento[idx] = perdidas_para_este_evento
+        perdidas_brutas_por_evento[idx] = perdidas_brutas_este_evento
 
         perdidas_totales += perdidas_para_este_evento
         # Optimización: acumular frecuencias_totales incrementalmente para evitar
@@ -3739,6 +3959,12 @@ class SimulacionThread(QThread):
         self.is_running = True
 
     def run(self):
+        # R3 crítico #2: marca de inicio en el buffer global de avisos RiskLab*,
+        # para poder mostrarle al usuario (al terminar) los avisos de
+        # RiskLabRejectionFallbackWarning/RiskLabAjusteImperfectoWarning que
+        # antes solo iban a warnings.warn() y podian perderse en silencio en
+        # un build empaquetado (sys.stderr=None).
+        self.avisos_riesgo_indice_inicio = _indice_actual_avisos_riesgo()
         try:
             total = self.num_simulaciones
             if total <= 0:
@@ -3829,26 +4055,6 @@ class Scenario:
         self.nombre = nombre
         self.descripcion = descripcion
         self.eventos_riesgo = []
-
-    def to_dict(self):
-        eventos_serializables = []
-        for evento in self.eventos_riesgo:
-            evt = copy.deepcopy(evento)
-            for key in list(evt.keys()):
-                if key in ('dist_severidad', 'dist_frecuencia') or key.startswith('_'):
-                    del evt[key]
-            eventos_serializables.append(evt)
-        return {
-            'nombre': self.nombre,
-            'descripcion': self.descripcion,
-            'eventos_riesgo': eventos_serializables
-        }
-
-    @staticmethod
-    def from_dict(data):
-        scenario = Scenario(data['nombre'], data.get('descripcion', ''))
-        scenario.eventos_riesgo = data.get('eventos_riesgo', [])
-        return scenario
 
 # Clase personalizada de QComboBox que ignora el scroll del mouse
 class NoScrollComboBox(QtWidgets.QComboBox):
@@ -8115,8 +8321,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             if getattr(self, 'ax_exceed_tol_label', None) is not None:
                                 ax = self.ax_exceed_tol_line.axes
                                 x_left, x_right = ax.get_xlim()
-                                x_range = max(1e-3, x_right - x_left)
-                                x_pos = x_left + 0.98 * x_range
+                                # R3 alto #13: la curva de Excedencia usa
+                                # ax.invert_xaxis(), por lo que x_left > x_right
+                                # y (x_right - x_left) es NEGATIVO. El anterior
+                                # max(1e-3, ...) pisaba ese negativo con el piso
+                                # positivo, pegando la etiqueta al borde
+                                # izquierdo en cada uso normal del control de
+                                # tolerancia. Se usa la MISMA fórmula que el
+                                # dibujo inicial (línea ~15404): 2% hacia
+                                # adentro desde x_left, con abs() para que
+                                # funcione igual con eje normal o invertido.
+                                x_pos = x_left - 0.02 * abs(x_right - x_left)
                                 self.ax_exceed_tol_label.set_position((x_pos, T))
                         except Exception:
                             pass
@@ -10165,7 +10380,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             estatico_layout.addRow(afecta_frecuencia_check)
             
             impacto_var = NoScrollSpinBox()
-            impacto_var.setRange(-200, 99)  # Positivo reduce (máx 99%), negativo aumenta
+            # R3 medio #29: el rango permitía hasta -200%, pero el motor
+            # aplica un piso de -99% (factor mínimo 0.01) sin importar cuán
+            # más negativo sea el valor -- un control configurado en -150%
+            # tenía EXACTAMENTE el mismo efecto que uno en -99%, una "zona
+            # muerta" no comunicada al usuario. Se acota el rango a lo que
+            # realmente tiene efecto.
+            impacto_var.setRange(-99, 99)  # Positivo reduce (máx 99%), negativo aumenta
             impacto_var.setValue(30)  # Por defecto 30% reducción
             impacto_var.setSuffix("%")
             impacto_var.setToolTip(
@@ -10213,7 +10434,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             porcentual_layout.setContentsMargins(0, 5, 0, 0)
             
             impacto_severidad_var = NoScrollSpinBox()
-            impacto_severidad_var.setRange(-200, 99)
+            impacto_severidad_var.setRange(-99, 99)
             impacto_severidad_var.setValue(25)
             impacto_severidad_var.setSuffix("%")
             impacto_severidad_var.setToolTip("Positivo reduce el impacto económico (0-99%), negativo lo aumenta")
@@ -10262,6 +10483,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
             seguro_limite_ocurrencia_var.setPrefix("$ ")
             seguro_limite_ocurrencia_var.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
             seguro_layout.addRow("Límite por siniestro:", seguro_limite_ocurrencia_var)
+
+            # R3 medio #20: el motor SOLO lee 'seguro_limite_ocurrencia' para
+            # pólizas 'por_ocurrencia' (lo ignora por completo para
+            # 'agregado'), pero el spinbox quedaba siempre habilitado sin
+            # importar el tipo de deducible seleccionado, sugiriendo
+            # falsamente que el límite tendría efecto también en modo
+            # agregado.
+            def _actualizar_habilitado_limite_ocurrencia():
+                habilitado = tipo_ded_ocurrencia.isChecked()
+                seguro_limite_ocurrencia_var.setEnabled(habilitado)
+                label_lim_ocurr = seguro_layout.labelForField(seguro_limite_ocurrencia_var)
+                if label_lim_ocurr is not None:
+                    label_lim_ocurr.setEnabled(habilitado)
+                seguro_limite_ocurrencia_var.setToolTip(
+                    "Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)"
+                    if habilitado else
+                    "No aplica: el tipo de deducible es 'Agregado anual', el motor ignora este límite"
+                )
+            tipo_ded_ocurrencia.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia())
+            _actualizar_habilitado_limite_ocurrencia()
             
             seguro_limite_var = NoScrollSpinBox()
             seguro_limite_var.setRange(0, 999999999)
@@ -10667,7 +10908,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             estatico_layout.addRow(afecta_frecuencia_check)
             
             impacto_var = NoScrollSpinBox()
-            impacto_var.setRange(-200, 99)  # Positivo reduce (máx 99%), negativo aumenta
+            impacto_var.setRange(-99, 99)  # Positivo reduce (máx 99%), negativo aumenta
             # Invertir signo al cargar: internamente negativo = reducción, UI positivo = reducción
             impacto_var.setValue(-factor_actual.get('impacto_porcentual', -30))  # Pre-cargar valor invertido
             impacto_var.setSuffix("%")
@@ -10724,7 +10965,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             porcentual_layout_edit.setContentsMargins(0, 5, 0, 0)
             
             impacto_severidad_var = NoScrollSpinBox()
-            impacto_severidad_var.setRange(-200, 99)
+            impacto_severidad_var.setRange(-99, 99)
             impacto_severidad_var.setValue(-factor_actual.get('impacto_severidad_pct', -25))
             impacto_severidad_var.setSuffix("%")
             impacto_severidad_var.setToolTip("Positivo reduce el impacto económico (0-99%), negativo lo aumenta")
@@ -10778,6 +11019,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
             seguro_limite_ocurrencia_var_edit.setPrefix("$ ")
             seguro_limite_ocurrencia_var_edit.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
             seguro_layout_edit.addRow("Límite por siniestro:", seguro_limite_ocurrencia_var_edit)
+
+            # R3 medio #20: ver mismo fix en el diálogo de "agregar" factor.
+            def _actualizar_habilitado_limite_ocurrencia_edit():
+                habilitado = tipo_ded_ocurrencia_edit.isChecked()
+                seguro_limite_ocurrencia_var_edit.setEnabled(habilitado)
+                label_lim_ocurr_edit = seguro_layout_edit.labelForField(seguro_limite_ocurrencia_var_edit)
+                if label_lim_ocurr_edit is not None:
+                    label_lim_ocurr_edit.setEnabled(habilitado)
+            tipo_ded_ocurrencia_edit.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_edit())
+            _actualizar_habilitado_limite_ocurrencia_edit()
             
             seguro_limite_var_edit = NoScrollSpinBox()
             seguro_limite_var_edit.setRange(0, 999999999)
@@ -11246,6 +11497,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             beta_minimo_ui, beta_mas_probable_ui, beta_maximo_ui, beta_confianza_ui = None, None, None, None
             calculated_alpha, calculated_beta = None, None
 
+            _indice_avisos_ajuste = _indice_actual_avisos_riesgo()
             if freq_opcion == 1: # Poisson
                  if not tasa_var.text(): raise ValueError("La tasa media (λ) no puede estar vacía.")
                  tasa = float(tasa_var.text())
@@ -11315,6 +11567,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             if dist_freq is None:
                  raise ValueError("No se pudo crear la distribución de frecuencia.")
+
+            # R3 crítico #2: si el ajuste Gamma/Beta de arriba fue imperfecto
+            # (RiskLabAjusteImperfectoWarning), avisar de forma explícita: antes
+            # dependía únicamente de warnings.warn(), invisible en un build
+            # empaquetado con sys.stderr=None.
+            _avisos_ajuste, _ = _drenar_avisos_riesgo_desde(_indice_avisos_ajuste)
+            _msgs_ajuste = [m for c, m in _avisos_ajuste if c == 'RiskLabAjusteImperfectoWarning']
+            if _msgs_ajuste:
+                QtWidgets.QMessageBox.warning(
+                    dialog, "Ajuste estadístico imperfecto",
+                    "\n\n".join(_msgs_ajuste)
+                )
 
             # Parsear límites superiores opcionales
             sev_limite_superior = None
@@ -12095,8 +12359,19 @@ class RiskLabApp(QtWidgets.QMainWindow):
             self.simulation_thread.start()
 
         except ValueError as ve:
+            # R3 bajo #39: si la excepción ocurre DESPUÉS de
+            # set_interfaz_activa(False) (más arriba en este try) pero ANTES
+            # de que el hilo arranque con éxito (p.ej. falla el constructor
+            # de SimulacionThread o .start()), la interfaz quedaba
+            # deshabilitada para siempre -- ningún error_ocurrido/
+            # simulacion_completada llega a reactivarla, porque el hilo
+            # nunca llegó a correr. set_interfaz_activa(True) es idempotente
+            # (solo habilita widgets) y no tiene efecto si la interfaz nunca
+            # llegó a deshabilitarse, por lo que es seguro llamarla siempre.
+            self.set_interfaz_activa(True)
             QtWidgets.QMessageBox.critical(self, "Error", str(ve))
         except Exception as e:
+            self.set_interfaz_activa(True)
             QtWidgets.QMessageBox.critical(self, "Error", f"Error al ejecutar la simulación: {e}")
 
     def actualizar_progreso(self, valor):
@@ -12261,6 +12536,58 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 "frecuencia de estos eventos para evitar esta distorsión."
             )
             QtWidgets.QMessageBox.warning(self, "Frecuencia Reescalada (resultados distorsionados)", mensaje)
+
+        # R3 crítico #1: mismo patrón que el aviso de cap de frecuencia arriba,
+        # pero para el tope de seguridad de pérdida agregada por evento (1e12),
+        # que antes se truncaba sin ningún aviso visible al usuario.
+        eventos_cap_perdida = [e for e in eventos if e.get('_cap_perdida_agregada_aplicado')]
+        if eventos_cap_perdida:
+            lineas = []
+            for e in eventos_cap_perdida[:10]:
+                lineas.append(
+                    f"• {e.get('nombre', 'N/A')}: {e.get('_cap_perdida_agregada_num_simulaciones', 0):,} "
+                    f"simulación(es) truncada(s) a $1.000.000.000.000"
+                )
+            mensaje = (
+                f"{len(eventos_cap_perdida)} evento(s) tuvieron pérdidas agregadas por simulación que "
+                f"superaron el tope interno de seguridad ($1e12) y fueron truncadas a ese valor, lo cual "
+                f"SUBESTIMA las pérdidas en esas simulaciones:\n\n" + "\n".join(lineas)
+            )
+            if len(eventos_cap_perdida) > 10:
+                mensaje += f"\n\n... y {len(eventos_cap_perdida) - 10} evento(s) adicional(es)."
+            mensaje += (
+                "\n\nRevise los parámetros de severidad de estos eventos (posible cola demasiado pesada) "
+                "para evitar esta distorsión."
+            )
+            QtWidgets.QMessageBox.warning(self, "Pérdida Truncada (resultados distorsionados)", mensaje)
+
+        # R3 crítico #2: RiskLabRejectionFallbackWarning (rejection sampling
+        # que no convergió para un límite superior de freq/sev) y
+        # RiskLabAjusteImperfectoWarning (ajuste Gamma/Beta de mala calidad)
+        # no tenían, hasta ahora, ningún mecanismo de respaldo si
+        # warnings.warn() no llegaba a mostrarse (build empaquetado con
+        # sys.stderr=None). Ahora se leen desde el buffer global que
+        # warnings.showwarning captura siempre, sin depender de stderr.
+        indice_inicio = getattr(getattr(self, 'simulation_thread', None), 'avisos_riesgo_indice_inicio', None)
+        if indice_inicio is not None:
+            avisos_nuevos, _ = _drenar_avisos_riesgo_desde(indice_inicio)
+            categorias_ya_cubiertas = ('RiskLabFrequencyCapWarning',)
+            mensajes_unicos = []
+            vistos = set()
+            for categoria, mensaje_aviso in avisos_nuevos:
+                if categoria in categorias_ya_cubiertas or mensaje_aviso in vistos:
+                    continue
+                vistos.add(mensaje_aviso)
+                mensajes_unicos.append(mensaje_aviso)
+            if mensajes_unicos:
+                cuerpo = "\n\n".join(f"• {m}" for m in mensajes_unicos[:10])
+                if len(mensajes_unicos) > 10:
+                    cuerpo += f"\n\n... y {len(mensajes_unicos) - 10} aviso(s) adicional(es)."
+                QtWidgets.QMessageBox.warning(
+                    self, "Avisos del motor de simulación",
+                    "El motor de simulación emitió los siguientes avisos durante esta corrida:\n\n"
+                    + cuerpo
+                )
 
     def simulacion_error(self, mensaje_error):
         # Reactivar la interfaz
@@ -12491,6 +12818,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
         return texto_resultados
 
     def setup_scenarios_tab(self):
+        # NOTA (R3 bajo #37/#38, documentado sin fix): un escenario clona
+        # los eventos de la simulación principal en el momento de crearlo
+        # (ver guardar_scenario) y a partir de ahí solo permite activar/
+        # desactivar eventos existentes y editar sus parámetros -- no hay
+        # forma de agregar un evento nuevo SOLO al escenario, ni de
+        # eliminar uno de él (bajo #37). Tampoco existe una vista de
+        # "comparar escenarios" lado a lado pese a que el texto de la UI
+        # ("¿Qué pasaría si...?") sugiere ese tipo de análisis (bajo #38).
+        # Ambas son limitaciones de producto (features nuevas, no bugs
+        # puntuales) que exceden el alcance de un fix de QA; se dejan
+        # documentadas para una futura iteración de diseño.
         # Fondo sutil para resaltar las cards
         self.scenarios_tab.setStyleSheet("""
             QWidget {
@@ -12803,6 +13141,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         eventos_table.verticalHeader().setVisible(False)
 
         # Obtener la lista de eventos
+        # NOTA (R3 bajo #40, documentado sin fix): self.eventos_scenario se
+        # usa como atributo de instancia (en vez de variable local
+        # capturada por closure) porque debe sobrevivir el límite entre
+        # este método (que solo construye y muestra el diálogo, sin
+        # bloquear) y guardar_scenario (un método SEPARADO, invocado más
+        # tarde como callback del botón "Guardar" del diálogo). Es un code
+        # smell real (el estado vive más de lo necesario en `self` y podría
+        # en teoría ser leído por error desde otro punto del código), pero
+        # refactorizarlo a un parámetro explícito pasado por closure/lambda
+        # tocaría varios métodos y conexiones de señales sin ningún
+        # beneficio funcional (no hay bug de comportamiento actual) --se
+        # deja documentado como deuda técnica de bajo riesgo/bajo impacto.
         self.eventos_scenario = copy.deepcopy(scenario.eventos_riesgo) if scenario else copy.deepcopy(self.eventos_riesgo)
 
         # Función para toggle del estado activo al hacer click
@@ -13363,7 +13713,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 afecta_freq_check.setChecked(True)
                 estatico_form.addRow(afecta_freq_check)
                 impacto_freq_spin = NoScrollSpinBox()
-                impacto_freq_spin.setRange(-200, 99)
+                impacto_freq_spin.setRange(-99, 99)
                 impacto_freq_spin.setValue(30)
                 impacto_freq_spin.setSuffix("%")
                 estatico_form.addRow("   Reducción frecuencia:", impacto_freq_spin)
@@ -13398,7 +13748,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 porcentual_layout_esc = QtWidgets.QFormLayout(porcentual_frame_esc)
                 porcentual_layout_esc.setContentsMargins(0, 5, 0, 0)
                 impacto_sev_spin = NoScrollSpinBox()
-                impacto_sev_spin.setRange(-200, 99)
+                impacto_sev_spin.setRange(-99, 99)
                 impacto_sev_spin.setValue(25)
                 impacto_sev_spin.setSuffix("%")
                 porcentual_layout_esc.addRow("Reducción (%):", impacto_sev_spin)
@@ -13443,6 +13793,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 seguro_lim_ocurr_spin_esc.setPrefix("$ ")
                 seguro_lim_ocurr_spin_esc.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
                 seguro_layout_esc.addRow("Límite por siniestro:", seguro_lim_ocurr_spin_esc)
+
+                # R3 medio #20: ver mismo fix en el diálogo principal de eventos.
+                def _actualizar_habilitado_limite_ocurrencia_esc():
+                    habilitado = tipo_ded_ocurrencia_esc.isChecked()
+                    seguro_lim_ocurr_spin_esc.setEnabled(habilitado)
+                    label_lim_ocurr_esc = seguro_layout_esc.labelForField(seguro_lim_ocurr_spin_esc)
+                    if label_lim_ocurr_esc is not None:
+                        label_lim_ocurr_esc.setEnabled(habilitado)
+                tipo_ded_ocurrencia_esc.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_esc())
+                _actualizar_habilitado_limite_ocurrencia_esc()
                 
                 seguro_lim_spin_esc = NoScrollSpinBox()
                 seguro_lim_spin_esc.setRange(0, 999999999)
@@ -13650,7 +14010,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 afecta_freq_check.setChecked(afecta_freq_default)
                 estatico_form.addRow(afecta_freq_check)
                 impacto_freq_spin = NoScrollSpinBox()
-                impacto_freq_spin.setRange(-200, 99)
+                impacto_freq_spin.setRange(-99, 99)
                 impacto_freq_spin.setValue(-factor_actual.get('impacto_porcentual', -30))
                 impacto_freq_spin.setSuffix("%")
                 impacto_freq_spin.setEnabled(afecta_freq_default)
@@ -13693,7 +14053,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 porcentual_layout_edit_esc = QtWidgets.QFormLayout(porcentual_frame_edit_esc)
                 porcentual_layout_edit_esc.setContentsMargins(0, 5, 0, 0)
                 impacto_sev_spin = NoScrollSpinBox()
-                impacto_sev_spin.setRange(-200, 99)
+                impacto_sev_spin.setRange(-99, 99)
                 impacto_sev_spin.setValue(-factor_actual.get('impacto_severidad_pct', -25))
                 impacto_sev_spin.setSuffix("%")
                 porcentual_layout_edit_esc.addRow("Reducción (%):", impacto_sev_spin)
@@ -13743,6 +14103,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 seguro_lim_ocurr_spin_edit_esc.setPrefix("$ ")
                 seguro_lim_ocurr_spin_edit_esc.setToolTip("Máximo que paga el seguro por siniestro (0 = sin límite por ocurrencia)")
                 seguro_layout_edit_esc.addRow("Límite por siniestro:", seguro_lim_ocurr_spin_edit_esc)
+
+                # R3 medio #20: ver mismo fix en el diálogo principal de eventos.
+                def _actualizar_habilitado_limite_ocurrencia_edit_esc():
+                    habilitado = tipo_ded_ocurrencia_edit_esc.isChecked()
+                    seguro_lim_ocurr_spin_edit_esc.setEnabled(habilitado)
+                    label_lim_ocurr_edit_esc = seguro_layout_edit_esc.labelForField(seguro_lim_ocurr_spin_edit_esc)
+                    if label_lim_ocurr_edit_esc is not None:
+                        label_lim_ocurr_edit_esc.setEnabled(habilitado)
+                tipo_ded_ocurrencia_edit_esc.toggled.connect(lambda _checked: _actualizar_habilitado_limite_ocurrencia_edit_esc())
+                _actualizar_habilitado_limite_ocurrencia_edit_esc()
                 
                 seguro_lim_spin_edit_esc = NoScrollSpinBox()
                 seguro_lim_spin_edit_esc.setRange(0, 999999999)
@@ -13942,6 +14312,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     cambios = {}
 
                     # Validar y preparar parámetros de frecuencia
+                    _indice_avisos_ajuste = _indice_actual_avisos_riesgo()
                     if evento['freq_opcion'] == 1:  # Poisson
                         if not tasa_var.text().strip():
                             raise ValueError("La tasa media (λ) no puede estar vacía.")
@@ -14041,6 +14412,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         cambios['beta_confianza'] = beta_confianza * 100
                         cambios['beta_alpha'] = alpha
                         cambios['beta_beta'] = beta
+
+                    # R3 crítico #2: mismo aviso que en el diálogo principal de
+                    # eventos si el ajuste Gamma/Beta de arriba fue imperfecto.
+                    _avisos_ajuste, _ = _drenar_avisos_riesgo_desde(_indice_avisos_ajuste)
+                    _msgs_ajuste = [m for c, m in _avisos_ajuste if c == 'RiskLabAjusteImperfectoWarning']
+                    if _msgs_ajuste:
+                        QtWidgets.QMessageBox.warning(
+                            evento_dialog, "Ajuste estadístico imperfecto",
+                            "\n\n".join(_msgs_ajuste)
+                        )
 
                     # Helper para leer de cambios con fallback a evento
                     def _get(key, default=None):
@@ -14272,6 +14653,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if not nombre_scenario:
                 raise ValueError("El nombre del escenario no puede estar vacío.")
 
+            # R3 medio #25: sin esta validación, dos escenarios podían tener
+            # el mismo nombre. La restauración del "escenario actual" tras
+            # cargar un JSON empareja por nombre (primer match), por lo que
+            # un archivo con nombres duplicados podía seleccionar el
+            # escenario equivocado de forma silenciosa.
+            for i, sc in enumerate(self.scenarios):
+                if (new or i != row) and sc.nombre == nombre_scenario:
+                    raise ValueError(
+                        f"Ya existe un escenario llamado '{nombre_scenario}'. "
+                        f"Elija un nombre único."
+                    )
+
             # Crear instancia del escenario
             old = self.scenarios[row] if (not new and 0 <= row < len(self.scenarios)) else None
             scenario = Scenario(nombre_scenario, descripcion_scenario)
@@ -14305,6 +14698,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         self.selected_scenario_label.setText(self.current_scenario.nombre)
                     except Exception:
                         pass
+                # R3 medio #26: la rama de edición nunca llamaba a
+                # actualizar_vista_escenarios(), a diferencia de la rama
+                # "nuevo" (línea de arriba). Los setItem() de arriba crean
+                # QTableWidgetItem NUEVOS sin el resaltado (fondo verde/✓)
+                # que esa función aplica, por lo que la fila del escenario
+                # editado quedaba "des-resaltada" aunque siguiera siendo el
+                # escenario actual.
+                self.actualizar_vista_escenarios()
 
             dialog.accept()
 
@@ -14469,17 +14870,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Advertencia", "Seleccione un escenario para simular.")
             return
         
-        # Actualizar el número de simulaciones con el valor ingresado en la pestaña "Escenarios"
+        # R3 alto #15: antes esto sobreescribía self.num_simulaciones_var (la
+        # pestaña "Simulación") de forma PERMANENTE, sin restaurarlo -- a
+        # diferencia de self.eventos_riesgo (que sí se restaura abajo). El
+        # usuario perdía silenciosamente el valor que tenía configurado en la
+        # pestaña Simulación cada vez que corría una simulación de escenario.
+        num_simulaciones_original = self.num_simulaciones_var.text()
         self.num_simulaciones_var.setText(self.num_simulaciones_var_escenarios.text())
-        
+
         # Sustituir temporalmente los eventos con los del escenario
         eventos_originales = self.eventos_riesgo
         try:
             self.eventos_riesgo = self.current_scenario.eventos_riesgo
             self.ejecutar_simulacion()
         finally:
-            # Restaurar siempre los eventos originales de la pestaña Simulación
+            # Restaurar siempre los eventos y el número de simulaciones originales
+            # de la pestaña Simulación.
             self.eventos_riesgo = eventos_originales
+            self.num_simulaciones_var.setText(num_simulaciones_original)
 
     def generar_figuras(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos_riesgo):
         """Genera las figuras de los gráficos para el reporte PDF."""
@@ -14647,11 +15055,22 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if perdidas_cola.size == 0:
             perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
+        # R3 medio #28: cuando la distribución es degenerada (masa puntual en
+        # el máximo que cubre >=20% de las simulaciones), el fallback ">="
+        # de arriba puede terminar seleccionando el 100% de los datos, pero
+        # el título seguía diciendo "Percentil 80 al 100" -- dando la falsa
+        # impresión de una cola extrema diferenciada cuando en realidad no
+        # hay ninguna diferenciación de cola.
+        if perdidas_cola.size >= perdidas_totales.size:
+            titulo_cola = 'Cola de Pérdidas (distribución degenerada: sin diferenciación de cola)'
+        else:
+            titulo_cola = 'Cola de Pérdidas (Percentil 80 al 100)'
+
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure()
         ax10 = fig10.add_subplot(111)
         sns.histplot(perdidas_cola, bins=30, kde=True, color='#1f77b4', edgecolor='black', ax=ax10)
-        ax10.set_title('Cola de Pérdidas (Percentil 80 al 100)')
+        ax10.set_title(titulo_cola)
         ax10.set_xlabel('Pérdida Total')
         ax10.set_ylabel('Frecuencia')
         ax10.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
@@ -14966,9 +15385,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             # Configurar datos para tooltips interactivos
             # Crear una función de formato para los tooltips
+            # R3 bajo #31: ordenar UNA SOLA VEZ (mismo patrón que Gráfico 1 /
+            # formatter_distribucion) en vez de np.sort() en cada hover.
+            _perdidas_sin_cero_sorted = np.sort(perdidas_totales_sin_cero)
+            _perdidas_sin_cero_n = len(perdidas_totales_sin_cero)
             def formatter_distribucion_sin_ceros(x, y):
-                percentil = np.searchsorted(np.sort(perdidas_totales_sin_cero), x)
-                percentil = min(100, max(0, int(percentil / len(perdidas_totales_sin_cero) * 100)))
+                percentil = np.searchsorted(_perdidas_sin_cero_sorted, x)
+                percentil = min(100, max(0, int(percentil / _perdidas_sin_cero_n * 100)))
                 return f"Pérdida: {currency_format(x)}\nPercentil: ~{percentil}%\nFrecuencia: {int(y)}"
             
             # Extraer datos del histograma para tooltips
@@ -15561,6 +15984,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 porcentaje = (y / len(frecuencias_totales)) * 100
                 return f"Eventos: {int(x)}\nSimulaciones: {int(y)}\nPorcentaje: {porcentaje:.2f}%"
 
+            # R3 bajo #34: InteractiveFigureCanvas._process_tooltip recorre
+            # tooltip_labels EN ORDEN y muestra el tooltip del primer dataset
+            # cuyo punto más cercano quede dentro del umbral (no compara
+            # distancias entre datasets, solo hace `break` en el primer
+            # match) -- por lo que el dataset agregado PRIMERO gana un
+            # empate. La moda (idx_max) y la media, por construcción, caen
+            # exactamente sobre un punto (o muy cerca) del dataset genérico
+            # de bins; si ese dataset genérico se agrega antes, "tapa"
+            # (shadowing) el tooltip especial resaltado en rojo/verde, que
+            # nunca se alcanza. Se registran los tooltips especiales de moda
+            # y media ANTES del dataset genérico para que ganen el empate.
+
+            # Añadir tooltip especial para la moda (valor más frecuente)
+            moda_tooltip = f"Moda: {int(x_values[idx_max])} eventos\nSimulaciones: {frecuencia_counts[idx_max]}\nPorcentaje: {(frecuencia_counts[idx_max]/len(frecuencias_totales))*100:.2f}%"
+            canvas4.add_tooltip_data(ax4, [idx_max], [frecuencia_counts[idx_max]], labels=[moda_tooltip], highlight_color=MELI_ROJO)
+
+            # Añadir tooltip para la media
+            media_tooltip = f"Media: {media_freq:.2f} eventos"
+            canvas4.add_tooltip_data(ax4, [media_freq], [0], labels=[media_tooltip], highlight_color=MELI_VERDE)
+
             # Optimización: en el modo rápido (muchos bins) NO agregamos un tooltip por
             # cada bin (eso construye un KDTree con N puntos y satura memoria). En su
             # lugar, samplemos los bins más representativos: top 50 por conteo + moda + media.
@@ -15572,14 +16015,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
             else:
                 # Pocos bins: tooltip por cada barra (interactividad fina)
                 canvas4.add_tooltip_data(ax4, x_values, frecuencia_counts, formatter=formatter_frecuencia)
-
-            # Añadir tooltip especial para la moda (valor más frecuente)
-            moda_tooltip = f"Moda: {int(x_values[idx_max])} eventos\nSimulaciones: {frecuencia_counts[idx_max]}\nPorcentaje: {(frecuencia_counts[idx_max]/len(frecuencias_totales))*100:.2f}%"
-            canvas4.add_tooltip_data(ax4, [idx_max], [frecuencia_counts[idx_max]], labels=[moda_tooltip], highlight_color=MELI_ROJO)
-
-            # Añadir tooltip para la media
-            media_tooltip = f"Media: {media_freq:.2f} eventos"
-            canvas4.add_tooltip_data(ax4, [media_freq], [0], labels=[media_tooltip], highlight_color=MELI_VERDE)
 
             tab7 = QtWidgets.QWidget()
             layout4 = QtWidgets.QVBoxLayout(tab7)
@@ -16054,6 +16489,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                        capprops=cap_props,
                        medianprops=median_props)
                        
+        # R3 alto #17: con showfliers=False, matplotlib autoescala el eje Y
+        # SIN considerar los outliers ocultos (solo mira cajas/bigotes). Para
+        # severidades sesgadas (la norma en riesgo operacional), el Máximo real
+        # y los percentiles P90/P95 -- registrados como tooltips más abajo --
+        # podían caer fuera del rango visible del eje, haciendo esos tooltips
+        # inalcanzables con el mouse aunque los datos existan. Se expande el
+        # ylim para cubrir el rango real (min/max) de todos los eventos,
+        # preservando el boxplot "limpio" (sin marcadores de outliers
+        # dibujados) pero garantizando que el área de hover cubra los puntos
+        # reales de interés.
+        try:
+            _valores_todos = np.concatenate([np.asarray(d) for d in datos_perdidas if len(d) > 0])
+            if _valores_todos.size > 0:
+                _y_min = float(np.min(_valores_todos))
+                _y_max = float(np.max(_valores_todos))
+                _y_pad = max(1e-9, (_y_max - _y_min) * 0.05)
+                ax8.set_ylim(_y_min - _y_pad, _y_max + _y_pad)
+        except Exception:
+            pass
+
         # Personalizar el color de cada caja con un gradiente de azul a amarillo
         for i, patch in enumerate(box['boxes']):
             # Degradado de color desde azul hasta amarillo
@@ -16151,6 +16606,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if perdidas_cola.size == 0:
             perdidas_cola = perdidas_totales[perdidas_totales >= percentil_80]
 
+        # R3 medio #28: ver mismo fix en generar_figuras (título dinámico
+        # para distribuciones degeneradas donde el fallback ">=" selecciona
+        # el 100% de los datos).
+        if perdidas_cola.size >= perdidas_totales.size:
+            titulo_cola = 'Cola de Pérdidas (distribución degenerada: sin diferenciación de cola)'
+        else:
+            titulo_cola = 'Cola de Pérdidas (Percentil 80-100)'
+
         # Gráfico 9: Cola de Pérdidas (Tail Risk)
         fig10 = Figure(figsize=(8, 5))
         canvas10 = InteractiveFigureCanvas(fig10)
@@ -16193,7 +16656,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
         
         # Mejorar títulos y etiquetas
-        ax10.set_title('Cola de Pérdidas (Percentil 80-100)')
+        ax10.set_title(titulo_cola)
         ax10.set_xlabel('Pérdida Total')
         ax10.set_ylabel('Frecuencia')
         
@@ -16573,8 +17036,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
         ax_escenarios = fig_escenarios.add_subplot(111)
 
         # Obtener pérdidas para diferentes percentiles (ordenados de menor a mayor impacto)
+        # R3 crítico #6: la Media se etiquetaba como "50% prob.", lo cual es
+        # estadísticamente falso salvo que media==mediana (no ocurre en
+        # distribuciones sesgadas, la norma en riesgo operacional). Contradecía
+        # tanto a la pestaña Excedencia (que muestra P50 real, distinto de la
+        # media) como al export IA (_build_scenario_impacts ya usa la etiqueta
+        # "promedio" para este mismo valor). Se usa la misma etiqueta aquí.
         escenarios = [
-            ("Típico (Media)", np.mean(perdidas_totales), "50% prob.", '#4CAF50'),
+            ("Típico (Media)", np.mean(perdidas_totales), "promedio", '#4CAF50'),
             ("Adverso (P90)", np.percentile(perdidas_totales, 90), "10% prob.", '#FFC107'),
             ("Muy Adverso (P95)", np.percentile(perdidas_totales, 95), "5% prob.", '#FF9800'),
             ("Extremo (P99)", np.percentile(perdidas_totales, 99), "1% prob.", '#F44336')
@@ -16595,14 +17064,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         # Añadir etiquetas de valor al final de cada barra
         max_valor = max(valores)
+        # R3 bajo #33: si TODOS los valores son 0 (año sin pérdidas en ningún
+        # percentil reportado), max_valor*1.35 == 0 -- un eje X degenerado
+        # (xlim=(0,0)) donde las barras, etiquetas y grid colapsan
+        # visualmente en x=0, ilegible. Se usa un piso de escala solo para
+        # el viewport/offsets (las barras siguen representando 0 fielmente).
+        _escala_para_offsets = max_valor if max_valor > 0 else 1.0
         for bar, prob in zip(bars, probabilidades):
             width = bar.get_width()
             # Valor de la pérdida
-            ax_escenarios.text(width + max_valor * 0.02, bar.get_y() + bar.get_height()/2,
+            ax_escenarios.text(width + _escala_para_offsets * 0.02, bar.get_y() + bar.get_height()/2,
                               f'{currency_format(width)}',
                               ha='left', va='center', fontsize=11, fontweight='bold')
             # Probabilidad de excedencia
-            ax_escenarios.text(width + max_valor * 0.02, bar.get_y() + bar.get_height()/2 - 0.18,
+            ax_escenarios.text(width + _escala_para_offsets * 0.02, bar.get_y() + bar.get_height()/2 - 0.18,
                               f'({prob})',
                               ha='left', va='top', fontsize=9, color='gray')
 
@@ -16614,7 +17089,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         ax_escenarios.set_xlabel('Impacto Económico Potencial', fontsize=11)
         ax_escenarios.set_title('¿Qué impacto habría si se materializara el riesgo?', 
                                fontsize=14, fontweight='bold', pad=15)
-        ax_escenarios.set_xlim(0, max_valor * 1.35)  # Espacio para etiquetas
+        ax_escenarios.set_xlim(0, _escala_para_offsets * 1.35)  # Espacio para etiquetas
         ax_escenarios.set_ylim(-0.8, len(escenarios) - 0.4)  # Espacio para etiqueta de tolerancia
         ax_escenarios.xaxis.set_major_formatter(FuncFormatter(currency_formatter))
         
@@ -16643,6 +17118,22 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.ax_escenarios_tol_line.set_visible(False)
         self.ax_escenarios_tol_label.set_visible(False)
         
+        # R3 bajo #32: la pestaña Escenarios carecía por completo de
+        # tooltips interactivos (a diferencia del resto de gráficos), pese
+        # a que InteractiveFigureCanvas ya soporta la interacción. Se
+        # agrega un tooltip por barra con el detalle completo del
+        # escenario (nombre, valor exacto y probabilidad asociada).
+        def formatter_escenarios(x, y):
+            idx = min(max(0, int(round(y))), len(escenarios) - 1)
+            return (f"{nombres[idx]}\n{currency_format(valores[idx])}"
+                    f"\nProbabilidad: {probabilidades[idx]}")
+
+        canvas_escenarios.add_tooltip_data(
+            ax_escenarios,
+            [w / 2 for w in valores], list(y_pos),
+            formatter=formatter_escenarios
+        )
+
         # Guardar referencias para actualización
         self.ax_escenarios = ax_escenarios
         self.canvas_escenarios = canvas_escenarios
@@ -16793,9 +17284,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         for marca in marcas_tiempo:
             ax_calendario.plot(marca, 0, '|', color='#666666', markersize=15, zorder=2)
 
-        # Posiciones verticales para los 4 niveles (alternando arriba/abajo)
-        y_positions = [1.5, -1.5, 1.5, -1.5]
-        
+        # Posiciones verticales para los 4 niveles (alternando arriba/abajo).
+        # R3 alto #18: antes BAJO/ALTO compartian la fila 1.5 y MODERADO/CRITICO
+        # compartian -1.5. Como 'periodo' se capea a 100 años para la
+        # visualización (línea siguiente), dos niveles con la misma paridad de
+        # fila y periodo_real >= 100 años terminaban en el MISMO punto exacto
+        # (x=100, misma fila), ocultando uno detrás del otro. Ahora cada nivel
+        # tiene su propia fila (4 valores distintos), sin perder la alternancia
+        # visual arriba/abajo.
+        y_positions = [2.0, -2.0, 1.0, -1.0]
+
+        # R3 bajo #32: la pestaña Calendario carecía por completo de
+        # tooltips interactivos. Se acumulan los puntos y su texto
+        # informativo (mismo contenido que ya se muestra siempre en el
+        # cuadro fijo) para registrarlos como tooltip al final del loop.
+        _calendario_tooltip_x = []
+        _calendario_tooltip_labels = []
+        _calendario_tooltip_colores = []
+
         # Dibujar cada nivel como un punto en la línea de tiempo
         for i, datos in enumerate(datos_calendario):
             periodo = min(datos['periodo'], 100)  # Limitar a 100 años para visualización
@@ -16830,6 +17336,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
                               ha='center', va='center' if y_pos > 0 else 'center',
                               fontsize=9, fontweight='bold',
                               bbox=bbox_props)
+
+            _calendario_tooltip_x.append(periodo)
+            _calendario_tooltip_labels.append(info_text.replace("\n\n", "\n"))
+            _calendario_tooltip_colores.append(datos['color'])
+
+        # R3 bajo #32: registrar el tooltip sobre los puntos de la línea de
+        # tiempo (mismo texto que ya se muestra siempre en el cuadro fijo,
+        # útil además cuando dos cuadros quedan visualmente cerca). El eje
+        # X es logarítmico; InteractiveFigureCanvas._process_tooltip ya
+        # normaliza correctamente en escala log (ver fix medio #18, QA
+        # ronda 2), por lo que no requiere ningún ajuste adicional aquí.
+        canvas_calendario.add_tooltip_data(
+            ax_calendario, _calendario_tooltip_x, [0] * len(_calendario_tooltip_x),
+            labels=_calendario_tooltip_labels, highlight_colors=_calendario_tooltip_colores
+        )
 
         # Configurar eje X (logarítmico)
         ax_calendario.set_xscale('log')
@@ -17449,12 +17970,30 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     continue
                 impacto_medio = float(np.mean(p_arr))
                 impacto_p90 = float(np.percentile(p_arr, 90))
-                if f_arr.size > 0 and int(np.max(f_arr)) <= 100000:
-                    freq_modo = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                if f_arr.size > 0:
+                    if int(np.max(f_arr)) <= 100000:
+                        freq_modo = int(np.argmax(np.bincount(f_arr.astype(np.int64))))
+                    else:
+                        # R3 crítico #5: antes se fijaba en 0 (dato falso, no un
+                        # "N/A") cuando la frecuencia máxima superaba 100.000,
+                        # distorsionando cuadrante e importancia. Mismo fallback
+                        # que ya usan generar_resultados y _build_results_section
+                        # para este caso (moda vía scipy en vez de bincount).
+                        freq_modo = int(stats.mode(f_arr, keepdims=True).mode[0])
                 else:
                     freq_modo = 0
                 freq_media = float(np.mean(f_arr)) if f_arr.size > 0 else 0.0
-                importancia = impacto_p90 * max(freq_modo, 1e-9)
+                # R3 crítico #4: la fórmula anterior (ImpactoP90 x FrecuenciaModo)
+                # colapsaba a 0 para cualquier evento con probabilidad de
+                # ocurrencia anual < 50% (frecuencia_modo=0) o < 10%
+                # (impacto_p90=0 también) — exactamente el perfil de riesgo de
+                # baja frecuencia/alta severidad que Risk Lab está pensado para
+                # modelar, y contradecía al executive_summary (basado en la
+                # media) para el mismo evento. Se usa impacto_medio (pérdida
+                # esperada anual, ya incorpora la frecuencia real de cada
+                # evento) como score de importancia, consistente con el
+                # ranking de "concentracion_riesgo" del resumen ejecutivo.
+                importancia = impacto_medio
                 registros.append({
                     "event_id": ev.get("id"),
                     "event_name": ev.get("nombre"),
@@ -17463,7 +18002,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "frecuencia_modo": freq_modo,
                     "frecuencia_media": freq_media,
                     "importancia_score": importancia,
-                    "importancia_formula": "ImpactoP90 x FrecuenciaModo"
+                    "importancia_formula": "ImpactoMedio (pérdida esperada anual, consistente con el resumen ejecutivo)"
                 })
             if not registros:
                 return None
@@ -17591,7 +18130,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "nivel": nombre,
                     "umbral": umbral,
                     "prob_anual_pct": prob_anual_pct,
-                    "periodo_retorno_años": periodo_años_val if periodo != float("inf") else "infinito",
+                    # R3 medio #30: siempre numérico (float) o None -- nunca el
+                    # string "infinito" -- para no alternar de tipo según el
+                    # valor. Cuando es None, "etiqueta" ya indica ">100 años".
+                    "periodo_retorno_años": periodo_años_val,
                     "etiqueta": etiqueta
                 })
             return {
@@ -17816,9 +18358,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "tipo": "Scatter + regresión",
                     "correlacion": corr,
                     "interpretacion": (
+                        # R3 medio #23: solo se reconocía corr > 0.5 (positiva
+                        # fuerte); una correlación NEGATIVA fuerte (p.ej. -0.9)
+                        # se etiquetaba como "moderada o débil", cuando en
+                        # realidad es una relación muy fuerte (inversa).
                         "Correlación positiva fuerte → años con más eventos tienen mayor "
                         "pérdida agregada (típico operacional)."
                         if corr is not None and corr > 0.5 else
+                        "Correlación negativa fuerte → años con más eventos tienen MENOR "
+                        "pérdida agregada (relación inversa, atípica; revisar el modelo)."
+                        if corr is not None and corr < -0.5 else
                         "Correlación moderada o débil entre frecuencia y pérdida."
                     )
                 },
@@ -17958,7 +18507,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 eventos, mapa_nombres):
         """Construye la sección 'results' del export. Incluye:
         aggregate (perdidas + frecuencias agregadas), per_event,
-        correlations, exceedance_curve, tail_analysis, risk_map,
+        correlation, exceedance_curve, tail_analysis, risk_map,
         risk_classification, calendar_periods_of_return,
         marginal_contribution_per_percentile, scenario_impacts,
         insurance_effectiveness, chart_summaries."""
@@ -18122,7 +18671,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 corr_freq_perd = None
         except Exception:
             corr_freq_perd = None
-        results["correlations"] = {
+        # R3 bajo #35: el campo se llamaba "correlations" (plural) pero solo
+        # reporta UN único valor (frecuencia vs. pérdida total). El plural
+        # sugería erróneamente varios pares de correlación disponibles.
+        results["correlation"] = {
             "frecuencia_total_vs_perdida_total": corr_freq_perd,
             "_explicacion": (
                 "Correlación de Pearson entre la cantidad total de eventos y la pérdida "
@@ -18253,8 +18805,25 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
         n_sim = int(perdidas_totales.size)
 
+        # R3 crítico #3: 'eventos' (arriba) es res['eventos_riesgo'], que
+        # ejecutar_simulacion ya pre-filtra a solo los eventos ACTIVOS antes
+        # de simular (eventos_activos_originales). Los eventos desactivados
+        # por el usuario nunca llegan a 'eventos' y por lo tanto antes
+        # desaparecían por completo del export (ni se contaban ni se
+        # listaban en input_events), aunque siguieran configurados en el
+        # modelo. 'eventos_todos' es la lista completa (activos + inactivos)
+        # tal como está configurada hoy en la app, usada solo para el conteo
+        # y el listado de input_events; las secciones de resultados siguen
+        # basadas en 'eventos' (los que realmente se simularon).
+        if getattr(self, "current_scenario", None) is not None:
+            eventos_todos = list(getattr(self.current_scenario, "eventos_riesgo", []) or [])
+        else:
+            eventos_todos = list(getattr(self, "eventos_riesgo", []) or [])
+        if not eventos_todos:
+            eventos_todos = list(eventos)
+
         # Mapa id->nombre para resolver vínculos
-        mapa_nombres = {e.get("id"): e.get("nombre") for e in eventos if e.get("id")}
+        mapa_nombres = {e.get("id"): e.get("nombre") for e in eventos_todos if e.get("id")}
 
         # ---- Metadata raíz ----
         try:
@@ -18348,19 +18917,46 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 ),
                 "eventos_con_cap_aplicado": eventos_con_cap
             },
-            "active_events_count": sum(1 for e in eventos if e.get("activo", True)),
-            "total_events_count": len(eventos),
+            "active_events_count": sum(1 for e in eventos_todos if e.get("activo", True)),
+            "total_events_count": len(eventos_todos),
             "topological_order": topological_order
         }
 
         # ---- Input events (decodificados con descripciones) ----
-        payload["input_events"] = [
-            self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
-            for e in eventos
-        ]
+        # Incluye TODOS los eventos configurados (activos e inactivos): un
+        # evento inactivo no se simuló (no tiene datos en 'results'), pero
+        # sigue formando parte del modelo y el agente IA debe poder verlo.
+        # R3 alto #12: antes, un solo evento que hiciera fallar
+        # _decodificar_evento_para_export (por cualquier motivo no previsto)
+        # abortaba la exportación COMPLETA, incluyendo eventos válidos. Ahora
+        # se aísla el error por evento (igual que ya hace 'input_scenarios'
+        # más abajo) y se deja constancia explícita de lo omitido, en vez de
+        # perder silenciosamente toda la exportación o todo un evento.
+        input_events_block = []
+        input_events_omitidos = []
+        for e in eventos_todos:
+            try:
+                input_events_block.append(
+                    self._decodificar_evento_para_export(e, mapa_nombres_por_id=mapa_nombres)
+                )
+            except Exception as ex:
+                input_events_omitidos.append({
+                    "event_id": e.get("id"), "event_name": e.get("nombre"),
+                    "error": str(ex)
+                })
+        payload["input_events"] = input_events_block
+        if input_events_omitidos:
+            payload["input_events_omitidos"] = input_events_omitidos
 
         # ---- Input scenarios ----
+        # R3 alto #12: antes, un escenario que fallara en cualquier punto se
+        # descartaba ENTERO y en silencio (except/continue), sin dejar
+        # ningún rastro en el payload. Un agente IA no tenía forma de saber
+        # que faltaban uno o más escenarios. Ahora se aísla el error por
+        # escenario (como ya se hace por evento en 'input_events_omitidos')
+        # y se deja constancia explícita en 'input_scenarios_omitidos'.
         scenarios_block = []
+        scenarios_omitidos = []
         for sc in (getattr(self, "scenarios", []) or []):
             try:
                 eventos_sc = sc.eventos_riesgo or []
@@ -18373,9 +18969,13 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         for e in eventos_sc
                     ]
                 })
-            except Exception:
-                continue
+            except Exception as ex:
+                scenarios_omitidos.append({
+                    "nombre": getattr(sc, "nombre", None), "error": str(ex)
+                })
         payload["input_scenarios"] = scenarios_block
+        if scenarios_omitidos:
+            payload["input_scenarios_omitidos"] = scenarios_omitidos
 
         # Las siguientes secciones se llenan paso a paso
         payload["results"] = self._build_results_section(
@@ -18425,7 +19025,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
         }
 
         # ---- Distribución de Frecuencia ----
-        freq_op = int(evento.get("freq_opcion", 3))
+        freq_op = int(_valor_o_default(evento.get("freq_opcion"), 3))
         freq_dist_name = _FREQ_DIST_NAMES.get(freq_op, f"desconocida ({freq_op})")
         freq_block = {
             "distribucion": freq_dist_name,
@@ -18525,11 +19125,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
             if es_seguro:
                 f_out["tipo_severidad"] = "seguro"
                 f_out["seguro"] = {
-                    "tipo_deducible": f.get("seguro_tipo_deducible", "agregado"),
-                    "deducible": f.get("seguro_deducible", 0),
-                    "cobertura_pct": f.get("seguro_cobertura_pct", 0),
-                    "limite_ocurrencia": f.get("seguro_limite_ocurrencia", 0),
-                    "limite_agregado_anual": f.get("seguro_limite", 0)
+                    "tipo_deducible": _valor_o_default(f.get("seguro_tipo_deducible"), "agregado"),
+                    "deducible": _valor_o_default(f.get("seguro_deducible"), 0),
+                    "cobertura_pct": _valor_o_default(f.get("seguro_cobertura_pct"), 0),
+                    "limite_ocurrencia": _valor_o_default(f.get("seguro_limite_ocurrencia"), 0),
+                    "limite_agregado_anual": _valor_o_default(f.get("seguro_limite"), 0)
                 }
                 td = f_out["seguro"]["tipo_deducible"]
                 ded = f_out["seguro"]["deducible"]
@@ -18577,9 +19177,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 "id_padre": id_padre,
                 "nombre_padre": nombre_padre,
                 "tipo": tipo,
-                "probabilidad_pct": v.get("probabilidad", 100),
-                "factor_severidad": v.get("factor_severidad", 1.0),
-                "umbral_severidad": v.get("umbral_severidad", 0)
+                "probabilidad_pct": _valor_o_default(v.get("probabilidad"), 100),
+                "factor_severidad": _valor_o_default(v.get("factor_severidad"), 1.0),
+                "umbral_severidad": _valor_o_default(v.get("umbral_severidad"), 0)
             }
             if tipo == "AND":
                 logica = "Solo ocurre SI el padre ocurrió Y se activa el vínculo"
@@ -18661,8 +19261,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     num_sim_guardar = int(self.num_simulaciones_var.text())
                 except (ValueError, TypeError):
                     num_sim_guardar = 10000
+                # R3 alto #15: el número de simulaciones de la pestaña
+                # Escenarios nunca se persistía (solo el de "Simulación"),
+                # obligando a reconfigurarlo en cada sesión.
+                try:
+                    num_sim_escenarios_guardar = int(self.num_simulaciones_var_escenarios.text())
+                except (ValueError, TypeError):
+                    num_sim_escenarios_guardar = 10000
                 configuracion = {
                     'num_simulaciones': num_sim_guardar,
+                    'num_simulaciones_escenarios': num_sim_escenarios_guardar,
                     'eventos_riesgo': [],
                     'scenarios': [],
                     'current_scenario_name': getattr(getattr(self, 'current_scenario', None), 'nombre', None)
@@ -18797,6 +19405,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 eventos_riesgo_temp = []
                 scenarios_temp = []
                 num_simulaciones_temp = configuracion.get('num_simulaciones', 10000)
+                # R3 alto #15: restaurar también el número de simulaciones de la
+                # pestaña Escenarios (antes nunca se guardaba/cargaba).
+                num_simulaciones_escenarios_temp = configuracion.get('num_simulaciones_escenarios', 10000)
                 
                 # Diccionario para mapear IDs antiguos a nuevos (para evitar conflictos)
                 id_mapeo = {}
@@ -18813,165 +19424,35 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
                 # Cargar eventos de riesgo de la simulación principal a lista temporal
                 for evento_data in configuracion.get('eventos_riesgo', []):
-                    sev_opcion = evento_data['sev_opcion']
-                    sev_input_method = evento_data.get('sev_input_method', 'min_mode_max') # Lee o usa default
-                    sev_params_direct = evento_data.get('sev_params_direct', {}) # Lee o usa default
-                    sev_minimo = evento_data['sev_minimo']
-                    sev_mas_probable = evento_data['sev_mas_probable']
-                    sev_maximo = evento_data['sev_maximo']
-
+                    # R3 alto #16: aislar errores de CUALQUIER punto del procesamiento de
+                    # este evento (no solo generar_distribucion_severidad, ya cubierto por
+                    # el try/except interno de abajo), para que un solo campo faltante o
+                    # mal tipado (freq_opcion, un vinculo sin "tipo", etc.) no aborte TODA
+                    # la importacion -- solo se descarta este evento, igual que ya hacia
+                    # el caso de severidad.
                     try:
-                         dist_sev = generar_distribucion_severidad(
-                            sev_opcion,
-                            sev_minimo,
-                            sev_mas_probable,
-                            sev_maximo,
-                            input_method=sev_input_method,
-                            params_direct=sev_params_direct
-                        )
-                    except Exception as e:
-                          # Acumular error para reportar al usuario (con traducción)
-                          nombre_evento = evento_data.get('nombre', 'N/A')
-                          error_traducido = traducir_error(e)
-                          eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
-                          continue # Saltar al siguiente evento si hay error
-
-                    freq_opcion = evento_data['freq_opcion']
-                    tasa = evento_data.get('tasa', None)
-                    num_eventos = evento_data.get('num_eventos', None)
-                    prob_exito = evento_data.get('prob_exito', None)
-                    if tasa is not None:
-                        tasa = float(tasa)
-                    if num_eventos is not None:
-                        num_eventos = int(num_eventos)
-                    if prob_exito is not None:
-                        prob_exito = float(prob_exito)
-                    if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
-                        vinculos = []
-                        tipo = evento_data.get('tipo_dependencia', 'AND')
-                        for padre_id in evento_data['eventos_padres']:
-                            vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
-                        evento_data['vinculos'] = vinculos
-
-                    pg_params = None
-                    beta_params = None
-                    if freq_opcion == 4:
-                        alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
-                        beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
-                        if alpha is None or beta is None:
-                            try:
-                                pg_min = evento_data.get('pg_minimo')
-                                pg_mode = evento_data.get('pg_mas_probable')
-                                pg_max = evento_data.get('pg_maximo')
-                                pg_conf_pct = evento_data.get('pg_confianza')
-                                if None not in (pg_min, pg_mode, pg_max, pg_conf_pct):
-                                    alpha, beta = obtener_parametros_gamma_para_poisson(float(pg_min), float(pg_mode), float(pg_max), float(pg_conf_pct) / 100.0)
-                            except Exception:
-                                alpha, beta = None, None
-                        if alpha is not None and beta is not None:
-                            pg_params = (float(alpha), float(beta))
-                    elif freq_opcion == 5:
-                        alpha = evento_data.get('beta_alpha')
-                        beta = evento_data.get('beta_beta')
-                        if alpha is not None and beta is not None:
-                            beta_params = (float(alpha), float(beta))
-
-                    dist_freq = generar_distribucion_frecuencia(
-                        freq_opcion,
-                        tasa=tasa,
-                        num_eventos_posibles=num_eventos,
-                        probabilidad_exito=prob_exito,
-                        poisson_gamma_params=pg_params,
-                        beta_params=beta_params
-                    )
-                    evento_data['dist_severidad'] = dist_sev
-                    evento_data['dist_frecuencia'] = dist_freq
-                    
-                    # Normalizar factores_ajuste para backward compatibility
-                    if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
-                        evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
-                        print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' tiene {len(evento_data['factores_ajuste'])} factores (normalizados)")
-                    else:
-                        print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' NO tiene factores_ajuste")
-
-                    # Crear un nuevo ID para el evento y mapearlo
-                    antiguo_id = evento_data['id']
-                    nuevo_id = str(uuid.uuid4())
-                    id_mapeo[antiguo_id] = nuevo_id
-                    evento_data['id'] = nuevo_id
-
-                    # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal
-                    eventos_padres_actualizados = []
-                    for padre_id in evento_data.get('eventos_padres', []):
-                        eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
-                    evento_data['eventos_padres'] = eventos_padres_actualizados
-
-                    # Asegurar que tenga el campo 'activo' (backward compatibility con archivos antiguos)
-                    if 'activo' not in evento_data:
-                        evento_data['activo'] = True
-
-                    # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
-                    eventos_riesgo_temp.append(evento_data)
-
-                # Actualizar IDs en los vínculos después de procesar todos los eventos
-                for evento_data in eventos_riesgo_temp:
-                    if 'vinculos' in evento_data:
-                        vinculos_actualizados = []
-                        for vinculo in evento_data['vinculos']:
-                            id_padre_antiguo = vinculo['id_padre']
-                            if id_padre_antiguo not in id_mapeo:
-                                vinculos_huerfanos.append(
-                                    f"• {evento_data.get('nombre', 'N/A')}: vínculo hacia un evento "
-                                    f"con ID '{id_padre_antiguo}' que no existe en el archivo. "
-                                    f"El vínculo se ignorará (el evento se comportará como independiente)."
-                                )
-                            id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
-                            prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
-                            fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
-                            umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                            # Fix bug #39: partir de una copia del vinculo original (no
-                            # de un dict nuevo con solo 5 claves fijas) para preservar
-                            # cualquier clave desconocida/futura que el archivo pudiera
-                            # traer, en vez de descartarla silenciosamente en cada
-                            # ciclo de guardar/cargar.
-                            vinculo_actualizado = dict(vinculo)
-                            vinculo_actualizado.update({
-                                'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
-                                'probabilidad': prob, 'factor_severidad': fsev,
-                                'umbral_severidad': umbral
-                            })
-                            vinculos_actualizados.append(vinculo_actualizado)
-                        evento_data['vinculos'] = vinculos_actualizados
-
-                # Cargar escenarios
-                for escenario_data in configuracion.get('scenarios', []):
-                    scenario = Scenario(escenario_data['nombre'], escenario_data.get('descripcion', ''))
-                    scenario.eventos_riesgo = []
-
-                    # Nuevo diccionario de IDs para los eventos del escenario
-                    id_mapeo_scenario = {}
-
-                    for evento_data in escenario_data['eventos_riesgo']:
                         sev_opcion = evento_data['sev_opcion']
+                        sev_input_method = evento_data.get('sev_input_method', 'min_mode_max') # Lee o usa default
+                        sev_params_direct = evento_data.get('sev_params_direct', {}) # Lee o usa default
                         sev_minimo = evento_data['sev_minimo']
                         sev_mas_probable = evento_data['sev_mas_probable']
                         sev_maximo = evento_data['sev_maximo']
+
                         try:
-                            dist_sev_esc = generar_distribucion_severidad(
-                                evento_data['sev_opcion'],
-                                evento_data.get('sev_minimo'),
-                                evento_data.get('sev_mas_probable'),
-                                evento_data.get('sev_maximo'),
-                                input_method=evento_data.get('sev_input_method', 'min_mode_max'),
-                                params_direct=evento_data.get('sev_params_direct', {})
+                             dist_sev = generar_distribucion_severidad(
+                                sev_opcion,
+                                sev_minimo,
+                                sev_mas_probable,
+                                sev_maximo,
+                                input_method=sev_input_method,
+                                params_direct=sev_params_direct
                             )
                         except Exception as e:
-                            # Acumular error para reportar al usuario (con traducción)
-                            nombre_evento = evento_data.get('nombre', 'N/A')
-                            nombre_escenario = escenario_data['nombre']
-                            error_traducido = traducir_error(e)
-                            eventos_con_error.append(f"• {nombre_evento} (Escenario: {nombre_escenario}): {error_traducido}")
-                            continue  # Omitir evento con distribución de severidad inválida
+                              # Acumular error para reportar al usuario (con traducción)
+                              nombre_evento = evento_data.get('nombre', 'N/A')
+                              error_traducido = traducir_error(e)
+                              eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
+                              continue # Saltar al siguiente evento si hay error
 
                         freq_opcion = evento_data['freq_opcion']
                         tasa = evento_data.get('tasa', None)
@@ -18989,8 +19470,16 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             for padre_id in evento_data['eventos_padres']:
                                 vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
                             evento_data['vinculos'] = vinculos
+                            # R3 bajo #41: eliminar las claves legacy ya migradas.
+                            # Sin esto, 'eventos_padres'/'tipo_dependencia' quedaban
+                            # colgando en el evento en memoria (y se volvían a
+                            # guardar en el próximo JSON) aun cuando 'vinculos' ya
+                            # es la única representación que el motor usa --
+                            # duplicación de datos sin valor, y potencial confusión
+                            # para código que solo chequee 'eventos_padres in evento'.
+                            evento_data.pop('eventos_padres', None)
+                            evento_data.pop('tipo_dependencia', None)
 
-                        # Reconstruir distribución de frecuencia para eventos del escenario
                         pg_params = None
                         beta_params = None
                         if freq_opcion == 4:
@@ -19022,69 +19511,240 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             poisson_gamma_params=pg_params,
                             beta_params=beta_params
                         )
-                        evento_data['dist_severidad'] = dist_sev_esc
+                        evento_data['dist_severidad'] = dist_sev
                         evento_data['dist_frecuencia'] = dist_freq
-
+                    
                         # Normalizar factores_ajuste para backward compatibility
                         if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
                             evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
+                            print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' tiene {len(evento_data['factores_ajuste'])} factores (normalizados)")
+                        else:
+                            print(f"[DEBUG CARGAR JSON] Evento '{evento_data.get('nombre')}' NO tiene factores_ajuste")
 
                         # Crear un nuevo ID para el evento y mapearlo
                         antiguo_id = evento_data['id']
                         nuevo_id = str(uuid.uuid4())
-                        id_mapeo_scenario[antiguo_id] = nuevo_id
+                        id_mapeo[antiguo_id] = nuevo_id
                         evento_data['id'] = nuevo_id
 
-                        # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario
-                        eventos_padres_actualizados = []
-                        for padre_id in evento_data.get('eventos_padres', []):
-                            if padre_id in id_mapeo_scenario:
-                                eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
-                            else:
-                                # Si el evento padre está en la simulación principal
-                                eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
-                        evento_data['eventos_padres'] = eventos_padres_actualizados
+                        # Actualizar 'eventos_padres' con los nuevos IDs en caso de que existan en la simulación principal.
+                        # R3 medio #27: antes se asignaba esta clave SIEMPRE
+                        # (incluso con lista vacía) aunque el evento original
+                        # (formato moderno, solo con 'vinculos') nunca la
+                        # hubiera tenido, rompiendo la fidelidad round-trip
+                        # (el dict cargado no era idéntico al guardado).
+                        if 'eventos_padres' in evento_data:
+                            evento_data['eventos_padres'] = [
+                                id_mapeo.get(padre_id, padre_id)
+                                for padre_id in evento_data['eventos_padres']
+                            ]
 
-                        # Asegurar que tenga el campo 'activo' (backward compatibility)
+                        # Asegurar que tenga el campo 'activo' (backward compatibility con archivos antiguos)
                         if 'activo' not in evento_data:
                             evento_data['activo'] = True
 
-                        scenario.eventos_riesgo.append(evento_data)
+                        # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
+                        eventos_riesgo_temp.append(evento_data)
+                    except Exception as e:
+                        nombre_evento = evento_data.get("nombre", "N/A")
+                        error_traducido = traducir_error(e)
+                        eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
+                        continue
 
-                    # Agregar a lista temporal (NO modificar self.scenarios todavía)
-                    scenarios_temp.append(scenario)
+                # Actualizar IDs en los vínculos después de procesar todos los eventos
+                for evento_data in eventos_riesgo_temp:
+                    if 'vinculos' in evento_data:
+                        vinculos_actualizados = []
+                        for vinculo in evento_data['vinculos']:
+                            id_padre_antiguo = vinculo['id_padre']
+                            if id_padre_antiguo not in id_mapeo:
+                                vinculos_huerfanos.append(
+                                    f"• {evento_data.get('nombre', 'N/A')}: vínculo hacia un evento "
+                                    f"con ID '{id_padre_antiguo}' que no existe en el archivo. "
+                                    f"El vínculo se ignorará (el evento se comportará como independiente)."
+                                )
+                            id_padre_nuevo = id_mapeo.get(id_padre_antiguo, id_padre_antiguo)  # Usar ID antiguo si no hay mapeo
+                            prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                            fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                            umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                            # Fix bug #39: partir de una copia del vinculo original (no
+                            # de un dict nuevo con solo 5 claves fijas) para preservar
+                            # cualquier clave desconocida/futura que el archivo pudiera
+                            # traer, en vez de descartarla silenciosamente en cada
+                            # ciclo de guardar/cargar.
+                            vinculo_actualizado = dict(vinculo)
+                            vinculo_actualizado.update({
+                                'id_padre': id_padre_nuevo, 'tipo': vinculo.get('tipo', 'AND'),  # R3 alto #16: default en vez de KeyError
+                                'probabilidad': prob, 'factor_severidad': fsev,
+                                'umbral_severidad': umbral
+                            })
+                            vinculos_actualizados.append(vinculo_actualizado)
+                        evento_data['vinculos'] = vinculos_actualizados
 
-                    for evento_data in scenario.eventos_riesgo:
-                        if 'vinculos' in evento_data:
-                            vinculos_actualizados = []
-                            for vinculo in evento_data['vinculos']:
-                                id_padre_antiguo = vinculo['id_padre']
-                                # Primero buscar en el mapeo del escenario, luego en el mapeo general
-                                if id_padre_antiguo in id_mapeo_scenario:
-                                    id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
-                                elif id_padre_antiguo in id_mapeo:
-                                    id_padre_nuevo = id_mapeo[id_padre_antiguo]
-                                else:
-                                    vinculos_huerfanos.append(
-                                        f"• {evento_data.get('nombre', 'N/A')} (Escenario: {scenario.nombre}): "
-                                        f"vínculo hacia un evento con ID '{id_padre_antiguo}' que no existe "
-                                        f"en el archivo. El vínculo se ignorará (el evento se comportará "
-                                        f"como independiente)."
-                                    )
-                                    id_padre_nuevo = id_padre_antiguo
-                                prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
-                                fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
-                                umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
-                                # Fix bug #39: preservar claves desconocidas/futuras del
-                                # vinculo original (ver mismo fix en la lista principal).
-                                vinculo_actualizado = dict(vinculo)
-                                vinculo_actualizado.update({
-                                    'id_padre': id_padre_nuevo, 'tipo': vinculo['tipo'],
-                                    'probabilidad': prob, 'factor_severidad': fsev,
-                                    'umbral_severidad': umbral
-                                })
-                                vinculos_actualizados.append(vinculo_actualizado)
-                            evento_data['vinculos'] = vinculos_actualizados
+                # Cargar escenarios
+                for escenario_data in configuracion.get('scenarios', []):
+                    # R3 alto #16: aislar errores de un escenario completo (nombre/
+                    # eventos_riesgo faltante o mal tipado, o cualquier error durante
+                    # el procesamiento de sus eventos) para que UN escenario roto no
+                    # aborte la importacion de los demas escenarios ni de la simulacion
+                    # principal ya procesada.
+                    _scenarios_temp_len_antes = len(scenarios_temp)
+                    try:
+                        scenario = Scenario(escenario_data['nombre'], escenario_data.get('descripcion', ''))
+                        scenario.eventos_riesgo = []
+
+                        # Nuevo diccionario de IDs para los eventos del escenario
+                        id_mapeo_scenario = {}
+
+                        for evento_data in escenario_data['eventos_riesgo']:
+                            sev_opcion = evento_data['sev_opcion']
+                            sev_minimo = evento_data['sev_minimo']
+                            sev_mas_probable = evento_data['sev_mas_probable']
+                            sev_maximo = evento_data['sev_maximo']
+                            try:
+                                dist_sev_esc = generar_distribucion_severidad(
+                                    evento_data['sev_opcion'],
+                                    evento_data.get('sev_minimo'),
+                                    evento_data.get('sev_mas_probable'),
+                                    evento_data.get('sev_maximo'),
+                                    input_method=evento_data.get('sev_input_method', 'min_mode_max'),
+                                    params_direct=evento_data.get('sev_params_direct', {})
+                                )
+                            except Exception as e:
+                                # Acumular error para reportar al usuario (con traducción)
+                                nombre_evento = evento_data.get('nombre', 'N/A')
+                                nombre_escenario = escenario_data['nombre']
+                                error_traducido = traducir_error(e)
+                                eventos_con_error.append(f"• {nombre_evento} (Escenario: {nombre_escenario}): {error_traducido}")
+                                continue  # Omitir evento con distribución de severidad inválida
+
+                            freq_opcion = evento_data['freq_opcion']
+                            tasa = evento_data.get('tasa', None)
+                            num_eventos = evento_data.get('num_eventos', None)
+                            prob_exito = evento_data.get('prob_exito', None)
+                            if tasa is not None:
+                                tasa = float(tasa)
+                            if num_eventos is not None:
+                                num_eventos = int(num_eventos)
+                            if prob_exito is not None:
+                                prob_exito = float(prob_exito)
+                            if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
+                                vinculos = []
+                                tipo = evento_data.get('tipo_dependencia', 'AND')
+                                for padre_id in evento_data['eventos_padres']:
+                                    vinculos.append({'id_padre': padre_id, 'tipo': tipo, 'probabilidad': 100, 'factor_severidad': 1.0, 'umbral_severidad': 0})
+                                evento_data['vinculos'] = vinculos
+                                # R3 bajo #41: eliminar las claves legacy ya migradas
+                                # (ver comentario equivalente en el loop de eventos
+                                # principales, más arriba en este mismo método).
+                                evento_data.pop('eventos_padres', None)
+                                evento_data.pop('tipo_dependencia', None)
+
+                            # Reconstruir distribución de frecuencia para eventos del escenario
+                            pg_params = None
+                            beta_params = None
+                            if freq_opcion == 4:
+                                alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
+                                beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
+                                if alpha is None or beta is None:
+                                    try:
+                                        pg_min = evento_data.get('pg_minimo')
+                                        pg_mode = evento_data.get('pg_mas_probable')
+                                        pg_max = evento_data.get('pg_maximo')
+                                        pg_conf_pct = evento_data.get('pg_confianza')
+                                        if None not in (pg_min, pg_mode, pg_max, pg_conf_pct):
+                                            alpha, beta = obtener_parametros_gamma_para_poisson(float(pg_min), float(pg_mode), float(pg_max), float(pg_conf_pct) / 100.0)
+                                    except Exception:
+                                        alpha, beta = None, None
+                                if alpha is not None and beta is not None:
+                                    pg_params = (float(alpha), float(beta))
+                            elif freq_opcion == 5:
+                                alpha = evento_data.get('beta_alpha')
+                                beta = evento_data.get('beta_beta')
+                                if alpha is not None and beta is not None:
+                                    beta_params = (float(alpha), float(beta))
+
+                            dist_freq = generar_distribucion_frecuencia(
+                                freq_opcion,
+                                tasa=tasa,
+                                num_eventos_posibles=num_eventos,
+                                probabilidad_exito=prob_exito,
+                                poisson_gamma_params=pg_params,
+                                beta_params=beta_params
+                            )
+                            evento_data['dist_severidad'] = dist_sev_esc
+                            evento_data['dist_frecuencia'] = dist_freq
+
+                            # Normalizar factores_ajuste para backward compatibility
+                            if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
+                                evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
+
+                            # Crear un nuevo ID para el evento y mapearlo
+                            antiguo_id = evento_data['id']
+                            nuevo_id = str(uuid.uuid4())
+                            id_mapeo_scenario[antiguo_id] = nuevo_id
+                            evento_data['id'] = nuevo_id
+
+                            # Actualizar 'eventos_padres' con los nuevos IDs dentro del escenario.
+                            # R3 medio #27: ver mismo fix en la lista principal
+                            # (no agregar la clave si el evento original no la tenía).
+                            if 'eventos_padres' in evento_data:
+                                _eventos_padres_actualizados = []
+                                for padre_id in evento_data['eventos_padres']:
+                                    if padre_id in id_mapeo_scenario:
+                                        _eventos_padres_actualizados.append(id_mapeo_scenario[padre_id])
+                                    else:
+                                        # Si el evento padre está en la simulación principal
+                                        _eventos_padres_actualizados.append(id_mapeo.get(padre_id, padre_id))
+                                evento_data['eventos_padres'] = _eventos_padres_actualizados
+
+                            # Asegurar que tenga el campo 'activo' (backward compatibility)
+                            if 'activo' not in evento_data:
+                                evento_data['activo'] = True
+
+                            scenario.eventos_riesgo.append(evento_data)
+
+                        # Agregar a lista temporal (NO modificar self.scenarios todavía)
+                        scenarios_temp.append(scenario)
+
+                        for evento_data in scenario.eventos_riesgo:
+                            if 'vinculos' in evento_data:
+                                vinculos_actualizados = []
+                                for vinculo in evento_data['vinculos']:
+                                    id_padre_antiguo = vinculo['id_padre']
+                                    # Primero buscar en el mapeo del escenario, luego en el mapeo general
+                                    if id_padre_antiguo in id_mapeo_scenario:
+                                        id_padre_nuevo = id_mapeo_scenario[id_padre_antiguo]
+                                    elif id_padre_antiguo in id_mapeo:
+                                        id_padre_nuevo = id_mapeo[id_padre_antiguo]
+                                    else:
+                                        vinculos_huerfanos.append(
+                                            f"• {evento_data.get('nombre', 'N/A')} (Escenario: {scenario.nombre}): "
+                                            f"vínculo hacia un evento con ID '{id_padre_antiguo}' que no existe "
+                                            f"en el archivo. El vínculo se ignorará (el evento se comportará "
+                                            f"como independiente)."
+                                        )
+                                        id_padre_nuevo = id_padre_antiguo
+                                    prob = max(1, min(100, int(vinculo.get('probabilidad', 100))))
+                                    fsev = max(0.10, min(5.0, float(vinculo.get('factor_severidad', 1.0))))
+                                    umbral = max(0, int(vinculo.get('umbral_severidad', 0)))
+                                    # Fix bug #39: preservar claves desconocidas/futuras del
+                                    # vinculo original (ver mismo fix en la lista principal).
+                                    vinculo_actualizado = dict(vinculo)
+                                    vinculo_actualizado.update({
+                                        'id_padre': id_padre_nuevo, 'tipo': vinculo.get('tipo', 'AND'),  # R3 alto #16: default en vez de KeyError
+                                        'probabilidad': prob, 'factor_severidad': fsev,
+                                        'umbral_severidad': umbral
+                                    })
+                                    vinculos_actualizados.append(vinculo_actualizado)
+                                evento_data['vinculos'] = vinculos_actualizados
+                    except Exception as e:
+                        # Descartar cualquier escenario parcialmente agregado antes del error
+                        del scenarios_temp[_scenarios_temp_len_antes:]
+                        nombre_escenario_err = escenario_data.get("nombre", "N/A") if isinstance(escenario_data, dict) else "N/A"
+                        error_traducido = traducir_error(e)
+                        eventos_con_error.append(f"• Escenario '{nombre_escenario_err}': {error_traducido}")
+                        continue
 
                 # Fix bug #21: validar ciclos de dependencia (vinculos) ANTES de
                 # comprometer la transaccion. tiene_ciclo() ya existia pero solo
@@ -19107,6 +19767,31 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             f"Corrija los vínculos en el archivo antes de importarlo."
                         )
 
+                # R3 crítico #7: validar que TODOS los eventos tengan 'nombre'
+                # ANTES de comprometer la transacción. El bloque de "commit" de
+                # abajo ya limpia self.eventos_riesgo/self.scenarios y recién
+                # ahí accede a evento_data['nombre'] sin protección (para
+                # poblar la tabla); si esa clave faltaba, el KeyError ocurría
+                # DESPUÉS de que la configuración previa (válida) del usuario ya
+                # había sido destruida y reemplazada a medias, violando por
+                # completo el diseño transaccional ("todo o nada") que el resto
+                # de esta función respeta.
+                for evento_data in eventos_riesgo_temp:
+                    if not evento_data.get('nombre'):
+                        raise ValueError(
+                            "El archivo contiene un evento sin nombre (o con nombre "
+                            "vacío) en la simulación principal. Corrija el archivo "
+                            "antes de importarlo."
+                        )
+                for scenario in scenarios_temp:
+                    for evento_data in scenario.eventos_riesgo:
+                        if not evento_data.get('nombre'):
+                            raise ValueError(
+                                f"El escenario '{scenario.nombre}' contiene un evento "
+                                f"sin nombre (o con nombre vacío). Corrija el archivo "
+                                f"antes de importarlo."
+                            )
+
                 # === COMMIT DE TRANSACCIÓN: Todo procesado exitosamente, ahora actualizar la UI ===
                 # Limpiar escenarios y resultados actuales
                 self.scenarios.clear()
@@ -19124,7 +19809,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
                 # Aplicar la nueva configuración
                 self.num_simulaciones_var.setText(str(num_simulaciones_temp))
-                
+                if hasattr(self, 'num_simulaciones_var_escenarios'):
+                    self.num_simulaciones_var_escenarios.setText(str(num_simulaciones_escenarios_temp))
+
                 # Aplicar eventos de riesgo
                 self.eventos_riesgo = eventos_riesgo_temp
                 for evento_data in self.eventos_riesgo:

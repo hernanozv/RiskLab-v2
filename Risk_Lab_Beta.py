@@ -3237,7 +3237,19 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     elif sev_freq_modelo == 'sistemico':
                         alpha = float(evento.get('sev_freq_alpha', 0.5))
                         solo_aumento = evento.get('sev_freq_solo_aumento', True)
-                        factor_max = float(evento.get('sev_freq_sistemico_factor_max', 3.0))
+                        # Fix bug #42 (QA ronda 2): documentado como > 1.0 (es el
+                        # multiplicador MÁXIMO; np.clip usa 1/factor_max como
+                        # mínimo, así que requiere factor_max >= 1 para que el
+                        # rango [1/factor_max, factor_max] tenga sentido). Sin
+                        # este piso: factor_max=0 producía ZeroDivisionError
+                        # (capturado en silencio por el except genérico de más
+                        # abajo, poniendo las pérdidas del evento en 0 sin
+                        # aviso); factor_max entre 0 y 1 invertía el rango de
+                        # np.clip (a_min > a_max) forzando TODAS las
+                        # simulaciones al mismo multiplicador reducido, sin
+                        # importar la frecuencia real; factor_max negativo
+                        # producía severidades negativas.
+                        factor_max = max(1.0, float(evento.get('sev_freq_sistemico_factor_max', 3.0)))
                         freq_mean = final_event_frequencies.mean()
                         freq_std = final_event_frequencies.std()
                         

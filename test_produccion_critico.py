@@ -529,6 +529,46 @@ def test_EE_sistemico_freq_std_cero_no_explota():
                      label="Sistemico con freq_std=0: sin amplificacion")
 
 
+def test_EE_sistemico_factor_max_invalido_no_crashea_ni_invierte_perdida():
+    """Regresion bug #42 (QA ronda 2): sev_freq_sistemico_factor_max
+    documentado como > 1.0 (multiplicador MAXIMO; np.clip usa
+    1/factor_max como minimo). Sin piso: factor_max=0 crasheaba
+    (ZeroDivisionError), factor_max entre 0 y 1 invertia el rango de
+    np.clip forzando TODAS las simulaciones al mismo multiplicador
+    reducido, y factor_max negativo producia severidades negativas.
+    Ahora se clipea a >= 1.0 (equivalente a 'sin escalamiento' para
+    cualquier valor invalido)."""
+    evento_base = _build_evento(
+        'e1', 'Base', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 100}}
+    )
+    perd_base, _, _, _ = _simular([evento_base], num_sims=4000, seed=14036)
+
+    for factor_max_invalido in (0, 0.5, -3.0):
+        evento_malo = _build_evento(
+            'e1', f'Sist_{factor_max_invalido}', 1, {'tasa': 20.0}, 2,
+            {'minimo': None, 'mas_probable': None, 'maximo': None,
+             'input_method': 'direct',
+             'params_direct': {'mean': 1000, 'std': 100}},
+            sev_freq_activado=True,
+            sev_freq_modelo='sistemico',
+            sev_freq_alpha=0.5,
+            sev_freq_solo_aumento=False,
+            sev_freq_sistemico_factor_max=factor_max_invalido,
+        )
+        perd_malo, _, _, _ = _simular([evento_malo], num_sims=4000, seed=14036)
+        assert np.isfinite(perd_malo).all(), (
+            f"factor_max={factor_max_invalido}: produjo NaN/Inf (posible crash silenciado)"
+        )
+        assert (perd_malo >= 0).all(), (
+            f"factor_max={factor_max_invalido}: produjo perdidas negativas"
+        )
+        assert_close_rel(perd_malo.mean(), perd_base.mean(), tol_rel=0.05,
+                         label=f"factor_max={factor_max_invalido} clipeado a 1.0: sin escalamiento")
+
+
 def test_EE_sev_freq_tabla_vacia():
     """Tabla de escalamiento vacia: deberia comportarse como sin escala
     (multiplicador 1)."""

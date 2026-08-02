@@ -75,6 +75,20 @@ class RiskLabRejectionFallbackWarning(UserWarning):
     pass
 
 
+class RiskLabFallbackWarning(UserWarning):
+    """Fix bug #43 (QA ronda 2): se emite cuando el motor no puede generar la
+    frecuencia/severidad de un evento (error inesperado durante el muestreo)
+    y cae al fallback de asignar cero para ese evento. Antes estas alertas
+    usaban RuntimeWarning, la MISMA categoría que
+    `warnings.filterwarnings("ignore", category=RuntimeWarning)` silencia
+    globalmente para suprimir warnings internos ruidosos de numpy/scipy — lo
+    que las dejaba completamente invisibles (nunca llegaban a mostrarse, ni
+    siquiera capturándolas con `catch_warnings`) desde el arranque de la
+    aplicación. Al usar una categoría propia (heredada de UserWarning, igual
+    que las otras alertas de Risk Lab), quedan protegidas de ese filtro."""
+    pass
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -278,7 +292,14 @@ def ajustar_distribuciones(losses):
 # Configuramos Seaborn y Matplotlib
 sns.set(style="whitegrid")
 
-# Ignoramos advertencias de runtime
+# Ignoramos advertencias de runtime RUIDOSAS de numpy/scipy (p.ej. "invalid
+# value encountered in divide/log" en cálculos internos ya manejados).
+# Fix bug #43 (QA ronda 2): las alertas propias de Risk Lab que avisan sobre
+# un fallback a cero por error de generación de frecuencia/severidad usaban
+# esta MISMA categoría (RuntimeWarning), quedando también silenciadas por
+# este filtro desde el arranque, sin que nadie lo notara. Esas alertas ahora
+# usan RiskLabFallbackWarning (ver clase arriba), que no es afectada por
+# este filtro.
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 def media_cola_condicional(arr, umbral):
@@ -1112,7 +1133,7 @@ class BetaFrequencyDistribution:
             warnings.warn(
                 f"Error al generar muestras de frecuencia Beta-Bernoulli: {str(e)}. "
                 f"Retornando ceros como fallback, pero esto puede afectar los resultados de la simulación.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Devolver un array de ceros del tamaño correcto como fallback
@@ -1166,7 +1187,7 @@ class BetaFrequencyDistribution:
         except Exception as e:
             warnings.warn(
                 f"Error al calcular PMF de Beta-Bernoulli: {str(e)}. Retornando ceros.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Valor por defecto en caso de error
@@ -1202,7 +1223,7 @@ class BetaFrequencyDistribution:
         except Exception as e:
             warnings.warn(
                 f"Error al calcular CDF de Beta-Bernoulli: {str(e)}. Retornando fallback.",
-                RuntimeWarning,
+                RiskLabFallbackWarning,
                 stacklevel=2
             )
             # Valor por defecto en caso de error
@@ -2685,7 +2706,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 warnings.warn(
                     f"Error al aplicar ajustes de probabilidad para evento '{evento.get('nombre', evento_id)}': {str(e)}. "
                     f"Se usará la distribución original.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
         # ====================================================================
@@ -2848,7 +2869,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}': {str(e)}. "
                         f"Asignando frecuencia cero para {len(indices_a_simular)} simulaciones. "
                         f"Esto puede afectar significativamente los resultados.",
-                        RuntimeWarning,
+                        RiskLabFallbackWarning,
                         stacklevel=2
                     )
                     # En caso de error, asignar ceros como fallback
@@ -2949,7 +2970,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                             f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (formato antiguo): {str(e)}. "
                             f"Asignando frecuencia cero para {len(indices_a_simular)} simulaciones. "
                             f"Esto puede afectar significativamente los resultados.",
-                            RuntimeWarning,
+                            RiskLabFallbackWarning,
                             stacklevel=2
                         )
                         # En caso de error, asignar ceros como fallback
@@ -3005,7 +3026,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     warnings.warn(
                         f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin padres): {str(e)}. "
                         f"Asignando frecuencia cero. Esto puede afectar significativamente los resultados.",
-                        RuntimeWarning,
+                        RiskLabFallbackWarning,
                         stacklevel=2
                     )
                     muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
@@ -3061,7 +3082,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                 warnings.warn(
                     f"Error al generar muestras de frecuencia para evento '{nombre_evento}' (sin dependencias): {str(e)}. "
                     f"Asignando frecuencia cero. Esto puede afectar significativamente los resultados.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
                 muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
@@ -3419,7 +3440,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     f"Error INESPERADO al generar/asignar severidad para evento '{nombre_evento}': {str(e)}. "
                     f"Las pérdidas para este evento se establecerán en 0. "
                     f"Esto afectará significativamente los resultados de la simulación.",
-                    RuntimeWarning,
+                    RiskLabFallbackWarning,
                     stacklevel=2
                 )
 

@@ -362,7 +362,7 @@ Antes de generar cualquier JSON, verificar internamente:
 * Factores dentro de rangos válidos (estático ≥ -99%, estocástico [-100, +99])
 * Seguros: `afecta_frecuencia: false`, `impacto_porcentual: 0`, **`afecta_severidad: true`** (OBLIGATORIO — si es `false`, el seguro se ignora en simulación), `tipo_severidad: "seguro"`, `impacto_severidad_pct: 0`
 * Bernoulli: evitar `prob_exito` exactamente 0.0 o 1.0 si hay factores estocásticos (usar 0.001 o 0.999)
-* Errores de severidad en eventos principales omiten solo ese evento, pero en **escenarios** agregan el evento con severidad nula (puede fallar al simular). Asegurar parámetros válidos siempre.
+* Errores de severidad omiten solo el evento afectado, tanto en eventos principales como dentro de **escenarios** (mismo comportamiento en ambos casos). Asegurar parámetros válidos siempre para no perder eventos silenciosamente.
 
 **Checklist completo pre-export (verificar TODOS antes de generar JSON):**
 

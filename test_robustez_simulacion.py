@@ -1020,6 +1020,45 @@ def test_seguro_multi_aseguradora_limite_agregado():
         )
 
 
+def test_seguro_torre_agregada_independiente_del_orden():
+    """Regresion bug #20: con 2+ polizas AGREGADAS formando una torre
+    (Primaria 0-1.5M al 80%, Excedente 1.5M+ al 100% con limite 2M), cada
+    poliza debe aplicar su deducible sobre la perdida agregada BRUTA, no
+    sobre el remanente ya reducido por la poliza anterior. El resultado
+    neto debe ser identico sin importar el orden de carga de las polizas,
+    y debe coincidir con la suma independiente de cada tramo.
+
+    Bruta determinista = $5,000,000 (freq Bernoulli p=1, sev casi fija):
+      pago_primaria  = min(max(5M-0, 0)*0.8, 1.5M)   = 1,500,000
+      pago_excedente = min(max(5M-1.5M, 0)*1.0, 2M)  = 2,000,000
+      neto esperado  = 5M - 1.5M - 2M                = 1,500,000
+
+    Con el bug viejo, el excedente aplicaba su deducible de $1.5M sobre la
+    perdida YA reducida por la primaria (3.5M), dando un neto invertido
+    dependiente del orden (~2.65M en vez de 1.5M)."""
+    primaria = _seguro(deducible=0, cobertura_pct=0.8, limite=1_500_000,
+                       tipo_deducible='agregado', nombre='Primaria')
+    excedente = _seguro(deducible=1_500_000, cobertura_pct=1.0, limite=2_000_000,
+                        tipo_deducible='agregado', nombre='Excedente')
+
+    def _make(orden):
+        return _build_evento(
+            'e1', 'Torre', 3, {'probabilidad_exito': 1.0},
+            2, {'minimo': None, 'mas_probable': None, 'maximo': None,
+                'input_method': 'direct',
+                'params_direct': {'mean': 5_000_000, 'std': 50_000}},
+            factores_ajuste=orden
+        )
+
+    perd_orden1, _, _, _ = _simular([_make([primaria, excedente])], num_sims=8000, seed=606)
+    perd_orden2, _, _, _ = _simular([_make([excedente, primaria])], num_sims=8000, seed=606)
+
+    assert_close_rel(perd_orden1.mean(), 1_500_000, tol_rel=0.03,
+                     label="Bug #20: neto de la torre coincide con la suma independiente")
+    assert_close_rel(perd_orden1.mean(), perd_orden2.mean(), tol_rel=0.005,
+                     label="Bug #20: el neto no debe depender del orden de carga de las polizas")
+
+
 # ===========================================================================
 # SECCION 8: EDGE CASES y robustez
 # ===========================================================================

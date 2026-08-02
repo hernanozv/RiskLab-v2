@@ -445,6 +445,67 @@ def test_EE_sev_freq_factor_max_uno_capea_a_uno():
                      label="Sev_freq factor_max=1 no debe escalar")
 
 
+def test_EE_sev_freq_paso_negativo_no_anula_ni_invierte_perdida():
+    """Regresion hallazgo medio #6: sev_freq_paso documentado como > 0 (la
+    severidad debe escalar CON la reincidencia). Un paso negativo (via
+    import JSON) hacia que el multiplicador se volviera negativo para
+    ocurrencias de indice alto (1 + paso*(n-1) < 0), invirtiendo el signo
+    de la perdida en vez de escalarla. Ahora se clipea a >= 0, comportandose
+    como paso=0 (sin escalamiento) en vez de invertir/anular."""
+    evento_base = _build_evento(
+        'e1', 'B', 1, {'tasa': 20.0}, 2,  # alta frecuencia para exponer el bug
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}}
+    )
+    evento_paso_negativo = _build_evento(
+        'e1', 'PasoNeg', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='lineal',
+        sev_freq_paso=-0.5,
+        sev_freq_factor_max=5.0,
+    )
+    perd_b, _, _, _ = _simular([evento_base], num_sims=5000, seed=14034)
+    perd_neg, _, _, _ = _simular([evento_paso_negativo], num_sims=5000, seed=14034)
+    assert (perd_neg >= 0).all(), "Paso negativo produjo perdidas negativas"
+    assert_close_rel(perd_neg.mean(), perd_b.mean(), tol_rel=0.05,
+                     label="Paso negativo clipeado a 0: equivalente a sin escalamiento")
+
+
+def test_EE_sev_freq_factor_max_menor_a_uno_no_anula_perdida():
+    """Regresion hallazgo medio #6: sev_freq_factor_max documentado como
+    > 1.0 (es un CAP superior sobre el multiplicador base de 1.0x). Un
+    factor_max < 1 (via import JSON) hacia que np.minimum(mult, factor_max)
+    anulara/redujera la perdida de TODAS las ocurrencias (no solo las de
+    indice alto). Ahora se clipea a >= 1.0."""
+    evento_base = _build_evento(
+        'e1', 'B', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}}
+    )
+    evento_factor_bajo = _build_evento(
+        'e1', 'FactorBajo', 1, {'tasa': 20.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1000, 'std': 1}},
+        sev_freq_activado=True,
+        sev_freq_modelo='reincidencia',
+        sev_freq_tipo_escalamiento='lineal',
+        sev_freq_paso=0.5,
+        sev_freq_factor_max=0.1,
+    )
+    perd_b, _, _, _ = _simular([evento_base], num_sims=5000, seed=14035)
+    perd_bajo, _, _, _ = _simular([evento_factor_bajo], num_sims=5000, seed=14035)
+    assert (perd_bajo >= 0).all(), "factor_max<1 produjo perdidas negativas"
+    assert_close_rel(perd_bajo.mean(), perd_b.mean(), tol_rel=0.05,
+                     label="factor_max<1 clipeado a 1.0: no anula la perdida")
+
+
 def test_EE_sistemico_freq_std_cero_no_explota():
     """Sistemico cuando todas las simulaciones tienen la misma frecuencia
     (freq_std=0). Esto sucede si Bernoulli(p=1.0) con tasa=1. El codigo
@@ -658,6 +719,37 @@ def test_GG_seguro_deducible_negativo_no_genera_pagos_negativos():
     assert perd.mean() < 50, (
         f"Deducible negativo: perd neta media={perd.mean():.0f}, esperaba ~0"
     )
+
+
+def test_GG_seguro_cobertura_negativa_no_aumenta_perdida_neta():
+    """Regresion hallazgo medio #5: seguro_cobertura_pct negativo (posible
+    via import JSON, ya que el spinbox de la UI lo restringe a [1,100])
+    hacia que el 'pago' del seguro fuera negativo, AUMENTANDO la perdida
+    neta por encima de la perdida bruta en vez de reducirla. Ahora se
+    clipea a [0,100]: una cobertura negativa se trata como 0% (el seguro
+    no paga nada, pero tampoco perjudica)."""
+    evento_con_seguro_malo = _build_evento(
+        'e1', 'CobNeg', 3, {'probabilidad_exito': 1.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1_000_000, 'std': 10000}},
+        factores_ajuste=[_seguro(deducible=0, cobertura_pct=-0.5, limite=0,
+                                  tipo_deducible='agregado', nombre='CobNeg')]
+    )
+    evento_sin_seguro = _build_evento(
+        'e1', 'SinSeg', 3, {'probabilidad_exito': 1.0}, 2,
+        {'minimo': None, 'mas_probable': None, 'maximo': None,
+         'input_method': 'direct',
+         'params_direct': {'mean': 1_000_000, 'std': 10000}}
+    )
+    perd_con, _, _, _ = _simular([evento_con_seguro_malo], num_sims=3000, seed=14055)
+    perd_sin, _, _, _ = _simular([evento_sin_seguro], num_sims=3000, seed=14055)
+    assert perd_con.mean() <= perd_sin.mean() * 1.001, (
+        f"Cobertura negativa NO deberia aumentar la perdida neta por encima de la "
+        f"bruta: con_seguro={perd_con.mean():.0f}, sin_seguro={perd_sin.mean():.0f}"
+    )
+    assert_close_rel(perd_con.mean(), perd_sin.mean(), tol_rel=0.02,
+                     label="Cobertura negativa clipeada a 0%: neto == bruto")
 
 
 def test_GG_seguro_limite_ocurrencia_igual_a_severidad():

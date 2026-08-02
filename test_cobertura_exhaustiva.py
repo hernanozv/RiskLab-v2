@@ -159,6 +159,21 @@ def test_O_sev_normal_direct_std_negativo_rechazado():
     raise AssertionError("Normal con std<0 deberia ser rechazada")
 
 
+def test_O_sev_normal_min_mode_max_moda_fuera_de_rango_rechazada():
+    """Regresion bug #23: a diferencia de PERT/GPD/Lognormal, la Normal con
+    input_method='min_mode_max' no validaba que mas_probable estuviera
+    dentro de [minimo, maximo]."""
+    gen = ENGINE['generar_distribucion_severidad']
+    try:
+        gen(1, 100, 500, 200, input_method='min_mode_max')
+    except (ValueError, Exception):
+        pass
+    else:
+        raise AssertionError("Normal con moda fuera de [min,max] deberia ser rechazada")
+    # Caso valido (moda dentro de rango) no debe fallar
+    gen(1, 100, 150, 200, input_method='min_mode_max')
+
+
 def test_O_sev_lognormal_mean_negativo_rechazado():
     gen = ENGINE['generar_distribucion_severidad']
     try:
@@ -580,8 +595,15 @@ def test_S_seguro_limite_ocurrencia_y_agregado_simultaneos():
 
 
 def test_S_multiples_seguros_agregados():
-    """3 seguros agregados con limite_agregado diferentes — cada uno aplica
-    sus deducibles, cobertura y limite en cascada."""
+    """3 seguros agregados apilados (torre) — bug #20: cada uno debe aplicar
+    su deducible/cobertura/limite sobre la perdida agregada BRUTA, no en
+    cascada sobre el remanente ya reducido por el seguro anterior. Con 3
+    polizas de deducible=0, cobertura=30%, sin limite, cada una cubre 30%
+    de la perdida bruta de forma independiente: pago total = 90% de la
+    bruta, remanente = 10% (ratio=0.1).
+
+    NOTA: antes del fix, este test codificaba erroneamente el comportamiento
+    en cascada (0.7^3=0.343) como el resultado "correcto"."""
     evento_no = _build_evento(
         'e1', 'NoSeg', 1, {'tasa': 5.0},
         2, {'minimo': None, 'mas_probable': None, 'maximo': None,
@@ -604,11 +626,11 @@ def test_S_multiples_seguros_agregados():
     )
     perd_no, _, _, _ = _simular([evento_no], num_sims=15_000, seed=6006)
     perd_3, _, _, _ = _simular([evento_3seg], num_sims=15_000, seed=6007)
-    # Cascada: 5000 → 5000*0.7=3500 → 3500*0.7=2450 → 2450*0.7=1715
-    # Ratio = 0.7^3 = 0.343
+    # Cada poliza cubre 30% de la BRUTA de forma independiente: pago total
+    # = 90% de la bruta, remanente = 10% (ratio = 1 - 3*0.3 = 0.1).
     ratio = perd_3.mean() / perd_no.mean()
-    assert_close_rel(ratio, 0.343, tol_rel=0.10,
-                     label="3 seguros agregados cascade 30% c/u")
+    assert_close_rel(ratio, 0.1, tol_rel=0.10,
+                     label="3 seguros agregados en torre: 30% c/u sobre la bruta")
 
 
 # ===========================================================================

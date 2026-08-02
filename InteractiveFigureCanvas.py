@@ -244,15 +244,51 @@ class InteractiveFigureCanvas(FigureCanvas):
             # queda dominada por el eje con mayor magnitud absoluta (p.ej.
             # frecuencia 0-30 vs pérdida en millones), pudiendo seleccionar el
             # punto equivocado como "más cercano" al cursor.
+            #
+            # Fix bug medio #18 (QA ronda 2): la normalización de arriba asume
+            # escala LINEAL. Con el eje Y en escala logarítmica (toggle de la
+            # curva de Excedencia), get_ylim() devuelve límites en unidades de
+            # DATOS (p.ej. 1e-5 a 1), pero el eje se dibuja con espaciado
+            # equitativo por DÉCADA, no por unidad lineal. Normalizar
+            # linealmente sobre ese rango hace que casi todos los puntos caigan
+            # cerca de 0 en la coordenada Y normalizada (ya que la mayoria de
+            # los datos estan muy cerca del extremo inferior en escala lineal),
+            # dejando que el hover quede dominado casi solo por la proximidad
+            # en X. La solución es transformar a log10 antes de normalizar
+            # cuando el eje tiene escala logarítmica, igual que hace
+            # matplotlib al posicionar los píxeles.
             xlim = event.inaxes.get_xlim()
             ylim = event.inaxes.get_ylim()
-            x_range = (xlim[1] - xlim[0]) or 1.0
-            y_range = (ylim[1] - ylim[0]) or 1.0
+            escala_x = event.inaxes.get_xscale()
+            escala_y = event.inaxes.get_yscale()
 
-            x_data_norm = (x_data - xlim[0]) / x_range
-            y_data_norm = (y_data - ylim[0]) / y_range
-            x_norm = (x - xlim[0]) / x_range
-            y_norm = (y - ylim[0]) / y_range
+            def _lim_transformado(lim, escala):
+                if escala == 'log':
+                    return np.log10(lim[0]), np.log10(lim[1])
+                return lim[0], lim[1]
+
+            def _valores_transformados(valores, lim, escala):
+                if escala != 'log':
+                    return np.asarray(valores, dtype=np.float64)
+                valores = np.asarray(valores, dtype=np.float64)
+                piso = min(lim[0], lim[1]) * 1e-6 if min(lim) > 0 else 1e-300
+                valores_seguros = np.where(valores > 0, valores, piso)
+                return np.log10(valores_seguros)
+
+            xlim_t = _lim_transformado(xlim, escala_x)
+            ylim_t = _lim_transformado(ylim, escala_y)
+            x_data_t = _valores_transformados(x_data, xlim, escala_x)
+            y_data_t = _valores_transformados(y_data, ylim, escala_y)
+            x_t = _valores_transformados([x], xlim, escala_x)[0]
+            y_t = _valores_transformados([y], ylim, escala_y)[0]
+
+            x_range = (xlim_t[1] - xlim_t[0]) or 1.0
+            y_range = (ylim_t[1] - ylim_t[0]) or 1.0
+
+            x_data_norm = (x_data_t - xlim_t[0]) / x_range
+            y_data_norm = (y_data_t - ylim_t[0]) / y_range
+            x_norm = (x_t - xlim_t[0]) / x_range
+            y_norm = (y_t - ylim_t[0]) / y_range
 
             # Optimizar búsqueda para grandes conjuntos de datos
             if len(x_data) > 500 and KDTREE_AVAILABLE:

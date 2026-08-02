@@ -9849,91 +9849,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # ====================================================================
         
         # Función helper para normalizar factores (migración automática de formato legacy)
-        def normalizar_factor(factor):
-            """Asegura que el factor tenga todos los campos necesarios (backward compatibility)"""
-            factor_norm = factor.copy()
-            
-            # Si no tiene tipo_modelo, es formato legacy → migrar a estático
-            if 'tipo_modelo' not in factor_norm:
-                factor_norm['tipo_modelo'] = 'estatico'
-            
-            # Asegurar campos para modelo estático
-            if 'impacto_porcentual' not in factor_norm:
-                factor_norm['impacto_porcentual'] = 0
-            
-            # Asegurar campos para modelo estocástico (valores por defecto)
-            if 'confiabilidad' not in factor_norm:
-                # Si migra de estático, usar 100% confiabilidad
-                factor_norm['confiabilidad'] = 100
-            
-            if 'reduccion_efectiva' not in factor_norm:
-                # Usar el valor absoluto del impacto como reducción efectiva
-                factor_norm['reduccion_efectiva'] = abs(factor_norm.get('impacto_porcentual', 0))
-            
-            if 'reduccion_fallo' not in factor_norm:
-                # Por defecto, sin reducción cuando falla
-                factor_norm['reduccion_fallo'] = 0
-            
-            # Asegurar campo activo
-            if 'activo' not in factor_norm:
-                factor_norm['activo'] = True
-            
-            # ====================================================================
-            # NUEVOS CAMPOS: Impacto en frecuencia y severidad (backward compatible)
-            # ====================================================================
-            
-            # afecta_frecuencia: True por defecto si impacto_porcentual != 0 (backward compat)
-            if 'afecta_frecuencia' not in factor_norm:
-                factor_norm['afecta_frecuencia'] = factor_norm.get('impacto_porcentual', 0) != 0
-            
-            # afecta_severidad: False por defecto para mantener comportamiento existente
-            if 'afecta_severidad' not in factor_norm:
-                factor_norm['afecta_severidad'] = False
-            
-            # Para modelo ESTÁTICO: impacto porcentual en severidad
-            if 'impacto_severidad_pct' not in factor_norm:
-                factor_norm['impacto_severidad_pct'] = 0
-            
-            # Para modelo ESTOCÁSTICO: reducción de severidad cuando funciona/falla
-            if 'reduccion_severidad_efectiva' not in factor_norm:
-                factor_norm['reduccion_severidad_efectiva'] = 0
-            
-            if 'reduccion_severidad_fallo' not in factor_norm:
-                factor_norm['reduccion_severidad_fallo'] = 0
-            
-            # ================================================================
-            # MODELO DE SEGURO/TRANSFERENCIA (para severidad)
-            # ================================================================
-            # tipo_severidad: 'porcentual' (default) o 'seguro'
-            if 'tipo_severidad' not in factor_norm:
-                factor_norm['tipo_severidad'] = 'porcentual'
-            
-            # Campos de seguro (solo usados si tipo_severidad == 'seguro')
-            if 'seguro_deducible' not in factor_norm:
-                factor_norm['seguro_deducible'] = 0
-            
-            if 'seguro_cobertura_pct' not in factor_norm:
-                factor_norm['seguro_cobertura_pct'] = 100
-            
-            if 'seguro_limite' not in factor_norm:
-                factor_norm['seguro_limite'] = 0  # 0 = sin límite agregado
-            
-            # NUEVO: Tipo de deducible - 'agregado' o 'por_ocurrencia'
-            if 'seguro_tipo_deducible' not in factor_norm:
-                factor_norm['seguro_tipo_deducible'] = 'agregado'
-            
-            # NUEVO: Límite por ocurrencia
-            if 'seguro_limite_ocurrencia' not in factor_norm:
-                factor_norm['seguro_limite_ocurrencia'] = 0
-            
-            return factor_norm
-        
-        # Cargar factores de ajuste existentes desde el evento
+        # Cargar factores de ajuste existentes desde el evento.
+        # Fix bug bajo #21 (QA ronda 2): antes había una copia LOCAL de
+        # normalizar_factor duplicando (y desincronizada de)
+        # normalizar_factor_global — a diferencia de la versión canónica, la
+        # copia local no clipeaba impacto_porcentual/reduccion_efectiva/
+        # confiabilidad a rangos válidos. No era explotable hoy porque los
+        # spinboxes de la UI ya clipean al mostrar, pero era una trampa de
+        # mantenimiento (dos implementaciones que podían divergir en
+        # silencio). Se usa la misma función canónica que ya usan el editor
+        # de escenario y el import de JSON.
         factores_ajuste_existentes = []
         if evento_data and 'factores_ajuste' in evento_data:
             # Cargar y normalizar factores (migración automática)
             factores_raw = copy.deepcopy(evento_data['factores_ajuste'])
-            factores_ajuste_existentes = [normalizar_factor(f) for f in factores_raw]
+            factores_ajuste_existentes = [normalizar_factor_global(f) for f in factores_raw]
             
             # DEBUG: Verificar que los factores se cargaron
             if factores_ajuste_existentes:

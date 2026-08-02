@@ -9937,12 +9937,23 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     prob_ajustada_label.setText("")
                     return
                 
-                # Calcular factor multiplicativo total
+                # Calcular factor multiplicativo total.
+                # Fix bug alto #7 (QA ronda 2): el motor real (modelo estático,
+                # ver más arriba en generar_lda_con_secuencialidad) clipea cada
+                # impacto individual a >= -99% y el factor_multiplicativo final
+                # a >= 0.01 (mínimo 1% de la frecuencia original). Este preview
+                # no aplicaba ninguno de los dos: con 3 controles de -99% cada
+                # uno, el factor real da (1-0.99)^3=1e-6 sin clipear, pero el
+                # motor lo clipea a 0.01 antes de usarlo — el preview mostraba
+                # una frecuencia ajustada 10.000 veces menor a la que el motor
+                # realmente simula.
                 factor_multiplicativo = 1.0
                 for f in factores_activos:
                     impacto_pct = f.get('impacto_porcentual', 0)
+                    impacto_pct = max(impacto_pct, -99)
                     factor_multiplicativo *= (1 + impacto_pct / 100.0)
-                
+                factor_multiplicativo = max(factor_multiplicativo, 0.01)
+
                 # Obtener tipo de distribución de frecuencia
                 freq_opcion = freq_combobox.currentIndex() + 1
                 tipo_dist_nombres = ['Poisson', 'Binomial', 'Bernoulli', 'Poisson-Gamma', 'Beta']

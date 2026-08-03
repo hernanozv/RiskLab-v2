@@ -130,7 +130,7 @@ Preguntar al usuario:
 
 > **🚨 POLÍTICA OBLIGATORIA PARA IA**: Para `sev_opcion = 2` (LogNormal) y `sev_opcion = 4` (Pareto/GPD), el agente **DEBE** usar `sev_input_method: "direct"` con parámetros directos. No usar `min_mode_max` para estas distribuciones — puede causar errores de parametrización en la importación. Ver detalles en `ESPECIFICACION_JSON_RISK_LAB.md`.
 >
-> **Burr XII (6), Weibull (7) y Log-t (8) SOLO existen en modo `"direct"`**: siempre `sev_input_method: "direct"`, min/mode/max = `null`, y `sev_params_direct` con sus parámetros. Burr y Log-t (como GPD con xi>0) se truncan automáticamente en el percentil 99.9 por seguridad ante colas de media infinita.
+> **Burr XII (6), Weibull (7) y Log-t (8) SOLO existen en modo `"direct"`**: siempre `sev_input_method: "direct"`, min/mode/max = `null`, y `sev_params_direct` con sus parámetros. **Pareto/GPD (con `c`/xi > 0), Burr XII y Log-t se truncan automáticamente en el percentil 99.9** (clases `TruncatedGPD`, `TruncatedBurr`, `LogTDistribution`) por seguridad ante colas de media infinita. Implica que **la simulación no genera valores por encima de ese percentil teórico**: el extremo queda acotado (evita valores espurios), a costa de una leve subestimación de la cola más allá del P99.9. Weibull no se trunca (cola finita/sub-exponencial).
 
 #### Cuándo usar cada una:
 
@@ -155,6 +155,7 @@ Preguntar al usuario:
 - Ciberseguridad, desastres naturales
 - Cola muy pesada (eventos extremos son más probables que en LogNormal)
 - Usuario dice: "Típicamente $100K pero podría ser $5M o más"
+- **⚠️ Truncada en P99.9 cuando `c` (xi) > 0** (clase `TruncatedGPD`): la cola se corta automáticamente en el percentil 99.9 teórico por seguridad ante colas de **media infinita**. **Implica que la simulación NO genera valores por encima de ese percentil teórico** — el extremo queda acotado, lo que evita valores espurios/infinitos pero puede subestimar levemente la cola más allá del P99.9. Con `c ≤ 0` la cola es finita y no se trunca.
 
 **Uniforme (sev_opcion: 5)**
 - Alta incertidumbre
@@ -871,6 +872,25 @@ Preguntar:
 
 ---
 
+### ⚠️ Efecto del factor sobre la FRECUENCIA: multiplicativo exacto (tasa/conteo) vs. log-odds aproximado (probabilidad)
+
+La fórmula `factor = 1 ± (impacto/100)` describe el efecto **exacto** sobre la frecuencia **solo** para distribuciones de **conteo/tasa**: **Poisson** (`freq_opcion=1`), **Poisson-Gamma** (`freq_opcion=4`) y **Zero-Inflated Poisson** (`freq_opcion=6`). En esos casos el factor escala λ **multiplicativamente** y el % nominal ingresado coincide con el cambio real de la media de ocurrencias (ej: -30% reduce λ exactamente 30%).
+
+Para distribuciones de **probabilidad** — **Bernoulli** (`freq_opcion=3`), **Binomial** (`freq_opcion=2`) y **Beta** (`freq_opcion=5`) — el ajuste de frecuencia **NO es multiplicativo**: se aplica como un **shift aditivo en escala log-odds (logit)** (funciones `ajustar_probabilidad_por_factores` / `aplicar_factor_a_probabilidad_vec`). El efecto **REAL** sobre la probabilidad depende de la **probabilidad base** y normalmente **NO coincide** con el % nominal:
+
+- Ejemplo: probabilidad base `p = 10%`, factor nominal `-30%` → `p` ajustada ≈ **7.6%** (reducción real ≈ 24%, **no** 30%).
+- El % nominal es un **shift en log-odds** (`impacto × 0.01`), no un porcentaje literal de reducción/aumento de `p`. El mismo `-30%` sobre una `p` distinta produce otra reducción real.
+- Varios factores se acumulan de forma **aditiva en log-odds** (esto permite combinarlos de manera consistente), y la probabilidad resultante se acota a `[0.0001, 0.9999]`.
+
+**Regla para el agente:**
+- **Frecuencia por tasa/conteo (Poisson / Poisson-Gamma / ZIP)** → factor multiplicativo, efecto = % nominal exacto.
+- **Frecuencia por probabilidad (Bernoulli / Binomial / Beta)** → shift log-odds aditivo, efecto **aproximado** (depende de `p` base).
+- **Severidad** (`impacto_severidad_pct`) → siempre **multiplicativa y exacta** (ej: -30% reduce el monto exactamente 30%), en cualquier distribución.
+
+La propia app avisa al usuario sobre esto (ej: *"...para eventos de probabilidad (Bernoulli, Binomial, Beta) es un ajuste aproximado en escala log-odds cuyo efecto real depende de la probabilidad base — revise la vista previa para ver el valor exacto resultante."*). Al configurar controles sobre eventos Bernoulli/Binomial/Beta, comunicar al usuario que el % es **nominal** y que el valor exacto resultante se ve en la vista previa.
+
+---
+
 ## Controles de Tipo Seguro/Transferencia de Riesgo
 
 > ⚠️ **REGLA CRÍTICA**: Los seguros se modelan **EXCLUSIVAMENTE** como `factores_ajuste` con `tipo_severidad: "seguro"` dentro de los eventos que cubren. **NUNCA crear un evento de riesgo independiente para representar un seguro** — un evento con severidad 0 o `sev_params_direct: {"mean": 0, "std": 0}` es matemáticamente inválido y causa crash.
@@ -1313,6 +1333,25 @@ Risk Lab permite definir un **límite superior** para la frecuencia y/o la sever
 ```
 
 Para detalles técnicos completos (rejection sampling, validaciones), ver sección "Límites Superiores" en `ESPECIFICACION_JSON_RISK_LAB.md`.
+
+---
+
+## Límites Internos del Motor (Control de Memoria y Reescalado de Frecuencia)
+
+> ⚠️ **Distinto de los límites superiores del usuario.** Estos son topes **internos del motor** que protegen la RAM. No se configuran desde el JSON, pero el agente debe tenerlos en cuenta al sugerir tasas altas o `num_simulaciones` alto, porque uno de ellos **distorsiona los resultados**.
+
+El motor tiene dos constantes internas (valores reales del código):
+
+| Constante | Valor | Qué hace |
+|-----------|-------|----------|
+| `OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA` | `15_000_000` (15 millones) | Si `Σ (frecuencia esperada por evento) × num_simulaciones` supera este umbral de **ocurrencias totales**, la app muestra un diálogo de confirmación ("Posible uso alto de memoria") **antes** de arrancar. Es solo un aviso preventivo (evita un crash por OOM); no distorsiona resultados. |
+| `MAX_EVENTOS_POR_EVENTO_POR_CHUNK` | `500_000_000` (500 millones) | Tope absoluto de ocurrencias generadas **por evento dentro de un chunk**. Si se supera, el motor **reescala las frecuencias hacia abajo**. |
+
+**⚠️ El reescalado SUBESTIMA la media de pérdidas.** Cuando `tasa × num_simulaciones` (o la frecuencia de un solo evento) genera demasiadas ocurrencias y se activa `MAX_EVENTOS_POR_EVENTO_POR_CHUNK`, el motor reescala las frecuencias multiplicativamente: esto **preserva el CV pero subestima la media**, y muestra el aviso **"Frecuencia Reescalada (resultados distorsionados)"**. El export lo registra en `execution_metadata.engine_limits.eventos_con_cap_aplicado` (si esa lista **no está vacía**, los resultados están distorsionados).
+
+**Recomendaciones para el agente:**
+- Al sugerir **tasas altas** (Poisson/Poisson-Gamma/ZIP con λ grande) o `num_simulaciones` alto, estimar mentalmente `tasa × num_simulaciones` por evento y evitar acercarse a estos topes.
+- Si el usuario reporta resultados de una simulación, **verificar que no se haya activado el reescalado**: preguntar si apareció el aviso "Frecuencia Reescalada" o revisar `engine_limits.eventos_con_cap_aplicado` en el export. Si se activó, reducir `num_simulaciones` o revisar los parámetros de frecuencia y volver a correr.
 
 ---
 

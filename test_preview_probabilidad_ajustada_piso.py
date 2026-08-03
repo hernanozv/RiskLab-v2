@@ -81,11 +81,11 @@ resultado = {}
 
 
 def _fake_exec(self):
-    # Encontrar el combobox de frecuencia (contiene las 5 opciones conocidas)
+    # Encontrar el combobox de frecuencia (contiene las opciones conocidas)
     freq_combobox = None
     for combo in self.findChildren(QtWidgets.QComboBox):
         items = [combo.itemText(i) for i in range(combo.count())]
-        if items == ['Poisson', 'Binomial', 'Bernoulli', 'Poisson-Gamma', 'Beta']:
+        if items[:5] == ['Poisson', 'Binomial', 'Bernoulli', 'Poisson-Gamma', 'Beta']:
             freq_combobox = combo
             break
     assert freq_combobox is not None, "No se encontró el combobox de frecuencia"

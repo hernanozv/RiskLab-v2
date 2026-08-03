@@ -43,7 +43,7 @@ Para cada evento individual:
 Tabla matricial: cada evento como fila × percentiles como columnas (P50-P99), más una fila de "Pérdida Total"
 
 ### Sección 6: Gráficos de Análisis
-Hasta 9 gráficos (ver sección "Gráficos y su Interpretación" más abajo)
+Hasta 15 gráficos (ver sección "Gráficos y su Interpretación" más abajo). Nota: el PDF y la vista interactiva de la app pueden diferir en cuántos y cuáles gráficos muestran; el conjunto completo de pestañas interactivas se enumera en esa sección.
 
 ### Formato de moneda en el PDF
 Los valores monetarios usan formato: **`$X.XXX`** (punto como separador de miles, sin decimales). Ejemplo: `$1.250.000` = un millón doscientos cincuenta mil.
@@ -69,6 +69,7 @@ Risk Lab genera dos tipos principales de resultados:
 | **Mediana (P50)** | Valor central: 50% de simulaciones por debajo | Escenario "típico" — más robusto que la media ante outliers |
 | **Desviación Estándar** | Dispersión alrededor de la media | Volatilidad/incertidumbre del riesgo |
 | **VaR al 90%** | Percentil 90 de pérdidas | Pérdida que NO se excederá en 90% de los casos |
+| **VaR al 95%** | Percentil 95 de pérdidas | Pérdida que NO se excederá en 95% de los casos (1 en 20). El export "para IA" reporta `VaR_90`, `VaR_95` y `VaR_99` (OpVaR) |
 | **OpVaR al 99%** | Percentil 99 de pérdidas | Pérdida máxima en escenarios extremos (1 en 100) |
 | **Pérdida Esperada más allá del OpVaR 99%** | Media de pérdidas > P99 (CVaR/ES) | Severidad promedio en escenarios catastróficos |
 | **Máximo** | Mayor pérdida observada en todas las simulaciones | Peor caso absoluto simulado (depende de N) |
@@ -196,9 +197,12 @@ Risk Lab genera una tabla con los siguientes percentiles:
 | **P50 (Mediana)** | 50% de escenarios arriba/abajo | Escenario "típico" |
 | **P60-P80** | Escenarios moderadamente adversos | Planificación conservadora |
 | **P90** | VaR 90% - Solo 10% peor | Apetito de riesgo típico |
-| **P95** | Solo 5% de escenarios peor | Tolerancia de riesgo |
+| **P92** | Solo 8% de escenarios peor | Nivel intermedio P90-P95 |
+| **P95** | Solo 5% de escenarios peor (VaR 95%) | Tolerancia de riesgo |
 | **P99** | Solo 1% de escenarios peor | Escenarios extremos |
 | **P99.99** | 1 en 10,000 escenarios | Eventos catastróficos |
+
+> **Vector de percentiles real (app y export "para IA"):** la tabla interactiva y el JSON de exportación calculan `[P10, P20, P30, P40, P50, P60, P70, P75, P80, P85, P90, P92, P95, P99, P99.99]` (incluye **P92** y **P99.99**). El PDF exportado muestra un subconjunto más corto (P50, P75, P80, P85, P90, P95, P99). El export "para IA" añade además P1, P5, P25, P99.5 y P99.9.
 
 ### Cómo Comunicar la Tabla
 
@@ -392,7 +396,12 @@ Esta información es clave para que el lector del PDF pueda entender por qué un
 
 ## Gráficos y su Interpretación
 
-Risk Lab genera 9 tipos de gráficos principales:
+Risk Lab genera **15 tipos de gráficos** (pestañas interactivas). Los primeros 9 se documentan a continuación; los restantes (Termómetro/Velocímetro de Riesgo, Semáforo, Escenarios, Calendario / Línea de Tiempo, Impacto Económico Anual y el Box Plot de pérdida agregada) se documentan en "Gráficos adicionales" más abajo.
+
+**Pestañas interactivas (orden en la app):** Distribución, Excedencia, Contribución, Termómetro, Semáforo, Frecuencia, Tail Risk, Perd por Evento, Dist. por Evento, Escenarios, Sin Ceros, Calendario, Box Plot, Dispersión.
+
+> **Nota sobre títulos:** el título que aparece dentro de cada gráfico (string literal en el código) no siempre coincide con el nombre de la pestaña. Por ejemplo, la pestaña **"Distribución"** lleva el título **"Impacto Económico Anual Esperado"** (histograma de la pérdida agregada con líneas de Media, Mediana, P90 y P99). Cuando abajo se citan títulos entre comillas, son los strings exactos del gráfico.
+
 
 ### 1. Distribución de Pérdidas Agregadas (Histograma)
 
@@ -492,42 +501,62 @@ o 'la frecuencia es el driver principal de pérdidas']."
 - [EVENTO_C] y [EVENTO_D] tienen perfiles similares"
 ```
 
-### 7. Gráfico de Tornado (Contribución por Evento)
+### 7. Contribución por Evento de Riesgo (Tornado)
 
-**Qué muestra:** Contribución promedio de cada evento a la pérdida total, ordenado de mayor a menor.
+**Título real en el gráfico:** `"Contribución por Evento de Riesgo (<métrica>)"` — pestaña **"Contribución"**.
+
+**Qué muestra:** Contribución de cada evento a la pérdida total, ordenada de mayor a menor.
 
 **Es el gráfico más importante para priorización.**
 
+**Selector de métrica (clave):** el gráfico tiene un **selector** que cambia la métrica de contribución. Opciones: **Media, P75, P80, P90, P95, P99**. El título refleja la métrica elegida (`(Media)`, `(P90)`, `(P99)`, …).
+
+- **Modo Media (default):** contribución promedio de cada evento (`mean` de las pérdidas por evento). Responde "¿quién domina la pérdida esperada anual?".
+- **Modo por percentil (Pxx) — contribución marginal en cola:** en vez del promedio general, el gráfico identifica **solo las simulaciones cuya pérdida total cae en la banda del percentil elegido** (ventana ±2.5%, ampliada a ±5% si hay pocas observaciones) y promedia la contribución de cada evento **dentro de esa banda**. Esto responde "¿qué evento **domina en la cola** (en el P99, etc.)?", que puede ser un evento distinto del que domina la media. Nota: cuando hay una masa grande de años en $0, el motor excluye esos ceros de la banda para no colapsar la contribución de cola a la contribución promedio (mismo fix que en el export "para IA").
+
+> **Media vs. cola:** un evento de alta frecuencia/baja severidad suele dominar la **Media**, mientras que un evento de baja frecuencia/alta severidad domina el **P99**. Comparar ambos modos revela qué mitigar para reducir la pérdida esperada vs. qué mitigar para reducir el riesgo extremo.
+
+El export "para IA" incluye la opción **"Contribución marginal por percentil (qué evento domina en cola)"**, que persiste este análisis por percentil en el JSON.
+
 **Comunicar:**
 ```
-"El gráfico de tornado identifica los eventos que más contribuyen al riesgo:
+"La contribución por evento (métrica: [MEDIA/P99]) identifica los eventos que más aportan al riesgo:
 
 1. [EVENTO_TOP1]: $[VALOR] ([X]% del total) - PRIORIDAD ALTA
 2. [EVENTO_TOP2]: $[VALOR] ([X]% del total) - PRIORIDAD ALTA
 3. [EVENTO_TOP3]: $[VALOR] ([X]% del total) - PRIORIDAD MEDIA
 ...
 
-Los primeros [N] eventos representan el [X]% del riesgo total. 
-Enfocar recursos en estos eventos tendrá el mayor impacto."
+En la Media domina [EVENTO_A], pero en el P99 (cola) domina [EVENTO_B]:
+[EVENTO_A] impulsa la pérdida esperada; [EVENTO_B] impulsa el riesgo catastrófico."
 ```
 
-### 8. Box Plots por Evento
+### 8. Pérdidas por Evento (Histograma) y Box Plot Agregado
 
-**Qué muestra:** Distribución de pérdidas para cada evento (mediana, cuartiles, outliers).
+> **⚠️ Corrección importante:** el "Box Plot **por evento**" está **DESACTIVADO/comentado** en el código actual. NO existe un box plot por cada evento. Hay dos gráficos distintos que a menudo se confunden:
 
-**Elementos del box plot:**
-- **Caja**: 50% central de los datos (Q1 a Q3)
-- **Línea en caja**: Mediana (P50)
-- **Bigotes**: Rango típico
-- **Puntos**: Outliers (eventos extremos)
+**8a. Pestaña "Perd por Evento" — es un HISTOGRAMA, no un box plot.**
+- **Título real:** `"Distribución de Pérdidas por Evento de Riesgo"`.
+- **Qué muestra:** histograma(s) de la distribución de pérdidas de cada evento individual (no cajas/cuartiles). Sirve para ver la forma de la distribución de cada evento (sesgo, bimodalidad por controles estocásticos, cola).
+- No lo describas con lenguaje de box plot (caja/bigotes/outliers); son histogramas.
+
+**8b. Pestaña "Box Plot" — box plot de la pérdida AGREGADA (una sola caja).**
+- **Título real:** `"Distribución de Pérdida Agregada - Análisis de Percentiles"`.
+- **Qué muestra:** UN único box plot de la pérdida **total agregada** (no por evento), con líneas y etiquetas de referencia en **P90, P95 y P99**, más Media, Mediana, Q1 (P25) y Q3 (P75).
+- **Elementos:**
+  - **Caja**: 50% central (Q1=P25 a Q3=P75)
+  - **Línea roja en la caja**: Mediana (P50)
+  - **Bigotes**: rango típico
+  - **Puntos**: outliers (simulaciones extremas)
+  - **Líneas discontinuas**: P90 (verde), P95 (violeta), P99 (rojo)
 
 **Comunicar:**
 ```
-"Los box plots revelan la variabilidad de cada evento:
-- [EVENTO] tiene la mayor dispersión, indicando alta incertidumbre
-- [EVENTO] tiene muchos outliers, sugiriendo potencial de extremos
-- [EVENTO] es más predecible (caja estrecha)"
+"El box plot de la pérdida agregada muestra que el 50% de los años caen entre 
+$[Q1] y $[Q3], con mediana de $[P50]. La cola superior (outliers y P95/P99) 
+indica el potencial de años extremos: P90 $[P90], P95 $[P95], P99 $[P99]."
 ```
+Para la variabilidad por evento individual, usar el histograma de "Perd por Evento" (8a) o la comparación de densidades KDE (Gráfico 6, "Dist. por Evento").
 
 ### 9. Cola de Pérdidas (Tail Risk)
 
@@ -544,6 +573,151 @@ Enfocar recursos en estos eventos tendrá el mayor impacto."
 
 La forma de la cola [DESCRIPCION] sugiere [INTERPRETACION]."
 ```
+
+---
+
+## Gráficos Adicionales (no incluidos en los 9 clásicos)
+
+Estas pestañas existen en la app pero no estaban documentadas. Todas usan los mismos **umbrales fijos** de riesgo en USD (`_UMBRALES_RIESGO_USD`: bajo / moderado / alto) para clasificar la severidad, salvo donde se indique.
+
+### 10. Impacto Económico Anual Esperado (pestaña "Distribución")
+
+**Título real:** `"Impacto Económico Anual Esperado"`.
+
+**Qué muestra:** es el **histograma de la pérdida agregada** (mismo dato que el Gráfico 1), con líneas verticales de **Media, Mediana, P90 y P99**. En la app es la primera pestaña ("Distribución"); el título interno usa este rótulo de negocio.
+
+**Cómo interpretar:** igual que el Gráfico 1 (forma de la distribución, sesgo, bimodalidad). La distancia Media↔Mediana indica cola pesada; las líneas P90/P99 ubican los escenarios adversos sobre el histograma.
+
+### 11. Velocímetro / Termómetro de Riesgo (pestaña "Termómetro")
+
+**Título real:** `"Velocímetro de Riesgo"`.
+
+**Qué muestra:** un **gauge/aguja** que ubica un valor de pérdida (típicamente la Media o el P99 de la pérdida agregada) dentro de las zonas **BAJO / MODERADO / ALTO / CRÍTICO** definidas por los umbrales fijos en USD.
+
+**Cómo interpretar:**
+- La zona donde cae la aguja da una lectura rápida de criticidad sin leer números.
+- Es una traducción cualitativa de una cifra cuantitativa; NO reemplaza al VaR/OpVaR.
+- Reportar tanto la zona ("MODERADO") como el valor exacto que la produce.
+
+```
+"Según el velocímetro, la pérdida esperada cae en zona [ZONA]. Los umbrales 
+son fijos (bajo/moderado/alto en USD), así que esta lectura es comparable 
+entre eventos y escenarios."
+```
+
+### 12. Probabilidad por Nivel de Impacto (Semáforo) (pestaña "Semáforo")
+
+**Título real:** `"Probabilidad por Nivel de Impacto"`.
+
+**Qué muestra:** la **probabilidad (%) de que la pérdida agregada caiga en cada zona** de severidad (BAJO / MODERADO / ALTO / CRÍTICO), con código de colores tipo semáforo. Es la versión probabilística del velocímetro: no dice "en qué zona estás" sino "con qué probabilidad terminás en cada zona".
+
+**Cómo interpretar:**
+- Suma de las 4 probabilidades = 100%.
+- Una probabilidad "CRÍTICO" no despreciable (p. ej. >1–2%) es una señal de riesgo de cola relevante aunque la Media esté en zona baja.
+
+```
+"En [X]% de los años la pérdida es BAJA, [Y]% MODERADA, [Z]% ALTA y [W]% CRÍTICA. 
+Aunque el año típico es [ZONA_MEDIA], hay un [W]% de probabilidad de un año crítico."
+```
+
+### 13. Escenarios — "¿Qué impacto habría si se materializara el riesgo?" (pestaña "Escenarios")
+
+**Título real:** `"¿Qué impacto habría si se materializara el riesgo?"`.
+
+**Qué muestra:** comparación en barras de dos escenarios: el **caso Típico (Media)** vs. un **escenario Extremo** (aprox. 1 vez cada 100 — P99). Es un gráfico de comunicación para audiencias no técnicas.
+
+**⚠️ Interpretación crítica del rótulo:** la barra de la Media está etiquetada como **"Típico (Media)"** con la aclaración **"promedio"** — **NO** dice "50% de probabilidad". La media es el **promedio/valor esperado**, no la mediana ni un nivel de confianza del 50%. No traducir "Típico (Media)" como "hay 50% de probabilidad de esta pérdida"; es el promedio anual esperado. La barra Extremo corresponde a "una vez cada 100 años en promedio" (P99).
+
+```
+"Si el riesgo se materializa en un año típico, el impacto promedio es $[MEDIA]. 
+En un año extremo (1 en 100), el impacto podría llegar a $[P99]."
+```
+
+### 14. Calendario / Línea de Tiempo de Riesgo (pestaña "Calendario")
+
+**Qué muestra:** una línea de tiempo (eje X en escala logarítmica de años: 1 mes … 100 años) que ubica cada nivel de severidad (BAJO/MODERADO/ALTO/CRÍTICO) en su **período de retorno**: cada cuántos años, en promedio, se espera **superar** ese nivel de pérdida.
+
+**Concepto clave — período de retorno:**
+```
+período_de_retorno = 1 / prob_exceder
+```
+donde `prob_exceder` = fracción de simulaciones cuya pérdida agregada supera el umbral.
+
+**⚠️ NO se multiplica por eventos/año.** Cada simulación representa **un año agregado**, por lo que `prob_exceder` ya es una probabilidad **anual** y el período de retorno es su inverso directo. Un error común es multiplicar por la frecuencia de eventos por año: eso está mal. Si un nivel se supera en el 2% de las simulaciones, su período de retorno es 1/0.02 = **50 años** (no 50/eventos_año).
+
+**Cómo interpretar:**
+- Un nivel CRÍTICO con período de retorno de "100 años" = ~1% de probabilidad anual de superarlo.
+- Períodos de retorno muy largos (∞) significan que ese nivel nunca se superó en las simulaciones (probabilidad ≈ 0 dado N).
+- Para visualización el período se capea a 100 años, pero el valor real puede ser mayor.
+
+```
+"El nivel ALTO ($[UMBRAL]) tiene un período de retorno de [T] años, es decir 
+~[100/T]% de probabilidad de superarse cada año. El nivel CRÍTICO se espera 
+1 vez cada [T'] años."
+```
+
+---
+
+## Mapa de Riesgos (`risk_map` en el export "para IA")
+
+El export "para IA" incluye un bloque **`risk_map`** que posiciona cada evento en el plano **Impacto × Frecuencia** para análisis jerárquico. Campos por evento:
+
+| Campo | Significado |
+|-------|-------------|
+| `impacto_medio` | Pérdida media anual del evento (eje X) |
+| `impacto_p90` | P90 de la pérdida del evento |
+| `frecuencia_modo` | Nº más probable de ocurrencias/año (eje Y) |
+| `frecuencia_media` | Nº promedio de ocurrencias/año |
+| `importancia_score` | Score de importancia para ranking (ver abajo) |
+| `importancia_formula` | Descripción textual de la fórmula usada |
+| `cuadrante` | Cuadrante Impacto×Frecuencia asignado |
+
+### ⚠️ Cambio de fórmula de `importancia_score` (importante)
+
+**La fórmula cambió.** Antes era `ImpactoP90 × FrecuenciaModo`; **ahora es simplemente `impacto_medio`** (la **pérdida esperada anual** del evento).
+
+- **Por qué cambió:** la fórmula anterior colapsaba a **0** para cualquier evento con probabilidad de ocurrencia anual < 50% (→ `frecuencia_modo = 0`), que es exactamente el perfil **baja frecuencia / alta severidad** que Risk Lab está pensado para modelar. Además contradecía al `executive_summary` (basado en la media) para el mismo evento.
+- **Ahora** `importancia_score = impacto_medio`, que ya incorpora la frecuencia real del evento y es **consistente con el ranking de "concentracion_riesgo" del resumen ejecutivo**. `importancia_formula` documenta la fórmula exacta usada.
+- **Cómo leerlo:** ordená los eventos por `importancia_score` (= pérdida esperada anual) para priorizar; NO uses la vieja fórmula P90×Modo.
+
+### Umbrales dinámicos de cuadrante
+
+Los ejes se dividen con umbrales **dinámicos**: `umbral = mediana × 1.2` (calculado sobre los eventos de la simulación), tanto para el eje de impacto (`impacto_x`) como el de frecuencia (`frecuencia_y`). Es decir, un evento es "Alto Impacto" si su `impacto_medio ≥ mediana_de_impactos × 1.2`, y análogo para frecuencia con `frecuencia_modo`.
+
+### Los 4 cuadrantes
+
+| Cuadrante | Condición | Estrategia típica |
+|-----------|-----------|-------------------|
+| **Alto Impacto / Alta Frecuencia** | impacto ≥ umbral_x **y** frecuencia ≥ umbral_y | Prioridad máxima: prevención + mitigación de impacto |
+| **Alto Impacto / Baja Frecuencia** | impacto ≥ umbral_x, frecuencia < umbral_y | Transferencia (seguros) y planes de contingencia |
+| **Bajo Impacto / Alta Frecuencia** | impacto < umbral_x, frecuencia ≥ umbral_y | Automatizar controles, reducir tasa de ocurrencia |
+| **Bajo Impacto / Baja Frecuencia** | impacto < umbral_x **y** frecuencia < umbral_y | Monitoreo básico, aceptar el riesgo |
+
+> Como los umbrales son relativos a la mediana de la simulación, el cuadrante es **comparativo dentro del portfolio de eventos**, no un juicio absoluto. Un evento en "Bajo/Bajo" puede seguir siendo material si todos los eventos son grandes.
+
+### Correlación frecuencia–pérdida
+
+El export "para IA" también reporta una correlación numérica **`frecuencia_total_vs_perdida_total`** (correlación entre el nº total de eventos y la pérdida total por simulación). Un valor cercano a 1 indica que la **frecuencia** es el driver principal de la pérdida; un valor bajo indica que la **severidad** domina (pocos eventos pueden causar pérdidas altas). Complementa el análisis Frecuencia vs. Severidad descrito más abajo.
+
+---
+
+## Nota sobre Distribuciones Disponibles
+
+Además de las distribuciones clásicas (Normal, LogNormal, PERT, Pareto/GPD, Uniforme para severidad; Poisson, Binomial, Bernoulli, Poisson-Gamma, Beta para frecuencia), Risk Lab incorpora opciones adicionales que afectan cómo se leen los resultados:
+
+**Severidad (colas pesadas, truncadas en P99.9):**
+- **Burr XII (Singh-Maddala)** — dos parámetros de forma (c, d) para ajuste flexible de cuerpo y cola; se trunca en el percentil 99.9 por seguridad ante colas de media infinita.
+- **Weibull** — forma k y escala λ; colas sub-exponenciales.
+- **Log-t** — `ln(severidad) ~ t de Student`; cola aún más pesada que LogNormal cuando `df` es chico; se trunca en P99.9.
+
+**Frecuencia:**
+- **Zero-Inflated Poisson (ZIP)** (opción 6): con probabilidad π el año no tiene **ningún** evento ("cero estructural"); en caso contrario la cantidad sigue Poisson(λ). Modela eventos raros pero agrupados (p. ej. sanciones regulatorias: la mayoría de los años sin multas, pero cuando ocurren pueden ser varias).
+
+**Por qué importa al interpretar:**
+- **"Muchas simulaciones en $0"** puede deberse a **ZIP** (ceros estructurales por diseño), no a un error de configuración.
+- **Una cola que "se aplana" (P99.99 ≈ P99)** puede ser el **truncamiento intencional en P99.9** de GPD (xi>0), Burr XII o Log-t.
+
+> Estas dos situaciones ya están cubiertas en la sección **"Señales de Modelo Inadecuado"** más abajo; verificá la distribución antes de asumir que hay un error.
 
 ---
 

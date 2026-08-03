@@ -305,6 +305,7 @@ El campo `sev_opcion` determina la distribución de severidad:
   el agente **DEBE** usar `sev_input_method: "direct"`.
 - En esos casos, `sev_minimo`, `sev_mas_probable`, `sev_maximo` deben ser `null` y `sev_params_direct` debe contener los parámetros requeridos.
 - `sev_opcion = 1` (Normal) también soporta `"direct"` con parámetros `mean/std` o `mu/sigma`.
+- **`sev_opcion = 6` (Burr XII), `7` (Weibull) y `8` (Log-t) SOLO soportan `"direct"`**: `sev_input_method` DEBE ser `"direct"`, los tres campos min/mode/max = `null`, y `sev_params_direct` con los parámetros de cada una (Burr `{c,d,scale,loc}`; Weibull `{c,scale,loc}`; Log-t `{df,mu,sigma,loc}`).
 - **RESTRICCIÓN**: `sev_opcion = 3` (PERT) y `sev_opcion = 5` (Uniforme) **SOLO soportan `min_mode_max`**. Usar `"direct"` con estas distribuciones causará **CRASH TOTAL**.
 
 ---
@@ -904,14 +905,14 @@ Cuando se define un límite superior, Risk Lab **no** recorta los valores al top
 
 ### Frecuencia: `freq_limite_superior`
 
-- **Solo aplica** a distribuciones que pueden generar más de 1 ocurrencia: **Poisson** (`freq_opcion=1`), **Binomial** (`freq_opcion=2`) y **Poisson-Gamma** (`freq_opcion=4`)
+- **Solo aplica** a distribuciones que pueden generar más de 1 ocurrencia: **Poisson** (`freq_opcion=1`), **Binomial** (`freq_opcion=2`), **Poisson-Gamma** (`freq_opcion=4`) y **Zero-Inflated Poisson** (`freq_opcion=6`)
 - **No aplica** a Bernoulli (`freq_opcion=3`) ni Beta (`freq_opcion=5`) porque estas distribuciones solo generan 0 o 1 ocurrencias
 - El valor debe ser un **entero positivo** o `null` (sin límite)
 - Ejemplo: `"freq_limite_superior": 10` → máximo 10 ocurrencias por año
 
 ### Severidad: `sev_limite_superior`
 
-- Aplica a **todas** las distribuciones de severidad (Normal, LogNormal, PERT, GPD, Uniforme)
+- Aplica a **todas** las distribuciones de severidad (Normal, LogNormal, PERT, GPD, Uniforme, Burr XII, Weibull, Log-t)
 - El valor debe ser un **número positivo** (en moneda) o `null` (sin límite)
 - Se aplica a cada ocurrencia individual (no al total anual)
 - Ejemplo: `"sev_limite_superior": 500000` → cada ocurrencia tiene un impacto máximo de $500K
@@ -998,7 +999,7 @@ Los vínculos permiten que la ocurrencia de un evento dependa de otros, con prob
 | `tipo` | string | Tipo de dependencia: `"AND"`, `"OR"` o `"EXCLUYE"` |
 | `probabilidad` | integer | Probabilidad de activación del vínculo (1-100). Opcional, default: 100 |
 | `factor_severidad` | float | Multiplicador de severidad condicional (0.10-5.00). Opcional, default: 1.0 |
-| `umbral_severidad` | integer | Pérdida mínima del padre para considerar que "ocurrió" ($, ≥0). Opcional, default: 0 |
+| `umbral_severidad` | integer | Pérdida BRUTA mínima del padre (antes de seguros) para considerar que "ocurrió" ($, ≥0). Opcional, default: 0 |
 
 **Validaciones ESTRICTAS**:
 - `tipo` debe ser exactamente `"AND"`, `"OR"` o `"EXCLUYE"` (en mayúsculas)
@@ -1031,7 +1032,8 @@ Los vínculos permiten que la ocurrencia de un evento dependa de otros, con prob
 
 ### Umbral de Severidad del Padre:
 - 0 = sin umbral, basta con que el padre tenga frecuencia > 0 (default, backward compatible)
-- >0 = el padre se considera "ocurrido" solo si su pérdida total en esa simulación ≥ umbral
+- >0 = el padre se considera "ocurrido" solo si su pérdida en esa simulación ≥ umbral
+- **IMPORTANTE**: el umbral se evalúa contra la pérdida **BRUTA del padre (antes de aplicar seguros)**, no contra la pérdida neta post-seguro. Un padre con póliza igual dispara el vínculo si su pérdida bruta supera el umbral, aunque el seguro reduzca lo que finalmente contabiliza.
 - Solo aplica a vínculos de tipo AND y OR (EXCLUYE no usa umbral en la UI)
 - Permite modelar dependencias condicionadas a la magnitud del impacto del padre
 
@@ -1934,19 +1936,21 @@ Los campos min/mode/max/confianza son opcionales (para documentación/UI). Lo qu
 ### Antes de generar el JSON, verificar:
 
 #### ☑️ Severidad:
-- [ ] `sev_opcion` entre 1 y 5
+- [ ] `sev_opcion` entre 1 y 8
 - [ ] Si `sev_opcion` = 3 (PERT) o 5 (Uniforme): `sev_input_method` **DEBE** ser `"min_mode_max"` (no soportan `"direct"`)
+- [ ] Si `sev_opcion` = 6 (Burr XII), 7 (Weibull) u 8 (Log-t): `sev_input_method` **DEBE** ser `"direct"` (solo admiten parámetros directos)
 - [ ] Si `sev_input_method` = "min_mode_max":
   - [ ] `sev_minimo` < `sev_mas_probable` < `sev_maximo`
   - [ ] `sev_params_direct` = `{}`
 - [ ] Si `sev_input_method` = "direct":
   - [ ] `sev_minimo` = `null`, `sev_mas_probable` = `null`, `sev_maximo` = `null`
   - [ ] `sev_params_direct` NO está vacío
-  - [ ] Parámetros > 0 donde aplica (`std`, `sigma`, `s`, `scale`)
+  - [ ] Parámetros > 0 donde aplica (`std`, `sigma`, `s`, `scale`; para Burr `c`,`d`,`scale`; Weibull `c`,`scale`; Log-t `df`,`sigma`)
+  - [ ] `loc` ≥ 0 (opcional, default 0) en Burr/Weibull/Log-t
   - [ ] NO mezclar opciones (mean/std vs mu/sigma vs s/scale)
 
 #### ☑️ Frecuencia:
-- [ ] `freq_opcion` entre 1 y 5
+- [ ] `freq_opcion` entre 1 y 6
 - [ ] Poisson (1): `tasa` > 0, resto = `null`
 - [ ] Binomial (2): `num_eventos` > 0, `0 ≤ prob_exito ≤ 1`, resto = `null`
 - [ ] Bernoulli (3): `0 ≤ prob_exito ≤ 1`, resto = `null`. Recomendación: evitar 0.0 y 1.0 exactos si hay factores estocásticos
@@ -1957,6 +1961,7 @@ Los campos min/mode/max/confianza son opcionales (para documentación/UI). Lo qu
   - [ ] Si min/mode/max: `0 ≤ min < mode < max ≤ 100` y **además** `beta_alpha`/`beta_beta` > 0
   - [ ] Si alpha/beta: ambos > 0, y `beta_minimo`/`beta_mas_probable`/`beta_maximo`/`beta_confianza` deben ser numéricos (no `null`) y coherentes
   - [ ] Valores son PORCENTAJES (0-100), no decimales (0-1)
+- [ ] Zero-Inflated Poisson (6): `zip_pi` ∈ [0, 1) (prob. de cero estructural) y `zip_lambda` > 0 (tasa Poisson), ambos numéricos (no `null`); `tasa`/`num_eventos`/`prob_exito` = `null`
 
 #### ☑️ Factores Estáticos:
 - [ ] `tipo_modelo` = "estatico"
@@ -2052,6 +2057,7 @@ nuevo_id = str(uuid.uuid4())
    - Si `sev_input_method` = "direct": min/mode/max = `null`, `sev_params_direct` CON contenido
    - Si no se proveen parámetros directos explícitos, **NO inventar** `sev_params_direct`: usar `min_mode_max`
    - Excepción obligatoria para IA: si `sev_opcion` es LogNormal (2) o Pareto/GPD (4), **usar siempre `direct`**
+   - Burr XII (6), Weibull (7) y Log-t (8) **solo existen en `direct`**: siempre `sev_input_method: "direct"` con sus parámetros en `sev_params_direct`
 3. **NUNCA dejar `sev_params_direct` vacío `{}` con método "direct"**
 4. **NUNCA usar parámetros en 0 o negativos** donde no está permitido:
    - `std`, `sigma`, `s`, `scale` SIEMPRE > 0

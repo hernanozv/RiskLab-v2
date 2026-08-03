@@ -112,10 +112,14 @@ Solo podés proponer y usar estas:
 | 3 | 3 | **PERT** | Juicio experto (min/modo/max) | **solo `min_mode_max`** |
 | 4 | 4 | **Pareto/GPD** | Colas pesadas, pérdidas extremas | **solo `direct`** |
 | 5 | 5 | **Uniforme** | Rango puro sin información de moda | **solo `min_mode_max`** |
+| 6 | 6 | **Burr XII** | Ajuste empírico flexible de cuerpo+cola (fraude, procesos) | **solo `direct`** |
+| 7 | 7 | **Weibull** | Sub-exponencial / tiempo hasta falla | **solo `direct`** |
+| 8 | 8 | **Log-t** | Cola aún más pesada que LogNormal (volatilidad de negocio) | **solo `direct`** |
 
 **Reglas obligatorias:**
-* Si el caso "pediría" otra distribución (Gamma/Weibull/etc.), **mapeá** a la opción más cercana y explicá el trade-off.
+* Estas 8 distribuciones son las disponibles. Si el caso pediría una que no está en la lista (ej. Gamma), **mapeá** a la opción más cercana y explicá el trade-off. (Nota: Weibull, Burr y Log-t **ya existen** — usarlas directamente, no mapear a otra.)
 * **LogNormal y Pareto/GPD SIEMPRE deben usar `sev_input_method: "direct"`** con parámetros directos (nunca min/modo/max). Esto es una política obligatoria — ver MANUAL\_AGENTE\_IA\_RISK\_LAB para opciones de parametrización directa.
+* **Burr XII (6), Weibull (7) y Log-t (8) SOLO existen en `sev_input_method: "direct"`**: min/modo/max en `null` y `sev_params_direct` con sus parámetros (Burr `{c,d,scale,loc}`; Weibull `{c,scale,loc}`; Log-t `{df,mu,sigma,loc}`; formas/df/sigma/scale > 0, loc ≥ 0). Burr y Log-t se truncan en P99.9 (como GPD con xi>0).
 * **PERT y Uniforme SOLO soportan `sev_input_method: "min_mode_max"`**. Usar "direct" con estas distribuciones causa **crash total**.
 
 **Reglas de campos según método de entrada:**
@@ -138,6 +142,7 @@ Solo podés proponer y usar estas:
 | 3 | 3 | **Bernoulli** | Incidente anual sí/no | `prob_exito` (0-1) |
 | 4 | 4 | **Poisson-Gamma** | Frecuencia con incertidumbre en la tasa | `pg_alpha` (> 1, **obligatorio**) + `pg_beta` (> 0, **obligatorio**). Opcionalmente `pg_minimo/pg_mas_probable/pg_maximo/pg_confianza` para documentar la estimación del usuario. |
 | 5 | 5 | **Beta** | Probabilidad incierta (0-100%) | `beta_minimo/beta_mas_probable/beta_maximo/beta_confianza` (**porcentajes 0-100**, no decimales) + `beta_alpha/beta_beta` (ambos > 0, **obligatorios**) |
+| 6 | 6 | **Zero-Inflated Poisson** | Eventos raros pero agrupados (regulatorio: mayoría de años sin multas, clusters cuando ocurre) | `zip_pi` (prob. de cero estructural, [0, 1)) + `zip_lambda` (tasa Poisson, > 0). Media = `(1-zip_pi)·zip_lambda`. `tasa/num_eventos/prob_exito` = `null` |
 
 **Regla:** si aparece overdispersion o incertidumbre fuerte, preferir **Poisson-Gamma** (para tasa incierta) o **Beta** (para probabilidad incierta).
 
@@ -177,7 +182,7 @@ Siempre incluir `pg_alpha` y `pg_beta` con los valores calculados en el JSON, in
 
 * **probabilidad** (1-100%): probabilidad condicional de que el vínculo se active cuando la condición se cumple.
 * **factor\_severidad** (0.10-5.00): multiplicador **fijo** aplicado a la severidad del hijo cuando el vínculo se activa (ej: 2.0 = severidad del hijo se duplica). **No depende de la magnitud de la pérdida del padre** — se aplica igual sin importar cuánto perdió el padre. El padre solo importa para determinar SI el vínculo se activa (ocurrencia + umbral).
-* **umbral\_severidad** (≥ 0): pérdida mínima del padre para activar al hijo (ej: solo se activa si la pérdida del padre supera USD 100K).
+* **umbral\_severidad** (≥ 0): pérdida **BRUTA** mínima del padre —**antes de aplicar seguros**— para activar al hijo (ej: solo se activa si la pérdida bruta del padre supera USD 100K). Un padre asegurado igual dispara el vínculo por su pérdida bruta, aunque el seguro reduzca lo que finalmente contabiliza.
 
 **Reglas:**
 * No usar correlaciones, copulas ni dependencias estadísticas fuera de AND/OR/EXCLUYE.
@@ -753,7 +758,7 @@ En vez del mecánico "deme min/modo/max", usar estas técnicas para obtener mejo
   * `tipo`: `"AND"`, `"OR"` o `"EXCLUYE"` (mayúsculas exactas)
   * `probabilidad`: 1-100 (porcentaje, NO decimal — el código divide por 100 internamente)
   * `factor_severidad`: 0.10-5.00 (multiplicador fijo; 1.0 = sin efecto; para EXCLUYE siempre 1.0)
-  * `umbral_severidad`: ≥ 0 (USD; 0 = sin umbral)
+  * `umbral_severidad`: ≥ 0 (USD; 0 = sin umbral). Se evalúa contra la pérdida **bruta** del padre (antes de seguros)
 
   **Plantilla de factor ESTÁTICO** (dentro de `factores_ajuste`):
   ```json

@@ -959,10 +959,47 @@ Ejemplo: STD = $500K, N = 10,000
 
 | Señal | Posible Problema |
 |-------|------------------|
-| Muchas simulaciones en $0 | Frecuencias muy bajas, aumentar N |
-| P99.99 = P99 | Cola truncada, revisar distribución |
+| Muchas simulaciones en $0 | Frecuencias muy bajas o exceso de ceros. **Puede ser correcto**: eventos raros (frecuencia baja) o distribución Zero-Inflated Poisson (que genera años de "cero estructural" por diseño). Verificar la distribución de frecuencia antes de asumir que es un error. |
+| P99.99 = P99 (cola aplanada) | Puede ser **truncamiento intencional**: GPD (xi>0), Burr XII y Log-t se truncan por diseño en el percentil 99.9 para acotar valores extremos espurios. Solo es señal de modelo inadecuado si la distribución NO es una de esas y la cola se aplana de forma inesperada. |
 | CV muy bajo (<0.1) | Modelo demasiado determinístico |
 | Eventos siempre en mínimo | Frecuencia mal especificada |
+
+---
+
+## ⚠️ Advertencias de Validez de Resultados (LEER ANTES DE REPORTAR)
+
+Risk Lab aplica dos topes internos de seguridad que, si se activan, **SUBESTIMAN la pérdida
+esperada**. Cuando ocurren, la app muestra un `QMessageBox.warning` y el export "para IA"
+lo registra. **Un intérprete NUNCA debe reportar la pérdida media sin antes verificar que
+ninguno de estos topes se activó**, porque el número reportado sería artificialmente bajo.
+
+### 1. Reescalado de frecuencias por límite de memoria
+
+- **Qué pasa**: si un evento generaría demasiadas ocurrencias individuales en un chunk de
+  simulación (por `tasa` × `num_simulaciones` muy alto), el motor **reescala las
+  frecuencias hacia abajo** para no agotar memoria. Esto **preserva el coeficiente de
+  variación (CV) pero SUBESTIMA la media** de pérdidas.
+- **Cómo detectarlo**: en el export "para IA", revisar `execution_metadata.engine_limits.eventos_con_cap_aplicado`.
+  Si esa lista **no está vacía**, los resultados de esos eventos están distorsionados (cada
+  entrada trae `factor_reescalado`, `suma_frecuencias_original` vs `_capeada` y
+  `media_por_simulacion_original` vs `_capeada`). En la app aparece el aviso
+  "Frecuencia Reescalada (resultados distorsionados)".
+- **Qué hacer**: reportar la pérdida como **cota inferior**, no como estimación puntual, y
+  recomendar reducir la tasa/`num_simulaciones` o dividir el evento.
+
+### 2. Clip de pérdida agregada a $1e12
+
+- **Qué pasa**: las pérdidas por evento se acotan a un tope de seguridad de **$1e12 (1
+  billón USD, escala anglosajona)**. Si un evento supera ese tope, se recorta y también
+  **SUBESTIMA la media**.
+- **Cómo detectarlo**: la app muestra el aviso "superaron el tope interno de seguridad
+  ($1e12)... SUBESTIMA". Suele indicar parámetros de severidad irrealistas.
+- **Qué hacer**: revisar los parámetros de severidad del evento (probablemente `scale`/`sigma`
+  demasiado altos) en vez de tomar la pérdida al pie de la letra.
+
+> **Regla de oro para el intérprete**: si `eventos_con_cap_aplicado` no está vacío o aparece
+> cualquiera de estos avisos, **anteponer la advertencia** de que la pérdida esperada está
+> subestimada antes de cualquier cifra o recomendación.
 
 ---
 

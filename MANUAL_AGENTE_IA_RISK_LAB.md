@@ -76,6 +76,7 @@ Preguntar al usuario:
 | "Ocurre o no ocurre (una vez máximo)" | **Bernoulli** | 3 |
 | "No estoy seguro de la tasa exacta" | **Poisson-Gamma** | 4 |
 | "No estoy seguro de la probabilidad exacta" | **Beta** | 5 |
+| "La mayoría de los años sin eventos, pero cuando ocurre puede haber varios" | **Zero-Inflated Poisson** | 6 |
 
 #### Cuándo usar cada una:
 
@@ -106,6 +107,12 @@ Preguntar al usuario:
 - **Parámetros**: `beta_minimo`, `beta_mas_probable`, `beta_maximo` (en %), `beta_confianza`
 - **⚠️ OBLIGATORIO**: Además se deben incluir `beta_alpha` y `beta_beta` calculados (> 0). Sin ellos, la importación falla. Ver el snippet de cálculo en `ESPECIFICACION_JSON_RISK_LAB.md` sección Beta Frecuencia.
 
+**Zero-Inflated Poisson (freq_opcion: 6)**
+- Usuario dice: "La mayoría de los años no hay ninguna multa, pero cuando aparece una auditoría pueden salir varias sanciones a la vez"
+- Eventos **raros pero agrupados** (exceso de ceros estructural): muchos años en cero + clusters cuando ocurre. Típico de riesgo regulatorio o brechas de ciberseguridad masivas.
+- **Parámetros**: `zip_pi` (probabilidad de cero estructural, en [0, 1)) y `zip_lambda` (tasa de la Poisson subyacente cuando el evento sí ocurre, > 0). Media resultante = `(1 - zip_pi) * zip_lambda`.
+- `tasa`, `num_eventos`, `prob_exito` deben ser `null`. Admite `freq_limite_superior`.
+
 ---
 
 ### Distribuciones de SEVERIDAD
@@ -117,8 +124,13 @@ Preguntar al usuario:
 | Estimación por expertos (min/probable/max) | **PERT** | 3 |
 | Eventos catastróficos con cola muy pesada | **Pareto/GPD** | 4 |
 | Cualquier valor igualmente probable en un rango | **Uniforme** | 5 |
+| Ajuste empírico flexible de cuerpo y cola de pérdidas operacionales | **Burr XII** | 6 |
+| Colas sub-exponenciales / tiempo hasta falla | **Weibull** | 7 |
+| Cola aún más pesada que LogNormal (volatilidad de negocio) | **Log-t** | 8 |
 
 > **🚨 POLÍTICA OBLIGATORIA PARA IA**: Para `sev_opcion = 2` (LogNormal) y `sev_opcion = 4` (Pareto/GPD), el agente **DEBE** usar `sev_input_method: "direct"` con parámetros directos. No usar `min_mode_max` para estas distribuciones — puede causar errores de parametrización en la importación. Ver detalles en `ESPECIFICACION_JSON_RISK_LAB.md`.
+>
+> **Burr XII (6), Weibull (7) y Log-t (8) SOLO existen en modo `"direct"`**: siempre `sev_input_method: "direct"`, min/mode/max = `null`, y `sev_params_direct` con sus parámetros. Burr y Log-t (como GPD con xi>0) se truncan automáticamente en el percentil 99.9 por seguridad ante colas de media infinita.
 
 #### Cuándo usar cada una:
 
@@ -148,6 +160,18 @@ Preguntar al usuario:
 - Alta incertidumbre
 - Cualquier valor en el rango es igualmente probable
 - Usuario dice: "Puede ser cualquier cosa entre $20K y $80K, no tengo idea"
+
+**Burr XII (sev_opcion: 6)** — *solo parámetros directos*
+- Mejor ajuste empírico a pérdidas operacionales reales (fraude, fallas de procesos): dos parámetros de forma dan mucha flexibilidad para el cuerpo y la cola.
+- **Parámetros** (`sev_params_direct`): `c` > 0 y `d` > 0 (formas), `scale` > 0, `loc` ≥ 0 (opcional, default 0). Truncada en P99.9.
+
+**Weibull (sev_opcion: 7)** — *solo parámetros directos*
+- Colas sub-exponenciales; útil para "tiempo hasta evento/falla" (duración de caídas de plataforma, tiempo de resolución de incidentes).
+- **Parámetros** (`sev_params_direct`): `c` > 0 (forma k), `scale` > 0 (escala λ), `loc` ≥ 0 (opcional).
+
+**Log-t (sev_opcion: 8)** — *solo parámetros directos*
+- `ln(severidad)` sigue una t de Student: cola aún más pesada que LogNormal cuando `df` es chico. Útil para volatilidad de negocio / shocks extremos.
+- **Parámetros** (`sev_params_direct`): `df` > 0 (grados de libertad), `mu` (localización en escala log), `sigma` > 0 (escala en escala log), `loc` ≥ 0 (opcional). Truncada en P99.9.
 
 ---
 
@@ -520,6 +544,9 @@ Varianza = αβ / [(α + β)²(α + β + 1)]
 | PERT | 3 | No soporta | Solo min/mode/max |
 | Pareto/GPD | 4 | c, scale, loc | Análisis de extremos (EVT) |
 | Uniforme | 5 | No soporta | Solo min/max |
+| Burr XII | 6 | c, d, scale, loc | Ajuste empírico de cuerpo+cola (solo `direct`) |
+| Weibull | 7 | c, scale, loc | Sub-exponencial / tiempo hasta falla (solo `direct`) |
+| Log-t | 8 | df, mu, sigma, loc | Cola más pesada que LogNormal (solo `direct`) |
 
 | Distribución | freq_opcion | Parámetros directos | Cuándo usar |
 |--------------|-------------|---------------------|-------------|
@@ -528,6 +555,7 @@ Varianza = αβ / [(α + β)²(α + β + 1)]
 | Bernoulli | 3 | Solo `prob_exito` | Probabilidad conocida |
 | Poisson-Gamma | 4 | pg_alpha, pg_beta | Análisis Bayesiano |
 | Beta | 5 | beta_alpha, beta_beta | Análisis Bayesiano |
+| Zero-Inflated Poisson | 6 | zip_pi, zip_lambda | Eventos raros pero agrupados (exceso de ceros) |
 
 ---
 
@@ -642,7 +670,7 @@ Este evento modela:
 | `tipo` | string | (requerido) | `"AND"`, `"OR"` o `"EXCLUYE"` |
 | `probabilidad` | integer | 100 | Probabilidad de activación del vínculo (1-100%) |
 | `factor_severidad` | float | 1.0 | Multiplicador de severidad condicional (0.10-5.00) |
-| `umbral_severidad` | integer | 0 | Pérdida neta mínima del padre para activar ($, ≥0) |
+| `umbral_severidad` | integer | 0 | Pérdida BRUTA mínima del padre (antes de seguros) para activar ($, ≥0) |
 
 ### Cuándo usar cada campo avanzado:
 
@@ -659,7 +687,7 @@ Este evento modela:
 
 **`umbral_severidad` (>0)**
 - "La brecha de datos solo se activa si el ataque causó más de $50K" → umbral = 50000
-- Compara contra la pérdida **neta** del padre (post-controles y seguros)
+- Compara contra la pérdida **BRUTA** del padre (post-controles pero **ANTES de seguros**). Un padre asegurado igual dispara el vínculo si su pérdida bruta supera el umbral, aunque el seguro reduzca lo que finalmente contabiliza.
 - $0 = sin umbral, basta con que el padre haya ocurrido
 
 ### Ejemplo JSON de vínculos avanzados:
@@ -1270,7 +1298,7 @@ Risk Lab permite definir un **límite superior** para la frecuencia y/o la sever
 ```
 
 ### Reglas:
-- `freq_limite_superior` solo tiene efecto con Poisson, Binomial y Poisson-Gamma (Bernoulli/Beta ya generan 0 o 1)
+- `freq_limite_superior` solo tiene efecto con Poisson, Binomial, Poisson-Gamma y Zero-Inflated Poisson (Bernoulli/Beta ya generan 0 o 1)
 - `sev_limite_superior` aplica a todas las distribuciones de severidad
 - **No usar como parche** para distribuciones mal parametrizadas — ajustar parámetros primero
 - Ambos campos son opcionales; `null` = sin límite (backward compatible)
@@ -1487,6 +1515,7 @@ Antes de entregar el JSON al usuario, verificar:
 - [ ] Si `sev_input_method: "direct"` → `sev_minimo/mas_probable/maximo` son `null` (claves presentes) y `sev_params_direct` tiene parámetros válidos (nunca `{}` vacío)
 - [ ] `std`/`sigma`/`s`/`scale` siempre > 0 en `sev_params_direct`
 - [ ] PERT/Uniforme solo con `"min_mode_max"`; LogNormal/Pareto solo con `"direct"`
+- [ ] Burr XII (6)/Weibull (7)/Log-t (8) solo con `"direct"`; `sev_params_direct` con sus parámetros (Burr `c,d,scale,loc`; Weibull `c,scale,loc`; Log-t `df,mu,sigma,loc`), formas/df/sigma/scale > 0
 
 **Frecuencia:**
 - [ ] `freq_opcion=1` → `tasa` > 0 (nunca null ni 0)
@@ -1494,6 +1523,7 @@ Antes de entregar el JSON al usuario, verificar:
 - [ ] `freq_opcion=3` → `0 ≤ prob_exito ≤ 1`
 - [ ] `freq_opcion=4` → `pg_alpha` > 1 y `pg_beta` > 0, ambos numéricos (**nunca null**)
 - [ ] `freq_opcion=5` → `beta_alpha` > 0 y `beta_beta` > 0 (**nunca null**); `beta_minimo/mas_probable/maximo/confianza` numéricos (**nunca null**)
+- [ ] `freq_opcion=6` (ZIP) → `zip_pi` ∈ [0, 1) y `zip_lambda` > 0, ambos numéricos (**nunca null**); `tasa/num_eventos/prob_exito` = `null`
 
 **Factores y seguros:**
 - [ ] Todo factor tiene campo `nombre` (no vacío)

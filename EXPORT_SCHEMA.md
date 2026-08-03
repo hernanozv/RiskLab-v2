@@ -1,6 +1,6 @@
 # Especificación del Formato `Exportar para Análisis (IA)` — Risk Lab
 
-**Versión del schema:** `1.0`
+**Versión del schema:** `1.1`
 **Extensión:** `.risklab.json` (o `.risklab.json.gz` si está comprimido)
 **Idioma de descripciones:** Español (siempre)
 
@@ -21,7 +21,7 @@ A diferencia del export PDF, este formato:
 
 ```
 {
-  "$schema_version": "1.0",
+  "$schema_version": "1.1",
   "$schema_url": "...",
   "$generated_at": "2026-05-01T...Z",
   "$generator": { ... },
@@ -34,9 +34,18 @@ A diferencia del export PDF, este formato:
   "results": { ... },
   "executive_summary": { ... },
   "text_snapshot": { ... },
-  "schema_documentation": { ... }
+  "schema_documentation": { ... },
+  "input_events_omitidos": [ ... ],
+  "input_scenarios_omitidos": [ ... ]
 }
 ```
+
+`input_events_omitidos`/`input_scenarios_omitidos` son campos
+**condicionales**: solo aparecen en la raíz si al menos un evento o
+escenario del archivo original falló al decodificarse para el export
+(cada entrada indica el nombre/id afectado y el motivo). Si todos los
+eventos/escenarios se exportaron correctamente, estas claves están
+ausentes.
 
 ---
 
@@ -49,7 +58,7 @@ sepa qué espera del formato.
 
 ```json
 {
-  "$schema_version": "1.0",
+  "$schema_version": "1.1",
   "$generated_at": "2026-05-01T22:00:00Z",
   "$generator": {
     "tool": "Risk Lab",
@@ -108,6 +117,11 @@ Información del entorno de ejecución y orden de procesamiento.
     "scipy_version": "1.17.1",
     "numpy_version": "2.4.4"
   },
+  "engine_limits": {
+    "max_eventos_por_evento_por_chunk": 500000000,
+    "descripcion": "Limite absoluto del motor: cantidad maxima de ocurrencias individuales generadas por evento dentro de un chunk de simulacion. Si la suma de frecuencias generadas excede este limite, el motor reescala las frecuencias multiplicativamente, lo que preserva el CV pero SUBESTIMA la media de perdidas. Si 'eventos_con_cap_aplicado' no esta vacio, los resultados estan distorsionados.",
+    "eventos_con_cap_aplicado": []
+  },
   "active_events_count": 5,
   "total_events_count": 7,
   "topological_order": [
@@ -115,6 +129,12 @@ Información del entorno de ejecución y orden de procesamiento.
   ]
 }
 ```
+
+`engine_limits.eventos_con_cap_aplicado` está vacío en la corrida normal;
+si algún evento excedió el límite interno del motor, cada entrada trae
+`event_id`, `event_name`, `factor_reescalado`,
+`suma_frecuencias_original`/`_capeada` y
+`media_por_simulacion_original`/`_capeada`.
 
 ### 6. `input_events`
 
@@ -200,7 +220,7 @@ los códigos internos.
 | 2 | Binomial | `num_eventos` (n), `prob_exito` (p) |
 | 3 | Bernoulli | `prob_exito` (p) |
 | 4 | Poisson-Gamma (Binomial Negativa) | `pg_alpha`, `pg_beta`, `pg_minimo`, `pg_mas_probable`, `pg_maximo` |
-| 5 | Beta de probabilidad | `beta_alpha`, `beta_beta`, `beta_minimo`, `beta_mas_probable`, `beta_maximo` |
+| 5 | Beta | `beta_alpha`, `beta_beta`, `beta_minimo`, `beta_mas_probable`, `beta_maximo` |
 
 ### Severidad
 
@@ -237,22 +257,37 @@ o `"direct"` (usa parámetros nativos en `sev_params_direct`).
   "modelo": "reincidencia",
   "tipo_escalamiento": "lineal",
   "paso": 0.5,
+  "base": null,
   "factor_max": 5.0,
+  "tabla": [],
+  "alpha": 0.5,
+  "solo_aumento": true,
+  "sistemico_factor_max": 3.0,
   "explicacion": "Reincidencia lineal con paso 0.5..."
 }
 ```
 
 Modelos: `"reincidencia"` (factor crece por ocurrencia ordinal) o `"sistemico"`
-(factor depende del z-score de la frecuencia agregada).
+(factor depende del z-score de la frecuencia agregada). Este bloque
+siempre incluye TODOS los campos de ambos modelos (`paso`/`base`/`tabla`
+para `"reincidencia"`; `alpha`/`solo_aumento`/`sistemico_factor_max` para
+`"sistemico"`), no solo los relevantes al `modelo`/`tipo_escalamiento`
+activo — los campos del modelo no usado quedan con su valor guardado
+(o `null`) pero no afectan el cálculo.
 
 ### Factores de ajuste
 
 Cada factor puede ser uno de tres tipos:
 
+Todo factor (de cualquiera de los tres tipos) siempre incluye además un
+campo `"activo"` (booleano, `true` por defecto): factores inactivos se
+exportan igual, pero no se aplicaron en la simulación.
+
 **Estático** — aplica siempre con un impacto fijo:
 ```json
 {
   "nombre": "Política Anti-Fraude",
+  "activo": true,
   "tipo_modelo": "estatico",
   "afecta_frecuencia": true,
   "afecta_severidad": false,
@@ -266,6 +301,7 @@ Cada factor puede ser uno de tres tipos:
 ```json
 {
   "nombre": "Auditoría",
+  "activo": true,
   "tipo_modelo": "estocastico",
   "confiabilidad_pct": 80,
   "reduccion_efectiva_pct": 60,
@@ -280,6 +316,7 @@ Cada factor puede ser uno de tres tipos:
 ```json
 {
   "nombre": "Cyber Insurance",
+  "activo": true,
   "tipo_modelo": "estatico",
   "tipo_severidad": "seguro",
   "seguro": {
@@ -391,6 +428,16 @@ Lista por evento con estadísticas, boxplot, contribución y comportamiento obse
 ]
 ```
 
+`contribucion_al_total` y `comportamiento_observado` son campos
+**condicionales**, no siempre presentes en cada entrada de `per_event`:
+- `contribucion_al_total` solo aparece si la pérdida media agregada de
+  la cartera es mayor a 0 y el evento tiene datos de pérdida.
+- `comportamiento_observado` solo aparece si el evento tuvo un factor de
+  severidad estático distinto de 1.0 aplicado, o un vector de factores
+  estocásticos de severidad activo; contiene únicamente las claves
+  (`factor_severidad_estatico_aplicado`, `factor_severidad_estocastico_promedio`)
+  que efectivamente aplicaron.
+
 ### `correlation`
 
 ```json
@@ -443,7 +490,7 @@ Posicionamiento de eventos en el plano Impacto × Frecuencia.
   "umbrales_cuadrantes": {
     "impacto_x": 800000,
     "frecuencia_y": 3,
-    "criterio": "mediana × 1.2"
+    "criterio": "mediana × 1.2 (calculado dinámicamente)"
   },
   "events": [
     {
@@ -453,13 +500,18 @@ Posicionamiento de eventos en el plano Impacto × Frecuencia.
       "impacto_p90": 2400000,
       "frecuencia_modo": 5,
       "frecuencia_media": 4.98,
-      "importancia_score": 12000000,
-      "importancia_formula": "ImpactoP90 x FrecuenciaModo",
+      "importancia_score": 850000,
+      "importancia_formula": "ImpactoMedio (pérdida esperada anual, consistente con el resumen ejecutivo)",
       "cuadrante": "Alto Impacto / Alta Frecuencia"
     }
   ]
 }
 ```
+
+Nota: `importancia_score` es la pérdida media anual esperada del evento
+(`impacto_medio`), no un producto de impacto y frecuencia -- usar
+siempre el campo `importancia_formula` (incluido en cada evento) como
+fuente de verdad de qué fórmula se aplicó, en vez de asumirla.
 
 ### `risk_classification`
 
@@ -538,13 +590,17 @@ escenarios típicos.
 ```json
 {
   "escenarios": [
-    {"nombre": "Típico (Media)",      "valor": ..., "probabilidad_etiqueta": "promedio"},
-    {"nombre": "Adverso (P90)",       "valor": ..., "probabilidad_etiqueta": "10% de probabilidad anual"},
-    {"nombre": "Muy Adverso (P95)",   "valor": ..., "probabilidad_etiqueta": "5% de probabilidad anual"},
-    {"nombre": "Extremo (P99)",       "valor": ..., "probabilidad_etiqueta": "1% de probabilidad anual"}
+    {"nombre": "Típico (Media)",      "valor": ..., "probabilidad_etiqueta": "promedio", "_meaning": "Pérdida esperada en un año típico"},
+    {"nombre": "Adverso (P90)",       "valor": ..., "probabilidad_etiqueta": "10% de probabilidad anual", "_meaning": "Pérdida que se supera con 10% de probabilidad"},
+    {"nombre": "Muy Adverso (P95)",   "valor": ..., "probabilidad_etiqueta": "5% de probabilidad anual", "_meaning": "Pérdida que se supera con 5% de probabilidad"},
+    {"nombre": "Extremo (P99)",       "valor": ..., "probabilidad_etiqueta": "1% de probabilidad anual", "_meaning": "Una vez cada 100 años en promedio"}
   ]
 }
 ```
+
+Cada entrada de `escenarios[]` siempre incluye un campo `_meaning` con una
+explicación en lenguaje natural del significado del escenario, pensada
+para que un agente IA no necesite inferirla del nombre/etiqueta.
 
 ### `insurance_effectiveness`
 

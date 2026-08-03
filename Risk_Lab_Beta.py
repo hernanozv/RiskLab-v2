@@ -32,6 +32,8 @@ import io
 import traceback
 import uuid
 import copy
+import logging
+import logging.handlers
 from xml.sax.saxutils import escape as _xml_escape_pdf
 
 # Import de log_odds_utils (movido al tope para evitar reimports en el hot loop de simulación)
@@ -162,6 +164,58 @@ def _indice_actual_avisos_riesgo():
         return len(_riesgo_warnings_buffer)
 
 
+# ==========================================================================
+# R4 alto #7: logging a archivo + excepthook global.
+#
+# En una build empaquetada con la consola oculta (PyInstaller
+# --windowed/console=False), cualquier excepción no capturada en el hilo
+# principal (fuera de los try/except explícitos de la UI) simplemente
+# cierra la aplicación sin dejar NINGÚN rastro visible: no hay consola
+# donde leer el traceback, y sin este logging tampoco quedaría nada en
+# disco. Esto hace que un crash reportado por un usuario en producción sea
+# efectivamente indiagnosticable a distancia. Instalamos:
+#   1) un logger raíz que escribe a un archivo rotativo en el directorio
+#      de configuración del usuario (~/.risklab/risklab.log), y
+#   2) un sys.excepthook que registra cualquier excepción no capturada
+#      del hilo principal en ese archivo antes de continuar con el
+#      comportamiento por defecto de Python.
+# Si el archivo de log no se puede crear (permisos, disco de solo
+# lectura, etc.), la app debe seguir funcionando igual: el logging es una
+# ayuda de diagnóstico, nunca un requisito para operar.
+# ==========================================================================
+def _configurar_logging_archivo_y_excepthook():
+    try:
+        log_dir = os.path.join(os.path.expanduser('~'), '.risklab')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'risklab.log')
+        handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        ))
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(handler)
+    except Exception:
+        pass
+
+    def _excepthook_global(tipo, valor, tb):
+        try:
+            logging.getLogger('risklab.uncaught').critical(
+                "Excepción no capturada en el hilo principal",
+                exc_info=(tipo, valor, tb)
+            )
+        except Exception:
+            pass
+        sys.__excepthook__(tipo, valor, tb)
+
+    sys.excepthook = _excepthook_global
+
+
+_configurar_logging_archivo_y_excepthook()
+
+
 # Limite absoluto de eventos individuales generados por evento por chunk de
 # simulacion. Antes era 10_000_000 (10M); con el chunking interno de 10 chunks
 # eso equivalia a un cap efectivo de 100M/num_simulaciones por simulacion (=10K
@@ -171,6 +225,55 @@ def _indice_actual_avisos_riesgo():
 # excede, se emite RiskLabFrequencyCapWarning y se marca el evento para que la
 # UI y el export adviertan al usuario sobre la distorsion.
 MAX_EVENTOS_POR_EVENTO_POR_CHUNK = 500_000_000
+
+# R4 crítico #1: MAX_EVENTOS_POR_EVENTO_POR_CHUNK (arriba) protege contra la
+# DISTORSIÓN ESTADÍSTICA del cap de frecuencia, pero NO contra quedarse sin
+# memoria RAM real -- medido empíricamente: ~200.000 simulaciones totales con
+# un solo evento de tasa=500/año (nada extremo) ya hacen que el proceso sea
+# matado por el sistema operativo (OOM) en una máquina con 15GB libres, muy
+# por debajo de donde MAX_EVENTOS_POR_EVENTO_POR_CHUNK empieza a activarse.
+# Este umbral (en OCURRENCIAS TOTALES estimadas = num_simulaciones x E[N] por
+# evento, sumado entre todos los eventos activos) dispara una confirmación
+# visible ANTES de arrancar el hilo, para que un typo de tasa o un
+# num_simulaciones demasiado alto no termine en un crash silencioso sin
+# ningún diálogo de error ni datos guardados.
+OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA = 15_000_000
+# Estimación empírica de bytes por ocurrencia total (a partir de las
+# mediciones de la auditoría: ~25M ocurrencias ~ 4.9GB de RSS).
+BYTES_ESTIMADOS_POR_OCURRENCIA = 200
+
+
+def _estimar_frecuencia_esperada_evento(evento):
+    """Estima E[N] (ocurrencias esperadas por año) de un evento a partir de
+    sus parámetros crudos, SIN construir el objeto de distribución completo
+    (usado solo para una estimación previa de uso de memoria, no para la
+    simulación real). Devuelve un valor conservador (1.0) si los parámetros
+    no están disponibles o son inválidos, para no subestimar el uso de
+    memoria en casos ambiguos."""
+    freq_opcion = evento.get('freq_opcion', 3)
+    try:
+        if freq_opcion == 1:  # Poisson
+            return max(0.0, float(evento.get('tasa') or 0.0))
+        elif freq_opcion == 2:  # Binomial
+            n = float(evento.get('num_eventos') or 0.0)
+            p = float(evento.get('prob_exito') or 0.0)
+            return max(0.0, n * p)
+        elif freq_opcion == 3:  # Bernoulli
+            return max(0.0, float(evento.get('prob_exito') or 0.0))
+        elif freq_opcion == 4:  # Poisson-Gamma
+            alpha = evento.get('pg_alpha')
+            beta = evento.get('pg_beta')
+            if alpha and beta:
+                return max(0.0, float(alpha) / float(beta))
+        elif freq_opcion == 5:  # Beta (probabilidad anual)
+            alpha = evento.get('beta_alpha')
+            beta = evento.get('beta_beta')
+            if alpha and beta:
+                return max(0.0, float(alpha) / (float(alpha) + float(beta)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 1.0
+
 
 # Fix bug #33: campos internos que el motor de simulación agrega a los dicts
 # de evento en tiempo de ejecución (cache de factores, flags de estado,
@@ -191,6 +294,7 @@ _CAMPOS_INTERNOS_SIMULACION = (
     '_factor_severidad_vinculos',
     '_factor_severidad_vinculos_es_unidad',
     '_factores_severidad_vector_es_unidad',
+    '_condicion_vinculo_final',
     '_cap_frecuencia_aplicado',
     '_cap_frecuencia_factor',
     '_cap_frecuencia_suma_original',
@@ -207,7 +311,18 @@ _CAMPOS_INTERNOS_SIMULACION = (
 # (descripciones SIEMPRE en español)
 # ==========================================================================
 
-EXPORT_SCHEMA_VERSION = "1.0"
+# R4 bajo #1: incrementada de "1.0" a "1.1". Desde que se fijó en "1.0"
+# se agregaron secciones/campos nuevos (ai_agent_briefing, engine_limits,
+# _meaning en scenario_impacts, activo en factores_ajuste,
+# input_events_omitidos/input_scenarios_omitidos, etc.) y al menos un
+# cambio de significado sobre un campo YA existente sin renombrarlo
+# (risk_map.importancia_score cambió de fórmula en R3 crítico #4, de
+# "ImpactoP90 x FrecuenciaModo" a "ImpactoMedio") -- un consumidor que
+# dependiera del significado viejo del mismo nombre de campo se
+# rompería en silencio. Ninguno de estos cambios había incrementado la
+# versión del schema, dejando a cualquier agente/integración sin forma
+# de detectar que el formato cambió.
+EXPORT_SCHEMA_VERSION = "1.1"
 
 _FREQ_DIST_NAMES = {
     1: "Poisson",
@@ -291,7 +406,13 @@ _AI_BRIEFING_ES = {
         "Curtosis": "Kurtosis (exceso). > 0 colas más pesadas que la Normal, < 0 más ligeras",
         "Coeficiente_Variacion": "Desviación estándar dividida por la media. Volatilidad relativa",
         "Periodo_de_retorno": "1 dividido la probabilidad anual: cada cuántos años se espera ese nivel",
-        "Importancia_score": "Producto ImpactoP90 × FrecuenciaModo. Combina severidad y frecuencia para ranking"
+        # R4 alto #3: la fórmula anterior (ImpactoP90 x FrecuenciaModo)
+        # colapsaba a 0 para eventos de baja frecuencia/alta severidad y
+        # fue reemplazada por ImpactoMedio en R3 crítico #4 -- este
+        # glosario embebido (pensado justamente para que un agente IA no
+        # necesite contexto externo) seguía describiendo la fórmula vieja,
+        # contradiciendo el propio campo "importancia_formula" del payload.
+        "Importancia_score": "Pérdida media anual esperada del evento (ImpactoMedio, consistente con el resumen ejecutivo). Ver el campo 'importancia_formula' de cada evento en risk_map para la fórmula exacta usada"
     },
     "preguntas_que_un_agente_puede_responder": [
         "¿Cuál es la pérdida esperada anual y su volatilidad?",
@@ -684,10 +805,20 @@ def obtener_parametros_lognormal(minimo, mas_probable, maximo):
         
         if result_alt.success:
             mu_alt, sigma_alt = result_alt.x
-            # Usar resultado alternativo y emitir warning
+            # R4 bajo #5: el mensaje citaba sigma_alt (el sigma del ajuste
+            # ALTERNATIVO, basado en mediana) como la razón por la que se
+            # activó este branch -- pero la condición que realmente dispara
+            # el cambio de método (más arriba, "if result.success and sigma
+            # > 1.0") evalúa el sigma del ajuste ORIGINAL (basado en moda).
+            # sigma_alt es un valor de un sistema de ecuaciones totalmente
+            # distinto y puede terminar <= 1.0 sin problema, haciendo que el
+            # mensaje se auto-contradiga (ej. "alta dispersión (σ=0.85 >
+            # 1.0)", una afirmación falsa). Se usa 'sigma' (el valor que
+            # efectivamente disparó el cambio) para que el mensaje sea
+            # siempre consistente con su propia condición.
             warnings.warn(
                 f"Distribución LogNormal ajustada usando 'más probable' como MEDIANA (no moda) "
-                f"debido a alta dispersión (σ={sigma_alt:.2f} > 1.0). "
+                f"debido a alta dispersión (σ={sigma:.2f} > 1.0). "
                 f"Esto es normal para distribuciones muy asimétricas.",
                 UserWarning
             )
@@ -716,6 +847,12 @@ def obtener_parametros_pert(minimo, mas_probable, maximo):
         raise ValueError("El valor máximo y mínimo no pueden ser iguales para la distribución PERT.")
     if not (minimo <= mas_probable <= maximo):
         raise ValueError("Los valores deben cumplir que mínimo <= más probable <= máximo.")
+    if maximo <= 0:
+        raise ValueError(
+            "El valor máximo de severidad debe ser mayor a 0. Con un rango completamente "
+            "negativo o cero, todas las pérdidas se truncarían a $0 y el evento nunca "
+            "generaría impacto real en la simulación (quedaría como un 'riesgo fantasma')."
+        )
     alpha = 1 + 4 * ((mas_probable - minimo) / (maximo - minimo))
     beta_param = 1 + 4 * ((maximo - mas_probable) / (maximo - minimo))
     return alpha, beta_param
@@ -789,6 +926,12 @@ def obtener_parametros_uniforme(minimo, maximo):
     """Configura los parámetros para la distribución Uniforme."""
     if minimo >= maximo:
         raise ValueError("El valor mínimo debe ser menor que el máximo.")
+    if maximo <= 0:
+        raise ValueError(
+            "El valor máximo de severidad debe ser mayor a 0. Con un rango completamente "
+            "negativo o cero, todas las pérdidas se truncarían a $0 y el evento nunca "
+            "generaría impacto real en la simulación (quedaría como un 'riesgo fantasma')."
+        )
     return minimo, maximo - minimo
 
 def traducir_error(mensaje_error):
@@ -1110,6 +1253,22 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
     error_relativo_max = abs(q_max_ajustado - maximo) / maximo
     peor_error = max(error_relativo_moda, error_relativo_min, error_relativo_max)
 
+    # R4 crítico #6: cuando alpha y beta quedan AMBOS muy cerca de 1 (la
+    # frontera alpha,beta>1 exigida para que la moda exista), la Beta
+    # resultante es prácticamente indistinguible de Uniforme(0,1) sin
+    # importar qué moda/mínimo/máximo se pidieron -- y la fórmula de la
+    # moda, (alpha-1)/(alpha+beta-2), se vuelve numéricamente inestable
+    # (forma 0/0), por lo que error_relativo_moda puede dar un valor
+    # engañosamente bajo por pura coincidencia numérica en ese punto, no
+    # porque el ajuste realmente reproduzca la forma pedida. Verificado
+    # empíricamente: con mínimo=0.2082, más probable=0.5505, máximo=0.6759,
+    # confianza=0.53, el optimizador converge a alpha≈1.0012, beta≈1.0010
+    # (pasando los 3 chequeos puntuales de arriba) pero el 53% de las
+    # muestras reales caen FUERA del rango [mínimo, máximo] pedido -- la
+    # distribución es, en la práctica, un sorteo uniforme sobre [0,1]
+    # completo. Se detecta esta zona degenerada explícitamente.
+    cerca_de_uniforme = (alpha - 1) < 0.05 and (beta - 1) < 0.05
+
     if peor_error > 0.98:
         raise ValueError(
             f"No se pudo ajustar una distribución Beta razonable para "
@@ -1123,19 +1282,37 @@ def obtener_parametros_beta_frecuencia(minimo, mas_probable, maximo, confianza=0
             f"reduzca la amplitud del rango mínimo-máximo."
         )
 
-    if peor_error > 0.30:
-        warnings.warn(
-            f"El ajuste de la distribución Beta no reproduce con precisión "
-            f"los valores pedidos (mínimo={minimo:.4g}, más "
-            f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
-            f"confianza={confianza:.2f}): diferencia relativa de "
-            f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
-            f"en el percentil inferior y {error_relativo_max:.0%} en el "
-            f"superior. Esto ocurre porque los 3 valores son difíciles de "
-            f"conciliar simultáneamente con una distribución Beta; "
-            f"verifique que sean coherentes entre sí.",
-            RiskLabAjusteImperfectoWarning
-        )
+    if peor_error > 0.30 or cerca_de_uniforme:
+        if cerca_de_uniforme:
+            masa_fuera_rango = (
+                stats.beta.cdf(minimo, alpha, beta)
+                + (1 - stats.beta.cdf(maximo, alpha, beta))
+            )
+            warnings.warn(
+                f"El ajuste de la distribución Beta convergió a alpha≈{alpha:.4f}, "
+                f"beta≈{beta:.4f} (prácticamente Uniforme(0,1)) para mínimo="
+                f"{minimo:.4g}, más probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+                f"confianza={confianza:.2f}. Aproximadamente {masa_fuera_rango:.0%} de "
+                f"las muestras caerán FUERA del rango [mínimo, máximo] pedido -- la "
+                f"distribución resultante NO concentra probabilidad alrededor de "
+                f"'más probable' como se esperaría. Verifique que los 3 valores sean "
+                f"coherentes entre sí (un rango muy amplio combinado con una moda "
+                f"cercana al centro dificulta el ajuste).",
+                RiskLabAjusteImperfectoWarning
+            )
+        else:
+            warnings.warn(
+                f"El ajuste de la distribución Beta no reproduce con precisión "
+                f"los valores pedidos (mínimo={minimo:.4g}, más "
+                f"probable={mas_probable:.4g}, máximo={maximo:.4g}, "
+                f"confianza={confianza:.2f}): diferencia relativa de "
+                f"{error_relativo_moda:.0%} en la moda, {error_relativo_min:.0%} "
+                f"en el percentil inferior y {error_relativo_max:.0%} en el "
+                f"superior. Esto ocurre porque los 3 valores son difíciles de "
+                f"conciliar simultáneamente con una distribución Beta; "
+                f"verifique que sean coherentes entre sí.",
+                RiskLabAjusteImperfectoWarning
+            )
 
     return alpha, beta
 
@@ -3113,6 +3290,14 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
             if tiene_excluye:
                 condicion_final = condicion_final & condicion_excluye
 
+            # R4 alto #8: cache de la máscara de elegibilidad de este evento
+            # (simulaciones donde su(s) vínculo(s) de dependencia SÍ se
+            # cumplieron), para que el escalamiento sev_freq "sistémico" más
+            # abajo pueda excluir del cálculo de referencia (media/desvío)
+            # las simulaciones donde el evento fue puesto en 0 por estructura
+            # (vínculo no activado), no por su propia variabilidad estocástica.
+            evento['_condicion_vinculo_final'] = condicion_final
+
             # Calcular factor de severidad combinado para simulaciones activas
             if tiene_factor_sev:
                 factor_severidad_vinculos = np.ones(num_simulaciones)
@@ -3199,6 +3384,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
 
         elif 'eventos_padres' in evento and evento['eventos_padres']:
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
+            evento['_condicion_vinculo_final'] = None  # R4 alto #8: idem, se fija abajo si hay padres válidos
             # Formato antiguo: usar tipo_dependencia único para todos los padres
             eventos_padres_declarados = evento.get('eventos_padres', [])
             tipo_dependencia = evento.get('tipo_dependencia', 'AND')
@@ -3233,6 +3419,9 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                     condicion_padres = ~np.any(ocurrencias_padres, axis=0)
                 else:
                     condicion_padres = np.ones(num_simulaciones, dtype=bool)
+
+                # R4 alto #8: mismo cache que en la rama 'vinculos' nueva.
+                evento['_condicion_vinculo_final'] = condicion_padres
 
                 muestras_frecuencia = np.zeros(num_simulaciones, dtype=int)
                 indices_a_simular = np.where(condicion_padres)[0]
@@ -3355,6 +3544,7 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
         else:
             # Evento sin dependencias, simular normalmente
             evento['_factor_severidad_vinculos'] = None  # Limpiar posible valor stale de simulación anterior
+            evento['_condicion_vinculo_final'] = None  # R4 alto #8: idem, sin vínculos no hay máscara que excluir
             try:
                 # ====================================================================
                 # Generar muestras con factores estocásticos si aplica
@@ -3621,9 +3811,31 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         # importar la frecuencia real; factor_max negativo
                         # producía severidades negativas.
                         factor_max = max(1.0, float(evento.get('sev_freq_sistemico_factor_max', 3.0)))
-                        freq_mean = final_event_frequencies.mean()
-                        freq_std = final_event_frequencies.std()
-                        
+                        # R4 alto #8: si el evento depende de vínculos, las
+                        # simulaciones donde el vínculo NO se activó quedan en
+                        # frecuencia 0 por estructura (no por variabilidad
+                        # propia del evento). Incluirlas en el cálculo de
+                        # media/desvío de referencia infla artificialmente el
+                        # z-score de las simulaciones donde el evento sí
+                        # ocurrió (la referencia queda sesgada hacia abajo por
+                        # ceros que nunca fueron "posibles" resultados del
+                        # evento en sí). Se usa solo el subconjunto elegible
+                        # (máscara de vínculo) como referencia cuando existe;
+                        # si el evento no tiene vínculos, la máscara es None y
+                        # el comportamiento es idéntico al de antes.
+                        _mascara_elegible = evento.get('_condicion_vinculo_final')
+                        if _mascara_elegible is not None:
+                            _frecuencias_referencia = final_event_frequencies[_mascara_elegible]
+                        else:
+                            _frecuencias_referencia = final_event_frequencies
+
+                        if _frecuencias_referencia.size > 0:
+                            freq_mean = _frecuencias_referencia.mean()
+                            freq_std = _frecuencias_referencia.std()
+                        else:
+                            freq_mean = 0.0
+                            freq_std = 0.0
+
                         if freq_std > 0.01:
                             z = (final_event_frequencies - freq_mean) / freq_std
                             if solo_aumento:
@@ -3705,7 +3917,24 @@ def generar_lda_con_secuencialidad(eventos_riesgo, num_simulaciones=10000, orden
                         nombre_evento = evento.get('nombre', evento_id)
                         _dbg(f"[DEBUG SEVERIDAD] Evento '{nombre_evento}': factor severidad estático {factor_sev_estatico:.4f} aplicado a pérdidas individuales "
                               f"(media: ${perdidas_antes_factor:,.0f} → ${perdidas_despues_factor:,.0f})")
-                
+
+                # R4 crítico #5: sev_limite_superior se re-aplicaba tras el
+                # escalamiento sev_freq (R3 medio #22, arriba) pero NO tras
+                # el factor de severidad de VÍNCULOS/cascada (que puede
+                # multiplicar hasta 5x por cada vínculo AND, COMPONIÉNDOSE
+                # multiplicativamente entre vínculos -- 5^N con N vínculos,
+                # sin ningún techo) ni tras el factor de ajuste de
+                # severidad (estático/estocástico, sin techo superior vía
+                # import JSON). El cap "máximo posible por ocurrencia"
+                # prometido al usuario podía terminar violado hasta en un
+                # 24x+ observado con solo 2 vínculos. Se re-aplica el clip
+                # una última vez aquí, después de TODOS los factores
+                # multiplicativos de severidad y justo antes de que los
+                # seguros procesen la pérdida ya definitiva.
+                if sev_cap is not None and sev_cap > 0:
+                    np.minimum(total_perdidas_del_evento_concatenadas, sev_cap,
+                               out=total_perdidas_del_evento_concatenadas)
+
                 # =====================================================
                 # APLICAR SEGUROS POR OCURRENCIA a pérdidas mitigadas
                 # DESPUÉS de aplicar factor de severidad
@@ -4992,6 +5221,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.aplicar_estilo_inputs_modernos()
 
     def nueva_simulacion(self):
+        # R4 alto #4: set_interfaz_activa (guard de re-entrancy, fix #22)
+        # solo deshabilita las pestañas y widgets de Simulación/Escenarios,
+        # pero el menú "Archivo" nunca se deshabilita -- "Nueva Simulación"
+        # podía limpiar self.eventos_riesgo/self.scenarios in-place
+        # mientras una simulación seguía corriendo en background sobre una
+        # copia ya tomada, dejando la UI y los resultados mostrados
+        # desincronizados del modelo real sin ningún aviso.
+        hilo_actual = getattr(self, 'simulation_thread', None)
+        if hilo_actual is not None and hilo_actual.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación en curso",
+                "Hay una simulación en ejecución. Espere a que finalice antes "
+                "de iniciar una nueva simulación."
+            )
+            return
         respuesta = QtWidgets.QMessageBox.question(
             self,
             "Nueva Simulación",
@@ -5105,81 +5349,6 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Mostrar el diálogo
         about_dialog.exec_()
         
-    def verificar_graficos_interactivos(self):
-        """
-        Verifica que todos los gráficos en la aplicación estén utilizando
-        InteractiveFigureCanvas en lugar de FigureCanvas estándar.
-        """
-        try:
-            # Importar el validador de gráficos
-            import chart_validator
-            
-            # Mostrar diálogo de información inicial
-            QtWidgets.QMessageBox.information(
-                self,
-                "Verificación de Gráficos Interactivos",
-                "A continuación se realizará una verificación de todos los gráficos\n"
-                "para asegurar que utilizan la versión interactiva con tooltips.\n\n"
-                "Los resultados se mostrarán en un informe detallado."
-            )
-            
-            # Crear y mostrar un diálogo de progreso
-            progress_dialog = QtWidgets.QProgressDialog(
-                "Verificando gráficos interactivos...", 
-                None, 0, 0, self
-            )
-            progress_dialog.setWindowTitle("Verificando Gráficos")
-            progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
-            progress_dialog.show()
-            QtWidgets.QApplication.processEvents()
-            
-            # Ejecutar la validación
-            validator = chart_validator.ChartValidator()
-            
-            # Validar widgets en esta aplicación
-            for widget in self.findChildren(QtWidgets.QWidget):
-                validator.validate_widget(widget)
-                QtWidgets.QApplication.processEvents()  # Mantener la UI responsiva
-                
-            # Cerrar diálogo de progreso
-            progress_dialog.close()
-            
-            # Generar texto de resultados
-            if validator.static_canvases == 0:
-                mensaje_principal = "✅ ÉXITO: ¡Todos los gráficos utilizan InteractiveFigureCanvas!"
-                titulo = "Verificación Exitosa"
-                icono = QtWidgets.QMessageBox.Information
-            else:
-                mensaje_principal = f"⚠️ ATENCIÓN: Se encontraron {validator.static_canvases} gráficos que aún usan FigureCanvas estándar"
-                titulo = "Verificación con Advertencias"
-                icono = QtWidgets.QMessageBox.Warning
-            
-            # Crear mensaje detallado
-            mensaje_detallado = f"""
-            Resultados de la verificación:
-            ----------------------------------------
-            Total de canvas encontrados: {validator.total_canvases}
-            Canvas interactivos: {validator.interactive_canvases}
-            Canvas estáticos: {validator.static_canvases}
-            """
-            
-            # Mostrar resultados en un diálogo
-            result_dialog = QtWidgets.QMessageBox(self)
-            result_dialog.setWindowTitle(titulo)
-            result_dialog.setText(mensaje_principal)
-            result_dialog.setDetailedText(mensaje_detallado)
-            result_dialog.setIcon(icono)
-            result_dialog.setStandardButtons(QtWidgets.QMessageBox.Ok)
-            result_dialog.exec_()
-            
-        except Exception as e:
-            # Manejar errores durante la validación
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Error en Verificación",
-                f"Ocurrió un error durante la verificación de gráficos:\n{str(e)}"
-            )
-
     def aplicar_estilo_boton_primario(self, button):
         """Aplica estilo de botón primario (acciones principales) con paleta MercadoLibre.
         
@@ -9877,7 +10046,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             umbral_sev_spinbox.setValue(0)
             umbral_sev_spinbox.setSingleStep(1000)
             umbral_sev_spinbox.setPrefix("$")
-            umbral_sev_spinbox.setToolTip("El vínculo solo se evalúa si la pérdida NETA del padre (post-controles y seguros) supera este monto. $0 = siempre evaluar.")
+            # R4 medio #10: la R3 alto #8 cambió el motor para evaluar este
+            # umbral contra la pérdida BRUTA del padre (perdidas_brutas_por_evento,
+            # antes de aplicar seguros), justamente para que un incidente
+            # realmente grave no dejara de disparar la cascada solo porque un
+            # seguro redujo el monto neto por debajo del umbral -- pero este
+            # tooltip nunca se actualizó y seguía describiendo la semántica
+            # vieja (NETA/post-seguros), contradiciendo el comportamiento real.
+            umbral_sev_spinbox.setToolTip("El vínculo solo se evalúa si la pérdida BRUTA del padre (antes de aplicar seguros) supera este monto. $0 = siempre evaluar.")
             sel_layout.addWidget(umbral_sev_spinbox)
 
             # Botones de aceptar/cancelar
@@ -10001,7 +10177,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 umbral_spin.setPrefix("$")
                 umbral_spin.setFixedHeight(30)
                 umbral_spin.setStyleSheet("QSpinBox { padding: 1px; margin: 0px; border: 1px solid #aaa; }")
-                umbral_spin.setToolTip("Pérdida NETA mínima del padre (post-controles y seguros) para activar este vínculo. $0 = siempre evaluar.")
+                # R4 medio #10: ver comentario equivalente más arriba, junto
+                # al otro spinbox de umbral (diálogo "Agregar Vínculo").
+                umbral_spin.setToolTip("Pérdida BRUTA mínima del padre (antes de aplicar seguros) para activar este vínculo. $0 = siempre evaluar.")
                 umbral_spin.valueChanged.connect(lambda val, row=idx: actualizar_umbral_severidad_vinculo(row, val))
                 vinculos_table.setCellWidget(idx, 4, umbral_spin)
 
@@ -10513,7 +10691,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             seguro_help = QtWidgets.QLabel(
                 "💡 <b>Por ocurrencia:</b> Deducible/límite se aplica a cada siniestro.<br>"
-                "<b>Agregado:</b> Deducible/límite se aplica al total anual.<br>"
+                "<b>Agregado:</b> Deducible/límite se aplica al total anual DE ESTE EVENTO "
+                "(si la misma póliza cubre otros eventos, se calcula de forma independiente para cada uno).<br>"
                 "Ej: 3 siniestros de $30K c/u, Ded $25K por ocurrencia → Paga 3×$5K"
             )
             seguro_help.setWordWrap(True)
@@ -11039,7 +11218,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
             
             seguro_help_edit = QtWidgets.QLabel(
                 "💡 <b>Por ocurrencia:</b> Deducible/límite se aplica a cada siniestro.<br>"
-                "<b>Agregado:</b> Deducible/límite se aplica al total anual.<br>"
+                "<b>Agregado:</b> Deducible/límite se aplica al total anual DE ESTE EVENTO "
+                "(si la misma póliza cubre otros eventos, se calcula de forma independiente para cada uno).<br>"
                 "Ej: 3 siniestros de $30K c/u, Ded $25K por ocurrencia → Paga 3×$5K"
             )
             seguro_help_edit.setWordWrap(True)
@@ -11344,12 +11524,38 @@ class RiskLabApp(QtWidgets.QMainWindow):
                      vinculos_existentes, factores_ajuste_existentes=None,
                      sev_freq_config=None,
                      sev_limite_var=None, freq_limite_var=None):
+        # R4 medio #4: un doble-click (o Enter + click casi simultáneos)
+        # sobre el botón Guardar puede disparar la señal 'accepted' del
+        # QDialogButtonBox dos veces antes de que el diálogo termine de
+        # cerrarse, ejecutando guardar_evento() dos veces en secuencia. La
+        # primera invocación agrega el evento exitosamente; como 'new'
+        # sigue siendo True, la segunda invocación lo agrega OTRA VEZ,
+        # duplicando el evento. Se guarda un flag en el propio objeto
+        # 'dialog' (persiste entre ambas invocaciones, ya que es el mismo
+        # objeto) para que solo la primera llamada exitosa tenga efecto.
+        if getattr(dialog, '_risklab_guardado_ok', False):
+            return
         try:
             nombre_evento = nombre_var.text().strip()
             if not nombre_evento:
                 raise ValueError("El nombre del evento no puede estar vacío.")
             if len(nombre_evento) > 50:
                 raise ValueError("El nombre del evento no puede tener más de 50 caracteres.")
+
+            # R4 medio #8: sin esta validación, dos eventos podían tener el
+            # mismo nombre. Muchos reportes/gráficos (tornado, contribución,
+            # resumen ejecutivo del export IA, etc.) identifican eventos por
+            # NOMBRE al mostrarlos a un usuario o a un agente IA -- con dos
+            # eventos "Fraude" distintos, un lector no puede saber cuál de
+            # los dos contribuyó qué, aunque el motor los distinga
+            # correctamente por 'id' internamente. Mismo patrón ya usado
+            # para nombres de escenario (R3 medio #25, ver guardar_scenario).
+            for i, ev in enumerate(self.eventos_riesgo):
+                if (new or i != row) and ev.get('nombre') == nombre_evento:
+                    raise ValueError(
+                        f"Ya existe un evento llamado '{nombre_evento}'. "
+                        f"Elija un nombre único."
+                    )
 
             # Severidad
             # --- NUEVA LÓGICA PARA SEVERIDAD ---
@@ -11506,7 +11712,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
             elif freq_opcion == 2: # Binomial
                 if not num_eventos_var.text(): raise ValueError("El número de eventos posibles (n) no puede estar vacío.")
                 if not prob_exito_var.text(): raise ValueError("La probabilidad de éxito (p) no puede estar vacía.")
-                num_eventos = int(float(num_eventos_var.text()))
+                # R4 medio #3: int(float(...)) (en vez de int(...) crudo) maneja
+                # bien texto como "5.0", pero también TRUNCABA en silencio
+                # cualquier valor genuinamente fraccionario (ej. "10.7" -> 10)
+                # sin avisar al usuario -- "n" es un conteo de ensayos y debe
+                # ser un entero exacto, no un valor redondeado sin aviso.
+                num_eventos_float = float(num_eventos_var.text())
+                if abs(num_eventos_float - round(num_eventos_float)) > 1e-9:
+                    raise ValueError(
+                        f"El número de eventos posibles (n) debe ser un número entero "
+                        f"(se ingresó {num_eventos_var.text()})."
+                    )
+                num_eventos = int(round(num_eventos_float))
                 prob_exito = float(prob_exito_var.text())
                 if num_eventos <= 0: raise ValueError("El número de eventos posibles (n) debe ser mayor que cero.")
                 if not 0 <= prob_exito <= 1: raise ValueError("La probabilidad de éxito (p) debe estar entre 0 y 1.")
@@ -11712,6 +11929,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 
                 # Evento actualizado exitosamente
 
+            dialog._risklab_guardado_ok = True
             dialog.accept()
 
         except ValueError as ve:
@@ -11800,6 +12018,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             evento_original = self.eventos_riesgo[row]
             eventos_a_duplicar.append(evento_original)
 
+        # R4 medio #8: sin esta validación, duplicar el mismo evento dos
+        # veces (o duplicar un evento que ya se llamaba "X (Copia)") producía
+        # dos eventos con el nombre IDÉNTICO -- mismo problema ya corregido
+        # para escenarios en duplicar_scenario (R4 alto #6). Se rastrean los
+        # nombres ya usados (incluyendo los que se van agregando en este
+        # mismo lote) para garantizar unicidad.
+        nombres_existentes = {ev.get('nombre') for ev in self.eventos_riesgo}
+
         # Primero asignamos nuevos IDs
         for evento_original in eventos_a_duplicar:
             evento_nuevo = copy.deepcopy(evento_original)
@@ -11807,7 +12033,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
             id_original_a_nuevo[evento_original['id']] = nuevo_id
             evento_nuevo['id'] = nuevo_id
             # Añadir un prefijo o sufijo al nombre para indicar que es una copia
-            evento_nuevo['nombre'] = evento_nuevo['nombre'] + " (Copia)"
+            nombre_base = evento_nuevo['nombre'] + " (Copia)"
+            nombre_candidato = nombre_base
+            contador = 2
+            while nombre_candidato in nombres_existentes:
+                nombre_candidato = f"{nombre_base} {contador}"
+                contador += 1
+            evento_nuevo['nombre'] = nombre_candidato
+            nombres_existentes.add(nombre_candidato)
             nuevos_eventos.append(evento_nuevo)
 
         # Actualizar las dependencias de los eventos duplicados
@@ -12300,6 +12533,53 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     "como independiente para ese vínculo):\n\n" + detalle
                 )
 
+            # R4 crítico #4: el motor calcula el límite agregado anual (y el
+            # deducible) de una póliza de seguro POR EVENTO, de forma
+            # totalmente independiente -- no existe ningún "pool" cruzado
+            # entre eventos para una misma póliza. Si el usuario configura
+            # la MISMA póliza real (identificada por 'nombre') como factor
+            # de ajuste tipo 'seguro' en 2+ eventos distintos (patrón de
+            # modelado común: una póliza de Crimen/Ciber que cubre varias
+            # categorías de riesgo), esa póliza puede terminar pagando hasta
+            # N veces su límite nominal en la misma simulación, subestimando
+            # la pérdida neta agregada sin ningún aviso. Implementar el
+            # pooling cruzado real requeriría rediseñar el pipeline de
+            # seguros (hoy procesa cada evento de forma aislada) con alto
+            # riesgo de regresión sobre la lógica ya extensamente testeada;
+            # se opta por detectar y advertir explícitamente el patrón de
+            # riesgo en vez de un pago combinado silenciosamente incorrecto.
+            polizas_por_nombre = {}
+            for evento in eventos_activos:
+                for f in evento.get('factores_ajuste', []) or []:
+                    if not f.get('activo', True):
+                        continue
+                    if f.get('tipo_severidad') != 'seguro':
+                        continue
+                    nombre_poliza = f.get('nombre', 'Seguro')
+                    polizas_por_nombre.setdefault(nombre_poliza, set()).add(evento['nombre'])
+            polizas_compartidas = {
+                nombre: eventos_cubiertos
+                for nombre, eventos_cubiertos in polizas_por_nombre.items()
+                if len(eventos_cubiertos) > 1
+            }
+            if polizas_compartidas:
+                detalle = "\n".join(
+                    f"• '{nombre}': {', '.join(sorted(eventos_cubiertos))}"
+                    for nombre, eventos_cubiertos in polizas_compartidas.items()
+                )
+                QtWidgets.QMessageBox.warning(
+                    self, "Póliza de seguro compartida entre eventos",
+                    "La(s) siguiente(s) póliza(s) de seguro están configuradas en "
+                    "MÁS DE UN evento de riesgo:\n\n" + detalle +
+                    "\n\nEl motor calcula el límite/deducible de cada póliza de "
+                    "forma INDEPENDIENTE por evento -- si esta es la MISMA póliza "
+                    "real cubriendo varios riesgos, podría pagar hasta el límite "
+                    "completo una vez POR CADA evento, subestimando la pérdida "
+                    "neta agregada real de la cartera. Si se trata de pólizas "
+                    "distintas que casualmente comparten nombre, puede ignorar "
+                    "este aviso."
+                )
+
             # Mostrar información en status bar
             total_eventos = len(eventos)
             activos_count = len(eventos_activos)
@@ -12340,6 +12620,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     _dbg(f"[DEBUG EJECUTAR V2]   Evento '{evento_data['nombre']}': SIN factores_ajuste")
 
                 eventos_simulacion.append(evento)
+
+            # R4 crítico #1: estimar el uso de memoria ANTES de arrancar el
+            # hilo. num_simulaciones x E[N] (sumado entre eventos activos)
+            # aproxima la cantidad total de ocurrencias que el motor tendrá
+            # que generar en arrays de numpy; por encima de un umbral
+            # empírico esto agota la RAM disponible y el proceso es matado
+            # por el sistema operativo sin ningún diálogo de error ni datos
+            # guardados. Se le da al usuario la chance de cancelar antes de
+            # que eso ocurra.
+            ocurrencias_estimadas = sum(
+                _estimar_frecuencia_esperada_evento(e) for e in eventos_activos
+            ) * num_simulaciones
+            if ocurrencias_estimadas > OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA:
+                gb_estimados = (ocurrencias_estimadas * BYTES_ESTIMADOS_POR_OCURRENCIA) / (1024 ** 3)
+                respuesta = QtWidgets.QMessageBox.question(
+                    self, "Posible uso alto de memoria",
+                    f"Esta configuración generaría aproximadamente "
+                    f"{ocurrencias_estimadas:,.0f} ocurrencias totales "
+                    f"(num. simulaciones x frecuencia esperada por evento), "
+                    f"lo que podría requerir ~{gb_estimados:,.1f} GB de "
+                    f"memoria RAM y hacer que la aplicación se cierre "
+                    f"abruptamente si no hay suficiente disponible.\n\n"
+                    f"Considere reducir el número de simulaciones o revisar "
+                    f"si algún valor de tasa/frecuencia fue tipeado por "
+                    f"error.\n\n¿Desea continuar de todas formas?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No
+                )
+                if respuesta != QtWidgets.QMessageBox.Yes:
+                    self.statusBar().showMessage("Simulación cancelada por uso estimado de memoria.", 5000)
+                    return
 
             # Desactivar la interfaz mientras se ejecuta la simulación
             self.set_interfaz_activa(False)
@@ -12412,6 +12723,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
         # Continuar la barra para post-procesamiento a partir de 70-100
         self.actualizar_progreso_post(70, "Procesando resultados")
 
+        # R4 medio #1: frecuencias_totales/frecuencias_por_evento son arrays
+        # np.int32 por diseño (cuentan ocurrencias, nunca deberían ser
+        # negativas), pero si un NaN se genera en algún punto del pipeline
+        # antes del cast final a int32 (p.ej. un factor de ajuste con
+        # parámetros extremos), numpy lo convierte SILENCIOSAMENTE al
+        # asignarlo a un slot int32: no hay excepción ni warning, el valor
+        # queda como un entero centinela (INT32_MIN). Ese centinela luego
+        # corrompe min()/max()/bincount() de los gráficos de Frecuencia --
+        # incluyendo callbacks de hover interactivo que NO pasan por el
+        # try/except de más abajo -- ocultando o distorsionando el gráfico
+        # sin ningún aviso visible. Como una frecuencia nunca puede ser
+        # negativa legítimamente, se sanea acá (único punto de entrada de
+        # los resultados a la UI) clampeando a >= 0.
+        if frecuencias_totales is not None:
+            frecuencias_totales = np.maximum(frecuencias_totales, 0)
+        if frecuencias_por_evento is not None:
+            frecuencias_por_evento = [np.maximum(a, 0) for a in frecuencias_por_evento]
+
         # Guardar los resultados para uso posterior (exportación a PDF)
         self.resultados_simulacion = {
             'perdidas_totales': perdidas_totales,
@@ -12441,24 +12770,51 @@ class RiskLabApp(QtWidgets.QMainWindow):
             pass
 
 
-        # Obtener texto de resultados
-        self.actualizar_progreso_post(72, "Calculando estadísticas agregadas")
-        resultados_texto = self.generar_resultados(
-            perdidas_totales,
-            frecuencias_totales,
-            perdidas_por_evento,
-            frecuencias_por_evento,
-            eventos,
-            generar_reporte=self.generar_reporte,
-            pdf_filename=self.pdf_filename
-        )
+        # R4 crítico #2: generar_resultados/graficar_resultados corrían sin
+        # ningún try/except dentro de este slot, que Qt invoca de forma
+        # cross-thread (conexión "queued") desde SimulacionThread. Una
+        # excepción que escape de un slot conectado así no queda como un
+        # simple traceback recuperable: en PyQt5 puede terminar en un
+        # SIGABRT que mata TODO el proceso (confirmado experimentalmente:
+        # un solo NaN/Inf aislado en perdidas_totales -- posible por
+        # cualquier bug menor en un factor estocástico -- hace que
+        # np.percentile()/pandas.astype(int) o gaussian_kde lancen una
+        # excepción aquí). Se envuelve el pipeline de post-procesamiento
+        # para que un dato corrupto muestre un error legible en vez de
+        # abortar la aplicación entera y perder la sesión completa.
+        try:
+            # Obtener texto de resultados
+            self.actualizar_progreso_post(72, "Calculando estadísticas agregadas")
+            resultados_texto = self.generar_resultados(
+                perdidas_totales,
+                frecuencias_totales,
+                perdidas_por_evento,
+                frecuencias_por_evento,
+                eventos,
+                generar_reporte=self.generar_reporte,
+                pdf_filename=self.pdf_filename
+            )
 
-        # Mostrar resultados en la interfaz
-        self.mostrar_resultados_en_interfaz(resultados_texto)
+            # Mostrar resultados en la interfaz
+            self.mostrar_resultados_en_interfaz(resultados_texto)
 
-        # Graficar resultados en la pestaña de Resultados
-        self.actualizar_progreso_post(90, "Generando gráficos")
-        self.graficar_resultados(perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos)
+            # Graficar resultados en la pestaña de Resultados
+            self.actualizar_progreso_post(90, "Generando gráficos")
+            self.graficar_resultados(perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento, eventos)
+        except Exception as e:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
+            if hasattr(self, 'progress_animation_timer'):
+                self.progress_animation_timer.stop()
+            QtWidgets.QMessageBox.critical(
+                self, "Error al procesar resultados",
+                f"La simulación terminó pero ocurrió un error al procesar/graficar "
+                f"los resultados: {traducir_error(e)}\n\n"
+                f"Esto puede deberse a valores no válidos (NaN/Infinito) generados "
+                f"por algún evento o factor de ajuste. Revise la configuración de "
+                f"los eventos e intente nuevamente."
+            )
+            return
 
         # Asegurar que la sección de Excedencia exista y quede habilitada
         try:
@@ -12632,7 +12988,26 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 event.ignore()
                 return
             hilo.stop()
-            hilo.wait(10_000)
+            # R4 crítico #3: hilo.wait(10_000) puede hacer TIMEOUT (retorna
+            # False) si un chunk individual de la simulación está a mitad de
+            # una llamada al motor no interrumpible (is_running solo se
+            # revisa ENTRE chunks). Antes se ignoraba el valor de retorno y
+            # se llamaba event.accept() igual, permitiendo que la app se
+            # cierre (y el intérprete termine) mientras el QThread real
+            # sigue vivo en otro hilo del SO -- exactamente el escenario
+            # que este mismo método (fix bug #30) buscaba eliminar por
+            # completo. Ahora, si el hilo no llega a detenerse a tiempo, NO
+            # se cierra la aplicación.
+            if not hilo.wait(10_000):
+                QtWidgets.QMessageBox.warning(
+                    self, "Simulación aún en ejecución",
+                    "La simulación no terminó de detenerse a tiempo (puede "
+                    "estar procesando un bloque de cálculo extenso). Por "
+                    "seguridad, la aplicación no se cerrará todavía. "
+                    "Intente cerrar nuevamente en unos segundos."
+                )
+                event.ignore()
+                return
         event.accept()
 
     def generar_resultados(self, perdidas_totales, frecuencias_totales, perdidas_por_evento, frecuencias_por_evento,
@@ -12925,7 +13300,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         self.scenarios_table.setHorizontalHeaderLabels(["Nombre del Escenario", "Descripción"])
         self.scenarios_table.horizontalHeader().setStretchLastSection(True)
         self.scenarios_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.scenarios_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        # R4 bajo #6: eliminar_scenario() siempre estuvo escrito para borrado
+        # múltiple (confirma la cantidad seleccionada, itera sobre todas las
+        # filas seleccionadas en orden descendente), pero SingleSelection
+        # hacía ese código inalcanzable -- nunca podía haber más de una fila
+        # seleccionada a la vez. eventos_table (con el mismo patrón de
+        # eliminar_evento) ya usa MultiSelection; se alinea scenarios_table
+        # con ese mismo precedente para que la funcionalidad ya escrita
+        # funcione de verdad. duplicar_scenario()/guardar_scenario() ya
+        # manejan con gracia el caso de más de una fila seleccionada
+        # (avisan "seleccione solo un escenario"), así que esto no rompe
+        # esos flujos.
+        self.scenarios_table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         self.scenarios_table.setToolTip("Lista de escenarios disponibles. Doble clic para seleccionar.")
         self.scenarios_table.setAlternatingRowColors(False)  # Desactivar alternancia (se usará hover)
         self.scenarios_table.verticalHeader().setVisible(False)  # Ocultar cabecera vertical
@@ -14332,7 +14718,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         # guardado como float (p.ej. 5.0), el texto queda "5.0"
                         # y int("5.0") lanza ValueError, mientras que
                         # int(float("5.0")) funciona correctamente.
-                        n = int(float(n_var.text()))
+                        # R4 medio #3: pero int(float(...)) también trunca en
+                        # silencio cualquier valor genuinamente fraccionario
+                        # (ej. "10.7" -> 10) sin avisar al usuario -- ver mismo
+                        # fix en el diálogo principal (guardar_evento).
+                        n_float = float(n_var.text())
+                        if abs(n_float - round(n_float)) > 1e-9:
+                            raise ValueError(
+                                f"El número de eventos (n) debe ser un número entero "
+                                f"(se ingresó {n_var.text()})."
+                            )
+                        n = int(round(n_float))
                         p = float(p_var.text())
                         if n <= 0:
                             raise ValueError("El número de eventos (n) debe ser mayor que cero.")
@@ -14646,6 +15042,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         dialog.exec_()
 
     def guardar_scenario(self, dialog, new, row, nombre_var, descripcion_var):
+        # R4 medio #4: mismo guard que guardar_evento -- un doble-click (o
+        # Enter + click casi simultáneos) sobre el botón Guardar puede
+        # disparar 'accepted' dos veces antes de que el diálogo cierre,
+        # ejecutando guardar_scenario() dos veces en secuencia y
+        # duplicando el escenario (la segunda invocación vuelve a pasar
+        # la validación de nombre único, ya que en ese punto el primer
+        # escenario ya se agregó exitosamente... salvo que ahora SÍ
+        # colisiona con el nombre recién agregado por la primera llamada,
+        # pero eso dependía de que la validación de nombre único llegara
+        # a tiempo; este guard lo evita de forma determinística).
+        if getattr(dialog, '_risklab_guardado_ok', False):
+            return
         try:
             nombre_scenario = nombre_var.text().strip()
             descripcion_scenario = descripcion_var.text().strip()
@@ -14707,6 +15115,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 # escenario actual.
                 self.actualizar_vista_escenarios()
 
+            dialog._risklab_guardado_ok = True
             dialog.accept()
 
         except ValueError as ve:
@@ -14766,7 +15175,21 @@ class RiskLabApp(QtWidgets.QMainWindow):
         escenario_nuevo = copy.deepcopy(scenario_original)
 
         # Modificar el nombre y descripción del nuevo escenario
-        escenario_nuevo.nombre = escenario_nuevo.nombre + " (Copia)"
+        # R4 alto #6: a diferencia de guardar_scenario (que valida nombre
+        # único desde R3 medio #25), esta ruta agregaba "(Copia)" sin
+        # chequear colisiones -- duplicar dos veces el mismo escenario (o
+        # duplicar uno que ya se llamaba "X (Copia)") producía dos
+        # escenarios con el nombre idéntico, lo que hace ambigua la
+        # restauración de "escenario actual" al cargar un JSON (empareja
+        # por nombre, primer match).
+        nombre_base = escenario_nuevo.nombre + " (Copia)"
+        nombres_existentes = {sc.nombre for sc in self.scenarios}
+        nombre_candidato = nombre_base
+        contador = 2
+        while nombre_candidato in nombres_existentes:
+            nombre_candidato = f"{nombre_base} {contador}"
+            contador += 1
+        escenario_nuevo.nombre = nombre_candidato
         if escenario_nuevo.descripcion:
             escenario_nuevo.descripcion = escenario_nuevo.descripcion + " (Duplicado)"
         else:
@@ -17665,9 +18088,41 @@ class RiskLabApp(QtWidgets.QMainWindow):
         if not filepath:
             return  # Usuario canceló
 
+        # R4 medio #5: _construir_export_payload_ia + _escribir_export_json
+        # corren de forma SÍNCRONA en el hilo principal (no hay un
+        # QThread como en la simulación), así que la interfaz queda sin
+        # responder durante toda la generación -- y con arrays raw
+        # incluidos, convertir arrays numpy a listas de Python nativas
+        # (necesario para serializar a JSON) puede usar varias veces la
+        # memoria del tamaño final del archivo (numpy float64 ~8 bytes/
+        # elemento vs. objetos float de Python ~28 bytes/elemento, más la
+        # cadena JSON completa en memoria antes de escribirla a disco).
+        # Se avisa explícitamente al usuario antes de bloquear la UI con
+        # una exportación grande, dándole la oportunidad de cancelar.
+        UMBRAL_MB_AVISO_EXPORT_IA = 50.0
+        if opciones.get("incluir_raw_arrays") and opciones.get("mb_raw_estimado", 0) > UMBRAL_MB_AVISO_EXPORT_IA:
+            respuesta = QtWidgets.QMessageBox.question(
+                self, "Exportación grande",
+                f"El archivo con arrays raw incluidos pesará aproximadamente "
+                f"{opciones['mb_raw_estimado']:.0f} MB. Generarlo puede tardar "
+                f"varios segundos y la aplicación quedará SIN RESPONDER durante "
+                f"ese tiempo (la exportación no corre en segundo plano). El uso "
+                f"de memoria durante la generación también puede ser varias "
+                f"veces mayor al tamaño final del archivo.\n\n¿Desea continuar?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if respuesta != QtWidgets.QMessageBox.Yes:
+                return
+
         # 3. Construir el payload y serializar
         try:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            # Forzar que el cursor de espera se pinte ANTES de bloquear el
+            # hilo principal con el trabajo pesado de abajo; sin esto, en
+            # exportaciones grandes el cursor podía no llegar a mostrarse
+            # nunca como "ocupado" antes de que la UI se congele, haciendo
+            # parecer que la aplicación colgó sin ningún indicio visual.
+            QtWidgets.QApplication.processEvents()
             payload = self._construir_export_payload_ia(opciones)
             self._escribir_export_json(filepath, payload, comprimir=opciones.get("comprimir", False))
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -17806,7 +18261,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
             "incluir_contribucion_marginal": cb_marginal.isChecked(),
             "incluir_text_snapshot": cb_text_snapshot.isChecked(),
             "incluir_raw_arrays": cb_raw.isChecked(),
-            "comprimir": cb_gzip.isChecked()
+            "comprimir": cb_gzip.isChecked(),
+            # R4 medio #5: se reutiliza esta estimación (ya calculada arriba
+            # para el label del checkbox) en exportar_para_ia() para avisar
+            # al usuario ANTES de bloquear la UI con una exportación grande.
+            "mb_raw_estimado": mb_raw,
         }
 
     @staticmethod
@@ -18415,15 +18874,41 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             porc_ceros = float(np.mean(perdidas_totales == 0) * 100.0) if perdidas_totales.size > 0 else 0.0
 
+            # R4 medio #7: si perdidas_totales (o algún perdidas_por_evento)
+            # trae un NaN aislado (posible por cualquier bug menor en un
+            # factor estocástico, ver R4 crítico #2), media/var_99/es_99/
+            # curt/asim/top_pct/top3_pct pueden quedar en NaN SIN lanzar
+            # ninguna excepción (numpy propaga NaN silenciosamente en mean/
+            # percentile/kurtosis/skew). El try/except de este método solo
+            # atrapa errores reales, así que un NaN aquí seguía adelante y
+            # currency_format()/f-strings lo formateaban como el texto
+            # literal "nan" (ej. "$nan"), incrustado en un resumen narrativo
+            # que se supone legible para un agente IA -- a diferencia de los
+            # campos NUMÉRICOS del payload (ya saneados recursivamente por
+            # _sanear_nan_inf_recursivo), este texto ya es un string por lo
+            # que ese saneo no lo alcanza. Se sanean estos valores ANTES de
+            # construir cualquier string narrativo.
+            def _texto_moneda_seguro(valor):
+                return currency_format(valor) if np.isfinite(valor) else "N/D (dato inválido)"
+
+            if not np.isfinite(curt):
+                curt = 0.0
+            if not np.isfinite(asim):
+                asim = 0.0
+            if not np.isfinite(top_pct):
+                top_pct = 0.0
+            if not np.isfinite(top3_pct):
+                top3_pct = 0.0
+
             # Fix bug medio #20 (QA ronda 2): usar currency_format() (formato
             # "$1.234.567", consistente con el resto de la app/PDF) en vez de
             # un f-string crudo "${:,.0f}" que produce el formato inverso en
             # inglés ("$1,234,567") — mismo antipatrón ya corregido en la
             # descripción de vínculos del PDF (fix bug #38).
             findings = [
-                f"Pérdida media esperada: {currency_format(media)} anuales",
-                f"Con 99% de confianza, las pérdidas no superarán {currency_format(var_99)} (VaR 99%)",
-                f"Si se supera el VaR 99%, la pérdida esperada es {currency_format(es_99)} (Expected Shortfall)",
+                f"Pérdida media esperada: {_texto_moneda_seguro(media)} anuales",
+                f"Con 99% de confianza, las pérdidas no superarán {_texto_moneda_seguro(var_99)} (VaR 99%)",
+                f"Si se supera el VaR 99%, la pérdida esperada es {_texto_moneda_seguro(es_99)} (Expected Shortfall)",
                 f"El evento '{top_evento}' contribuye {top_pct}% al riesgo agregado medio",
                 f"{porc_ceros:.1f}% de los años no presentan pérdida alguna",
                 f"Cola: kurtosis={curt:.2f}, asimetría={asim:.2f}",
@@ -18447,8 +18932,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
             return {
                 "headline": (
-                    f"Pérdida agregada media de {currency_format(media)} con VaR 99% de "
-                    f"{currency_format(var_99)}. Cartera en zona {zona_media} (media) / "
+                    f"Pérdida agregada media de {_texto_moneda_seguro(media)} con VaR 99% de "
+                    f"{_texto_moneda_seguro(var_99)}. Cartera en zona {zona_media} (media) / "
                     f"{zona_p99} (P99)."
                 ),
                 "key_findings": findings,
@@ -18853,10 +19338,18 @@ class RiskLabApp(QtWidgets.QMainWindow):
         }
 
         # ---- Configuration ----
-        try:
-            num_sim_config = int(self.num_simulaciones_var.text())
-        except Exception:
-            num_sim_config = n_sim
+        # R4 alto #2: antes se leía self.num_simulaciones_var.text() (la
+        # pestaña "Simulación") como fuente de verdad. Pero
+        # ejecutar_simulacion_escenario() sincroniza ese campo temporalmente
+        # con el valor de la pestaña "Escenarios", lanza el hilo ASÍNCRONO,
+        # y en su `finally` restaura el valor original de "Simulación"
+        # ANTES de que el hilo termine -- para cuando el usuario exporta
+        # (con self.resultados_simulacion ya poblado), el campo ya volvió al
+        # valor de "Simulación", que puede no coincidir con el realmente
+        # usado. `n_sim` (arriba, = perdidas_totales.size) es el conteo
+        # REAL de simulaciones de esta corrida, siempre correcto sin
+        # importar desde qué pestaña se ejecutó.
+        num_sim_config = n_sim
         payload["configuration"] = {
             "num_simulaciones": num_sim_config,
             "moneda": "USD",
@@ -19382,6 +19875,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la Simulación: {e}")
 
     def cargar_configuracion(self):
+        # R4 alto #4: mismo guard que nueva_simulacion() -- "Cargar
+        # Simulación" reemplaza self.eventos_riesgo/self.scenarios
+        # COMPLETOS desde otro archivo; sin este chequeo, podía hacerse
+        # mientras una simulación seguía corriendo en background sobre el
+        # modelo anterior, desincronizando la UI de los resultados que
+        # esa simulación termine mostrando.
+        hilo_actual = getattr(self, 'simulation_thread', None)
+        if hilo_actual is not None and hilo_actual.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación en curso",
+                "Hay una simulación en ejecución. Espere a que finalice antes "
+                "de cargar una nueva configuración."
+            )
+            return
         options = QtWidgets.QFileDialog.Options()
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Cargar Simulación", "",
                                                             "JSON Files (*.json);;All Files (*)", options=options)
@@ -19399,9 +19906,98 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 with open(filepath, 'r', encoding='utf-8') as f:
                     configuracion = json.load(f)
 
+                # R4 alto #1: validar la ESTRUCTURA raíz del archivo ANTES de
+                # asumir que es un dict con listas en 'eventos_riesgo'/
+                # 'scenarios'. Un JSON sintácticamente válido pero mal
+                # formado (la raíz es un array/string, o 'eventos_riesgo' es
+                # un string/dict/null en vez de una lista) rompía el propio
+                # mecanismo de aislamiento de errores por-evento: al iterar
+                # un string carácter por carácter, `evento_data.get(...)`
+                # dentro del handler de excepción también fallaba
+                # (AttributeError), escapando hasta el catch-all genérico de
+                # más abajo, que mostraba un traceback crudo de Python al
+                # usuario.
+                if not isinstance(configuracion, dict):
+                    raise ValueError(
+                        "El archivo no tiene el formato esperado: se esperaba un "
+                        "objeto JSON (con 'eventos_riesgo', 'scenarios', etc.), "
+                        f"pero se encontró un {type(configuracion).__name__}."
+                    )
+                if 'eventos_riesgo' in configuracion and not isinstance(configuracion.get('eventos_riesgo'), (list, type(None))):
+                    raise ValueError(
+                        "El campo 'eventos_riesgo' del archivo debe ser una lista, pero "
+                        f"se encontró un {type(configuracion['eventos_riesgo']).__name__}."
+                    )
+                if 'scenarios' in configuracion and not isinstance(configuracion.get('scenarios'), (list, type(None))):
+                    raise ValueError(
+                        "El campo 'scenarios' del archivo debe ser una lista, pero "
+                        f"se encontró un {type(configuracion['scenarios']).__name__}."
+                    )
+
+                # R4 medio #2: tanto id_a_index (en el motor de simulación) como
+                # id_mapeo (más abajo, en este mismo método) resuelven eventos
+                # por su campo 'id' usando un dict. Si el archivo trae dos
+                # eventos con el MISMO id (archivo editado a mano o generado
+                # externamente), el segundo pisa silenciosamente al primero en
+                # ese dict, y cualquier vínculo que apunte a ese id termina
+                # enlazado al evento equivocado -- sin ningún aviso. Se detecta
+                # esto ANTES de procesar (en los eventos principales y en cada
+                # escenario por separado, ya que cada lista es su propio
+                # espacio de ids) para poder advertir al usuario.
+                ids_duplicados_detectados = []
+
+                def _detectar_ids_duplicados_evento(lista_eventos, contexto):
+                    conteo_por_id = {}
+                    for ev in lista_eventos:
+                        if not isinstance(ev, dict):
+                            continue
+                        eid = ev.get('id')
+                        if eid is None:
+                            continue
+                        conteo_por_id.setdefault(eid, []).append(ev.get('nombre', 'N/A'))
+                    for eid, nombres in conteo_por_id.items():
+                        if len(nombres) > 1:
+                            ids_duplicados_detectados.append(
+                                f"• {contexto}: id '{eid}' compartido por {len(nombres)} eventos "
+                                f"({', '.join(nombres)})"
+                            )
+
+                _detectar_ids_duplicados_evento(configuracion.get('eventos_riesgo') or [], "Eventos principales")
+                for _sc in (configuracion.get('scenarios') or []):
+                    if isinstance(_sc, dict):
+                        _detectar_ids_duplicados_evento(
+                            _sc.get('eventos_riesgo') or [], f"Escenario '{_sc.get('nombre', 'N/A')}'"
+                        )
+
+                # R4 medio #11: guardar_scenario() valida nombre único al
+                # crear/editar un escenario a mano (R3 medio #25), pero
+                # cargar_configuracion nunca validaba lo mismo para los
+                # escenarios que vienen de un archivo JSON importado. Si el
+                # archivo trae dos escenarios con el mismo 'nombre', la
+                # restauración de 'current_scenario_name' (que empareja por
+                # nombre, primer match -- ver más abajo) selecciona
+                # ambiguamente cualquiera de los dos, no necesariamente el
+                # que estaba realmente seleccionado cuando se guardó el
+                # archivo.
+                nombres_escenario_duplicados_detectados = []
+                _conteo_nombres_escenario = {}
+                for _sc in (configuracion.get('scenarios') or []):
+                    if not isinstance(_sc, dict):
+                        continue
+                    _nombre_sc = _sc.get('nombre')
+                    if _nombre_sc is None:
+                        continue
+                    _conteo_nombres_escenario.setdefault(_nombre_sc, 0)
+                    _conteo_nombres_escenario[_nombre_sc] += 1
+                for _nombre_sc, _cantidad in _conteo_nombres_escenario.items():
+                    if _cantidad > 1:
+                        nombres_escenario_duplicados_detectados.append(
+                            f"• El nombre de escenario '{_nombre_sc}' aparece {_cantidad} veces en el archivo"
+                        )
+
                 # === INICIO DE TRANSACCIÓN: Procesar en variables temporales ===
                 # Si hay algún error durante el procesamiento, los datos originales quedan intactos
-                
+
                 eventos_riesgo_temp = []
                 scenarios_temp = []
                 num_simulaciones_temp = configuracion.get('num_simulaciones', 10000)
@@ -19423,7 +20019,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 vinculos_huerfanos = []
 
                 # Cargar eventos de riesgo de la simulación principal a lista temporal
-                for evento_data in configuracion.get('eventos_riesgo', []):
+                # (`or []` porque .get(clave, default) solo aplica el default si la
+                # clave está AUSENTE, no si su valor es explícitamente null/None)
+                for evento_data in (configuracion.get('eventos_riesgo') or []):
                     # R3 alto #16: aislar errores de CUALQUIER punto del procesamiento de
                     # este evento (no solo generar_distribucion_severidad, ya cubierto por
                     # el try/except interno de abajo), para que un solo campo faltante o
@@ -19464,6 +20062,24 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             num_eventos = int(num_eventos)
                         if prob_exito is not None:
                             prob_exito = float(prob_exito)
+                        # R4 alto #9: escribir los valores YA CASTEADOS de vuelta
+                        # en evento_data, no solo usarlos en variables locales
+                        # para construir dist_frecuencia. Si el JSON traía estos
+                        # campos como string (ej. "tasa": "5.0"), dist_frecuencia
+                        # quedaba bien construida (con el valor casteado local),
+                        # pero evento_data['tasa'] seguía siendo un string -- y
+                        # _samplear_frecuencia_estocastica_vec (usado cuando el
+                        # evento tiene factores estocásticos activos) lee
+                        # evento['tasa']/evento['num_eventos']/evento['prob_exito']
+                        # DIRECTAMENTE del dict sin castear, para multiplicar por
+                        # el vector de factores. Esa multiplicación con un string
+                        # lanza un TypeError, capturado por el except genérico de
+                        # la simulación, que fuerza la frecuencia del evento a 0
+                        # para TODAS las simulaciones sin que sea evidente la
+                        # causa raíz (JSON con tipos de dato inconsistentes).
+                        evento_data['tasa'] = tasa
+                        evento_data['num_eventos'] = num_eventos
+                        evento_data['prob_exito'] = prob_exito
                         if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
                             vinculos = []
                             tipo = evento_data.get('tipo_dependencia', 'AND')
@@ -19546,7 +20162,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         # Agregar a lista temporal (NO modificar self.eventos_riesgo todavía)
                         eventos_riesgo_temp.append(evento_data)
                     except Exception as e:
-                        nombre_evento = evento_data.get("nombre", "N/A")
+                        # R4 alto #1: si 'eventos_riesgo' es una lista pero alguno de
+                        # sus elementos NO es un dict (ej. un string, si el archivo
+                        # está mal formado), evento_data.get(...) aquí mismo
+                        # lanzaría un AttributeError -- el propio manejador de
+                        # aislamiento de errores se rompería a sí mismo.
+                        nombre_evento = evento_data.get("nombre", "N/A") if isinstance(evento_data, dict) else "N/A"
                         error_traducido = traducir_error(e)
                         eventos_con_error.append(f"• {nombre_evento}: {error_traducido}")
                         continue
@@ -19582,7 +20203,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         evento_data['vinculos'] = vinculos_actualizados
 
                 # Cargar escenarios
-                for escenario_data in configuracion.get('scenarios', []):
+                for escenario_data in (configuracion.get('scenarios') or []):
                     # R3 alto #16: aislar errores de un escenario completo (nombre/
                     # eventos_riesgo faltante o mal tipado, o cualquier error durante
                     # el procesamiento de sus eventos) para que UN escenario roto no
@@ -19628,6 +20249,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 num_eventos = int(num_eventos)
                             if prob_exito is not None:
                                 prob_exito = float(prob_exito)
+                            # R4 alto #9: ver comentario equivalente en el loop de
+                            # eventos principales, más arriba en este mismo método.
+                            evento_data['tasa'] = tasa
+                            evento_data['num_eventos'] = num_eventos
+                            evento_data['prob_exito'] = prob_exito
                             if 'eventos_padres' in evento_data and 'vinculos' not in evento_data:
                                 vinculos = []
                                 tipo = evento_data.get('tipo_dependencia', 'AND')
@@ -19933,14 +20559,74 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         f"Configuración cargada con {cantidad_huerfanos} vínculo(s) no restaurado(s)", 5000
                     )
 
-                if not eventos_con_error and not vinculos_huerfanos:
+                # R4 medio #2: reportar ids de evento duplicados detectados en el
+                # archivo (ver comentario completo donde se detectan, más
+                # arriba). Los eventos SÍ se cargaron (cada uno recibe un id
+                # nuevo al importarse), pero cualquier vínculo que apuntara al
+                # id duplicado original pudo resolverse al evento equivocado.
+                if ids_duplicados_detectados:
+                    cantidad_dup = len(ids_duplicados_detectados)
+                    mensaje_dup = (
+                        f"El archivo contiene {cantidad_dup} id de evento duplicado(s). Esto puede "
+                        f"hacer que algún vínculo se haya enlazado al evento equivocado:\n\n"
+                    )
+                    dup_a_mostrar = ids_duplicados_detectados[:10]
+                    mensaje_dup += "\n".join(dup_a_mostrar)
+                    if cantidad_dup > 10:
+                        mensaje_dup += f"\n\n... y {cantidad_dup - 10} caso(s) adicional(es)."
+                    mensaje_dup += (
+                        "\n\nVerifique los vínculos de los eventos involucrados y la "
+                        "configuración del archivo (posiblemente editado a mano o generado externamente)."
+                    )
+                    QtWidgets.QMessageBox.warning(self, "IDs de Evento Duplicados", mensaje_dup)
+                    self.statusBar().showMessage(
+                        f"Configuración cargada con {cantidad_dup} id(s) de evento duplicado(s)", 5000
+                    )
+
+                # R4 medio #11: reportar nombres de escenario duplicados
+                # detectados en el archivo (ver comentario completo donde se
+                # detectan, más arriba). Los escenarios SÍ se cargaron; el
+                # riesgo es que la restauración de 'current_scenario_name'
+                # (empareja por nombre, primer match) seleccione el
+                # escenario equivocado.
+                if nombres_escenario_duplicados_detectados:
+                    cantidad_dup_sc = len(nombres_escenario_duplicados_detectados)
+                    mensaje_dup_sc = (
+                        f"El archivo contiene {cantidad_dup_sc} nombre(s) de escenario duplicado(s). "
+                        f"Esto puede hacer que se restaure el escenario equivocado como "
+                        f"'escenario actual':\n\n"
+                    )
+                    mensaje_dup_sc += "\n".join(nombres_escenario_duplicados_detectados[:10])
+                    if cantidad_dup_sc > 10:
+                        mensaje_dup_sc += f"\n\n... y {cantidad_dup_sc - 10} caso(s) adicional(es)."
+                    mensaje_dup_sc += (
+                        "\n\nVerifique los nombres de escenario en la configuración del archivo "
+                        "(posiblemente editado a mano o generado externamente)."
+                    )
+                    QtWidgets.QMessageBox.warning(self, "Nombres de Escenario Duplicados", mensaje_dup_sc)
+                    self.statusBar().showMessage(
+                        f"Configuración cargada con {cantidad_dup_sc} nombre(s) de escenario duplicado(s)", 5000
+                    )
+
+                if (not eventos_con_error and not vinculos_huerfanos and not ids_duplicados_detectados
+                        and not nombres_escenario_duplicados_detectados):
                     self.statusBar().showMessage("La Simulación ha sido cargada exitosamente", 5000)
                 
                 # Refrescar layout si la ventana está maximizada (fix bug de alineación)
                 self._refrescar_ventana_maximizada()
             except Exception as e:
-                error_message = traceback.format_exc()
-                QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo cargar la Simulación: {e}\n{error_message}")
+                # R4 alto #1: antes se mostraba traceback.format_exc() completo
+                # (rutas de archivo absolutas, números de línea, nombre interno
+                # de la excepción) directamente al usuario -- jerga técnica de
+                # Python inapropiada para un mensaje de error de aplicación, y
+                # una posible exposición menor de información interna. Se usa
+                # el mismo helper de traducción ya usado para errores
+                # por-evento/por-escenario en este mismo método.
+                QtWidgets.QMessageBox.critical(
+                    self, "Error",
+                    f"No se pudo cargar la Simulación: {traducir_error(e)}\n\n"
+                    f"Verifique que el archivo tenga el formato JSON esperado por Risk Lab."
+                )
 
 # Función principal
 def main():

@@ -1,5 +1,21 @@
 # ✅ VALIDACIÓN: Múltiples Factores Estocásticos por Evento
 
+> ⚠️ **NOTA DE ACTUALIZACIÓN (corrección importante).** La tesis central de
+> este análisis —que los factores se combinan **siempre** de forma
+> multiplicativa (`∏(1 - reducción_i)`)— es correcta **solo para
+> distribuciones de tasa/conteo** (Poisson, Poisson-Gamma y la nueva
+> Zero-Inflated Poisson), donde el factor escala λ multiplicativamente. Para
+> distribuciones de **probabilidad** (Bernoulli, Binomial, Beta) el ajuste
+> combinado se aplica como un **shift aditivo en escala log-odds** (logit), no
+> multiplicativo: el efecto real sobre la probabilidad depende de la
+> probabilidad base y no coincide con el "factor nominal". Existe además una
+> **limitación conocida** en la combinación de factores estáticos + estocásticos
+> sobre distribuciones de probabilidad (acumulación aditiva vs multiplicativa).
+> El análisis de independencia/conmutatividad/underflow de abajo sigue siendo
+> conceptualmente útil, pero las fórmulas y referencias de línea corresponden
+> al estado de nov-2025. Para el comportamiento vigente ver
+> `GUIA_AJUSTE_PROBABILIDADES.md` y `MANUAL_AGENTE_IA_RISK_LAB.md`.
+
 **Fecha:** 4 de noviembre de 2025  
 **Objetivo:** Validar la correcta funcionalidad matemática y lógica al aplicar múltiples factores estocásticos al mismo evento  
 

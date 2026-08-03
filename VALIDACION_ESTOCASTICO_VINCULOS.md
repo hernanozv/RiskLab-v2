@@ -1,5 +1,16 @@
 # ✅ VALIDACIÓN COMPLETA: Factores Estocásticos con Vínculos
 
+> ⚠️ **DOCUMENTO HISTÓRICO — registro de validación de nov-2025, no refleja
+> el estado actual.** El código de vínculos creció y se reorganizó: el
+> muestreo por-distribución inline se unificó en
+> `_samplear_frecuencia_estocastica_vec`, y los vínculos hoy incluyen campos
+> que este doc no describe (`probabilidad` de activación, `factor_severidad`,
+> `umbral_severidad` evaluado sobre la pérdida **bruta** del padre). Faltan
+> además Zero-Inflated Poisson y la máscara de elegibilidad de vínculo del
+> escalamiento sistémico. Las referencias a líneas (1376-1590) son obsoletas.
+> Se conserva por trazabilidad; para el comportamiento vigente de vínculos ver
+> `ESPECIFICACION_JSON_RISK_LAB.md` y `MANUAL_AGENTE_IA_RISK_LAB.md`.
+
 **Fecha:** 4 de noviembre de 2025  
 **Archivo:** `Risk_Lab_Beta.py`  
 **Líneas validadas:** 1376-1590  

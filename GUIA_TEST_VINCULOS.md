@@ -1,5 +1,15 @@
 # 🧪 Guía de Testing: Factores Estocásticos con Vínculos
 
+> ⚠️ **DOCUMENTO HISTÓRICO — plan de testing manual de nov-2025, superado.**
+> La verificación de vínculos y factores hoy vive en la suite automatizada
+> `test_*.py` del repo. Esta guía no describe los campos actuales del vínculo
+> (`probabilidad`, `factor_severidad`, `umbral_severidad` sobre pérdida
+> **bruta** del padre) ni Zero-Inflated Poisson, y sus mensajes de consola /
+> pasos de debug corresponden a una versión anterior. Se conserva como
+> referencia conceptual de casos AND/OR/EXCLUYE; para el comportamiento
+> vigente ver `MANUAL_AGENTE_IA_RISK_LAB.md` (sección Vínculos) y
+> `ESPECIFICACION_JSON_RISK_LAB.md`.
+
 ## 📋 Test 1: AND + Poisson
 
 ### Configuración:

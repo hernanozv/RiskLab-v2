@@ -1,5 +1,16 @@
 # ✅ VALIDACIÓN COMPLETA: Sistema de Factores Estocásticos
 
+> ⚠️ **DOCUMENTO HISTÓRICO — registro de validación de nov-2025, no refleja
+> el estado actual.** El sistema de factores estocásticos ya se estabilizó y
+> evolucionó desde entonces: la matriz "5/5 distribuciones" quedó incompleta
+> (hoy hay **6** distribuciones de frecuencia, se agregó Zero-Inflated
+> Poisson), el muestreo por-distribución que este doc transcribe inline se
+> unificó en el helper `_samplear_frecuencia_estocastica_vec`, y la estructura
+> del factor sumó campos (reducción de severidad, seguros como factor, etc.).
+> Las referencias a números de línea son obsoletas. Se conserva por
+> trazabilidad; para el comportamiento vigente ver `ESPECIFICACION_JSON_RISK_LAB.md`,
+> `MANUAL_AGENTE_IA_RISK_LAB.md` y `GUIA_AJUSTE_PROBABILIDADES.md`.
+
 **Fecha:** 4 de noviembre de 2025  
 **Archivo:** `Risk_Lab_Beta.py`  
 **Alcance:** Flujo completo desde input hasta resultados  

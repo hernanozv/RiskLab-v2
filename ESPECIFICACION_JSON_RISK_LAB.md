@@ -72,6 +72,7 @@ Este documento describe en detalle la estructura del archivo JSON que utiliza Ri
 - **Beta frecuencia (freq_opcion=5)**: siempre incluir `beta_alpha` y `beta_beta` (ambos > 0). Además `beta_minimo/beta_mas_probable/beta_maximo/beta_confianza` numéricos (nunca null).
 - **Poisson-Gamma (freq_opcion=4)**: siempre incluir `pg_alpha` (> 1) y `pg_beta` (> 0). **NUNCA dejarlos en null** — calcularlos con la fórmula PERT si el usuario da min/mode/max.
 - **Poisson (freq_opcion=1)**: `tasa` debe ser > 0, **nunca null ni 0**.
+- **Zero-Inflated Poisson (freq_opcion=6)**: siempre incluir `zip_pi` (∈ [0,1)) y `zip_lambda` (> 0), ambos numéricos (**nunca null**). `tasa/num_eventos/prob_exito` = null. La media resultante es `(1 - zip_pi) · zip_lambda`.
 - **Severidad directa**: si `sev_input_method: "direct"`, `sev_params_direct` NUNCA puede ser `{}` vacío. Debe tener parámetros válidos (`std`/`sigma`/`s`/`scale` > 0).
 - **PERT/Uniforme**: `sev_minimo < sev_mas_probable < sev_maximo`, todos > 0, nunca null ni 0.
 
@@ -104,6 +105,7 @@ Cada objeto de evento debe incluir **todas** estas claves (aunque muchas sean `n
   - `freq_opcion`, `freq_limite_superior`, `tasa`, `num_eventos`, `prob_exito`
   - `pg_minimo`, `pg_mas_probable`, `pg_maximo`, `pg_confianza`, `pg_alpha`, `pg_beta`
   - `beta_minimo`, `beta_mas_probable`, `beta_maximo`, `beta_confianza`, `beta_alpha`, `beta_beta`
+  - `zip_pi`, `zip_lambda` (Zero-Inflated Poisson, `freq_opcion=6`)
 - Escalamiento de severidad por frecuencia:
   - `sev_freq_activado`, `sev_freq_modelo`, `sev_freq_tipo_escalamiento`
   - `sev_freq_paso`, `sev_freq_base`, `sev_freq_factor_max`
@@ -156,6 +158,7 @@ Risk Lab maneja errores de forma **asimétrica** durante la importación:
 |---------------|----------------|--------------|
 | **Severidad inválida** (parámetros incorrectos) | El evento se **omite** y se muestra advertencia, tanto en eventos principales como en eventos dentro de escenarios (mismo comportamiento en ambos casos) | Los demás eventos se importan correctamente |
 | **Frecuencia inválida** (parámetros faltantes o fuera de rango) | **CRASH TOTAL** de la importación | No se importa ningún evento |
+| **Zero-Inflated Poisson inválida** (`freq_opcion=6` con `zip_pi`/`zip_lambda` faltantes, `null` o fuera de rango: `zip_pi` ∉ [0,1) o `zip_lambda` ≤ 0) | El evento se **omite** y se muestra advertencia (`ValueError` capturado por-evento), tanto en principales como dentro de escenarios | Los demás eventos se importan correctamente |
 | **Campo obligatorio faltante** (`id`, `nombre`, `sev_opcion`, `freq_opcion`) | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **`sev_minimo`/`sev_mas_probable`/`sev_maximo` faltantes** | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **JSON sintácticamente inválido** | **CRASH TOTAL** | Error de parseo |
@@ -189,6 +192,8 @@ Esta tabla muestra **exactamente** qué sucede si cada campo falta o es inválid
 | `beta_minimo/mas_probable/maximo/confianza` | OK (pero **CRASH** si `freq_opcion=5` y son `null`) | `null` |
 | `beta_alpha` | OK (pero **CRASH** si `freq_opcion=5` y es `null` o ≤ 0) | `null` |
 | `beta_beta` | OK (pero **CRASH** si `freq_opcion=5` y es `null` o ≤ 0) | `null` |
+| `zip_pi` | OK (pero el evento se **omite** con aviso si `freq_opcion=6` y es `null` o ∉ [0,1) — NO crash total) | `null` |
+| `zip_lambda` | OK (pero el evento se **omite** con aviso si `freq_opcion=6` y es `null` o ≤ 0 — NO crash total) | `null` |
 | `sev_freq_activado` | OK | `false` |
 | `sev_freq_modelo` | OK | `"reincidencia"` |
 | `sev_freq_tipo_escalamiento` | OK | `"lineal"` |
@@ -211,6 +216,8 @@ Esta tabla muestra **exactamente** qué sucede si cada campo falta o es inválid
 **Nota Beta**: Cuando `freq_opcion=5`, `beta_alpha` y `beta_beta` deben ser numéricos (> 0) o la frecuencia fallará (CRASH TOTAL). Ver sección Beta Frecuencia.
 
 **Nota Poisson**: Cuando `freq_opcion=1`, `tasa` debe ser numérico y > 0 — **NUNCA `null` ni 0**. Si no se tiene dato, usar un fallback documentado (ej: 0.01) y marcar como estimado.
+
+**Nota Zero-Inflated Poisson**: Cuando `freq_opcion=6`, `zip_pi` (∈ [0,1)) y `zip_lambda` (> 0) deben ser numéricos — **NUNCA `null`**. `tasa/num_eventos/prob_exito` = null. A diferencia de Poisson/Binomial/Beta/PG, si estos parámetros faltan o están fuera de rango el evento se **omite** con aviso (no hay CRASH TOTAL). Ver sección Zero-Inflated Poisson.
 
 ---
 
@@ -249,6 +256,8 @@ Cada evento de riesgo tiene la siguiente estructura:
     "beta_confianza": null,
     "beta_alpha": null,
     "beta_beta": null,
+    "zip_pi": null,
+    "zip_lambda": null,
     
     "sev_freq_activado": false,
     "sev_freq_modelo": "reincidencia",
@@ -2243,6 +2252,125 @@ Estas reglas evitan errores al exportar/importar y problemas de parseo/visualiza
     "current_scenario_name": null
 }
 ```
+
+### Plantilla C: Burr XII + Poisson (severidad de cola pesada, parámetros directos)
+
+```json
+{
+    "num_simulaciones": 10000,
+    "eventos_riesgo": [
+        {
+            "id": "GENERAR-UUID-AQUI",
+            "nombre": "Nombre del Evento",
+            "activo": true,
+            "sev_opcion": 6,
+            "sev_input_method": "direct",
+            "sev_minimo": null,
+            "sev_mas_probable": null,
+            "sev_maximo": null,
+            "sev_params_direct": {
+                "c": 2.0,
+                "d": 1.5,
+                "scale": 1000000,
+                "loc": 0
+            },
+            "sev_limite_superior": null,
+            "freq_opcion": 1,
+            "freq_limite_superior": null,
+            "tasa": 1.5,
+            "num_eventos": null,
+            "prob_exito": null,
+            "pg_minimo": null,
+            "pg_mas_probable": null,
+            "pg_maximo": null,
+            "pg_confianza": null,
+            "pg_alpha": null,
+            "pg_beta": null,
+            "beta_minimo": null,
+            "beta_mas_probable": null,
+            "beta_maximo": null,
+            "beta_confianza": null,
+            "beta_alpha": null,
+            "beta_beta": null,
+            "zip_pi": null,
+            "zip_lambda": null,
+            "sev_freq_activado": false,
+            "sev_freq_modelo": "reincidencia",
+            "sev_freq_tipo_escalamiento": "lineal",
+            "sev_freq_paso": 0.5,
+            "sev_freq_base": 1.5,
+            "sev_freq_factor_max": 5.0,
+            "sev_freq_tabla": [],
+            "sev_freq_alpha": 0.5,
+            "sev_freq_solo_aumento": true,
+            "sev_freq_sistemico_factor_max": 3.0,
+            "vinculos": [],
+            "factores_ajuste": []
+        }
+    ],
+    "scenarios": [],
+    "current_scenario_name": null
+}
+```
+
+> Para **Weibull** usar `"sev_opcion": 7` con `sev_params_direct` = `{"c", "scale", "loc"}`; para **Log-t** usar `"sev_opcion": 8` con `sev_params_direct` = `{"df", "mu", "sigma", "loc"}`. En ambos casos `sev_input_method` DEBE ser `"direct"` y min/mode/max = `null`.
+
+### Plantilla D: PERT + Zero-Inflated Poisson (frecuencia rara pero agrupada)
+
+```json
+{
+    "num_simulaciones": 10000,
+    "eventos_riesgo": [
+        {
+            "id": "GENERAR-UUID-AQUI",
+            "nombre": "Sanción Regulatoria",
+            "activo": true,
+            "sev_opcion": 3,
+            "sev_input_method": "min_mode_max",
+            "sev_minimo": 100000,
+            "sev_mas_probable": 500000,
+            "sev_maximo": 2000000,
+            "sev_params_direct": {},
+            "sev_limite_superior": null,
+            "freq_opcion": 6,
+            "freq_limite_superior": null,
+            "tasa": null,
+            "num_eventos": null,
+            "prob_exito": null,
+            "pg_minimo": null,
+            "pg_mas_probable": null,
+            "pg_maximo": null,
+            "pg_confianza": null,
+            "pg_alpha": null,
+            "pg_beta": null,
+            "beta_minimo": null,
+            "beta_mas_probable": null,
+            "beta_maximo": null,
+            "beta_confianza": null,
+            "beta_alpha": null,
+            "beta_beta": null,
+            "zip_pi": 0.7,
+            "zip_lambda": 3.0,
+            "sev_freq_activado": false,
+            "sev_freq_modelo": "reincidencia",
+            "sev_freq_tipo_escalamiento": "lineal",
+            "sev_freq_paso": 0.5,
+            "sev_freq_base": 1.5,
+            "sev_freq_factor_max": 5.0,
+            "sev_freq_tabla": [],
+            "sev_freq_alpha": 0.5,
+            "sev_freq_solo_aumento": true,
+            "sev_freq_sistemico_factor_max": 3.0,
+            "vinculos": [],
+            "factores_ajuste": []
+        }
+    ],
+    "scenarios": [],
+    "current_scenario_name": null
+}
+```
+
+En esta plantilla, con probabilidad `zip_pi = 0.7` el año no tiene ninguna sanción; en caso contrario el número de sanciones sigue una Poisson(`zip_lambda = 3.0`). Media anual = `(1 - 0.7) · 3.0 = 0.9` sanciones/año.
 
 ---
 

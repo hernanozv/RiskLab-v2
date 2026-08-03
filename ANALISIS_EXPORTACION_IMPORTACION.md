@@ -1,5 +1,16 @@
 # 🔍 ANÁLISIS: Exportación/Importación de Factores Estocásticos
 
+> ⚠️ **DOCUMENTO HISTÓRICO — el bug descrito YA FUE RESUELTO.** Esta nota
+> (nov-2025) reportaba un problema de serialización de factores estocásticos
+> al guardar tras simular. El fix ya está implementado y ampliado en el
+> código actual mediante la lista centralizada `_CAMPOS_INTERNOS_SIMULACION`,
+> que limpia todos los campos internos (`_usa_estocastico`, `_factores_vector`,
+> `_seguros_aplicables`, `_cap_frecuencia_*`, etc.) antes de guardar, tanto en
+> eventos principales como en escenarios. **Guardar tras simular ya no
+> produce el `TypeError` descrito.** Las referencias a números de línea son
+> obsoletas. Se conserva por trazabilidad; para el comportamiento vigente ver
+> `ESPECIFICACION_JSON_RISK_LAB.md`.
+
 **Fecha:** 4 de noviembre de 2025  
 **Objetivo:** Verificar que factores estocásticos se guarden y carguen correctamente  
 

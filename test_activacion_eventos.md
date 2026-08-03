@@ -1,5 +1,15 @@
 # Plan de Verificación: Activación/Desactivación de Eventos
 
+> ⚠️ **DOCUMENTO HISTÓRICO — plan de verificación manual, parcialmente
+> superado.** La "solución" que describe (usar `copy.deepcopy()` de la lista
+> de eventos activos) **fue reemplazada**: el código actual usa una copia
+> superficial deliberada (`[{**e} for e in ...]`) por costo, el filtrado opera
+> sobre el formato `vinculos`/`id_padre` (no `eventos_padres`), y el aviso de
+> vínculos ignorados se muestra por `QMessageBox` (no solo `print()`). Las
+> referencias a números de línea son obsoletas. Los casos de prueba 1-5 siguen
+> siendo conceptualmente válidos; la verificación automatizada vive hoy en la
+> suite `test_*.py`. Se conserva por trazabilidad.
+
 ## ✅ CORRECCIONES IMPLEMENTADAS
 
 ### 1. **Problema de Modificación de Datos Originales** 

@@ -72,6 +72,7 @@ Este documento describe en detalle la estructura del archivo JSON que utiliza Ri
 - **Beta frecuencia (freq_opcion=5)**: siempre incluir `beta_alpha` y `beta_beta` (ambos > 0). Además `beta_minimo/beta_mas_probable/beta_maximo/beta_confianza` numéricos (nunca null).
 - **Poisson-Gamma (freq_opcion=4)**: siempre incluir `pg_alpha` (> 1) y `pg_beta` (> 0). **NUNCA dejarlos en null** — calcularlos con la fórmula PERT si el usuario da min/mode/max.
 - **Poisson (freq_opcion=1)**: `tasa` debe ser > 0, **nunca null ni 0**.
+- **Zero-Inflated Poisson (freq_opcion=6)**: siempre incluir `zip_pi` (∈ [0,1)) y `zip_lambda` (> 0), ambos numéricos (**nunca null**). `tasa/num_eventos/prob_exito` = null. La media resultante es `(1 - zip_pi) · zip_lambda`.
 - **Severidad directa**: si `sev_input_method: "direct"`, `sev_params_direct` NUNCA puede ser `{}` vacío. Debe tener parámetros válidos (`std`/`sigma`/`s`/`scale` > 0).
 - **PERT/Uniforme**: `sev_minimo < sev_mas_probable < sev_maximo`, todos > 0, nunca null ni 0.
 
@@ -104,6 +105,7 @@ Cada objeto de evento debe incluir **todas** estas claves (aunque muchas sean `n
   - `freq_opcion`, `freq_limite_superior`, `tasa`, `num_eventos`, `prob_exito`
   - `pg_minimo`, `pg_mas_probable`, `pg_maximo`, `pg_confianza`, `pg_alpha`, `pg_beta`
   - `beta_minimo`, `beta_mas_probable`, `beta_maximo`, `beta_confianza`, `beta_alpha`, `beta_beta`
+  - `zip_pi`, `zip_lambda` (Zero-Inflated Poisson, `freq_opcion=6`)
 - Escalamiento de severidad por frecuencia:
   - `sev_freq_activado`, `sev_freq_modelo`, `sev_freq_tipo_escalamiento`
   - `sev_freq_paso`, `sev_freq_base`, `sev_freq_factor_max`
@@ -156,6 +158,7 @@ Risk Lab maneja errores de forma **asimétrica** durante la importación:
 |---------------|----------------|--------------|
 | **Severidad inválida** (parámetros incorrectos) | El evento se **omite** y se muestra advertencia, tanto en eventos principales como en eventos dentro de escenarios (mismo comportamiento en ambos casos) | Los demás eventos se importan correctamente |
 | **Frecuencia inválida** (parámetros faltantes o fuera de rango) | **CRASH TOTAL** de la importación | No se importa ningún evento |
+| **Zero-Inflated Poisson inválida** (`freq_opcion=6` con `zip_pi`/`zip_lambda` faltantes, `null` o fuera de rango: `zip_pi` ∉ [0,1) o `zip_lambda` ≤ 0) | El evento se **omite** y se muestra advertencia (`ValueError` capturado por-evento), tanto en principales como dentro de escenarios | Los demás eventos se importan correctamente |
 | **Campo obligatorio faltante** (`id`, `nombre`, `sev_opcion`, `freq_opcion`) | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **`sev_minimo`/`sev_mas_probable`/`sev_maximo` faltantes** | **CRASH TOTAL** (`KeyError`) | No se importa ningún evento |
 | **JSON sintácticamente inválido** | **CRASH TOTAL** | Error de parseo |
@@ -189,6 +192,8 @@ Esta tabla muestra **exactamente** qué sucede si cada campo falta o es inválid
 | `beta_minimo/mas_probable/maximo/confianza` | OK (pero **CRASH** si `freq_opcion=5` y son `null`) | `null` |
 | `beta_alpha` | OK (pero **CRASH** si `freq_opcion=5` y es `null` o ≤ 0) | `null` |
 | `beta_beta` | OK (pero **CRASH** si `freq_opcion=5` y es `null` o ≤ 0) | `null` |
+| `zip_pi` | OK (pero el evento se **omite** con aviso si `freq_opcion=6` y es `null` o ∉ [0,1) — NO crash total) | `null` |
+| `zip_lambda` | OK (pero el evento se **omite** con aviso si `freq_opcion=6` y es `null` o ≤ 0 — NO crash total) | `null` |
 | `sev_freq_activado` | OK | `false` |
 | `sev_freq_modelo` | OK | `"reincidencia"` |
 | `sev_freq_tipo_escalamiento` | OK | `"lineal"` |
@@ -211,6 +216,8 @@ Esta tabla muestra **exactamente** qué sucede si cada campo falta o es inválid
 **Nota Beta**: Cuando `freq_opcion=5`, `beta_alpha` y `beta_beta` deben ser numéricos (> 0) o la frecuencia fallará (CRASH TOTAL). Ver sección Beta Frecuencia.
 
 **Nota Poisson**: Cuando `freq_opcion=1`, `tasa` debe ser numérico y > 0 — **NUNCA `null` ni 0**. Si no se tiene dato, usar un fallback documentado (ej: 0.01) y marcar como estimado.
+
+**Nota Zero-Inflated Poisson**: Cuando `freq_opcion=6`, `zip_pi` (∈ [0,1)) y `zip_lambda` (> 0) deben ser numéricos — **NUNCA `null`**. `tasa/num_eventos/prob_exito` = null. A diferencia de Poisson/Binomial/Beta/PG, si estos parámetros faltan o están fuera de rango el evento se **omite** con aviso (no hay CRASH TOTAL). Ver sección Zero-Inflated Poisson.
 
 ---
 
@@ -249,6 +256,8 @@ Cada evento de riesgo tiene la siguiente estructura:
     "beta_confianza": null,
     "beta_alpha": null,
     "beta_beta": null,
+    "zip_pi": null,
+    "zip_lambda": null,
     
     "sev_freq_activado": false,
     "sev_freq_modelo": "reincidencia",
@@ -287,6 +296,9 @@ El campo `sev_opcion` determina la distribución de severidad:
 | 3 | PERT (Beta) | Distribución PERT basada en Beta |
 | 4 | Pareto/GPD | Distribución Pareto Generalizada |
 | 5 | Uniforme | Distribución uniforme |
+| 6 | Burr XII | Cola pesada, dos parámetros de forma. **Solo parámetros directos** (`sev_input_method="direct"`), `sev_params_direct` = `{"c", "d", "scale", "loc"}`. Truncada en P99.9 |
+| 7 | Weibull | Sub-exponencial, forma k y escala λ. **Solo parámetros directos**, `sev_params_direct` = `{"c", "scale", "loc"}` |
+| 8 | Log-t | ln(severidad) ~ t de Student; cola más pesada que LogNormal. **Solo parámetros directos**, `sev_params_direct` = `{"df", "mu", "sigma", "loc"}`. Truncada en P99.9 |
 
 ### Método de Entrada (`sev_input_method`)
 
@@ -302,6 +314,7 @@ El campo `sev_opcion` determina la distribución de severidad:
   el agente **DEBE** usar `sev_input_method: "direct"`.
 - En esos casos, `sev_minimo`, `sev_mas_probable`, `sev_maximo` deben ser `null` y `sev_params_direct` debe contener los parámetros requeridos.
 - `sev_opcion = 1` (Normal) también soporta `"direct"` con parámetros `mean/std` o `mu/sigma`.
+- **`sev_opcion = 6` (Burr XII), `7` (Weibull) y `8` (Log-t) SOLO soportan `"direct"`**: `sev_input_method` DEBE ser `"direct"`, los tres campos min/mode/max = `null`, y `sev_params_direct` con los parámetros de cada una (Burr `{c,d,scale,loc}`; Weibull `{c,scale,loc}`; Log-t `{df,mu,sigma,loc}`).
 - **RESTRICCIÓN**: `sev_opcion = 3` (PERT) y `sev_opcion = 5` (Uniforme) **SOLO soportan `min_mode_max`**. Usar `"direct"` con estas distribuciones causará **CRASH TOTAL**.
 
 ---
@@ -541,6 +554,66 @@ Solo requiere mínimo y máximo:
 
 ---
 
+### 6. Burr XII (`sev_opcion: 6`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**. No usa mínimo/moda/máximo.
+
+Distribución de cola pesada con dos parámetros de forma; excelente ajuste empírico a
+pérdidas operacionales. Se trunca en el percentil 99.9 por seguridad ante colas de media
+infinita (`c·d ≤ 1`).
+
+```json
+{
+    "sev_opcion": 6,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "c": 2.0, "d": 1.5, "scale": 1000000, "loc": 0 }
+}
+```
+- `c` > 0, `d` > 0 (parámetros de forma), `scale` > 0, `loc` ≥ 0 (opcional, default 0).
+
+### 7. Weibull (`sev_opcion: 7`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**.
+
+Flexible para colas sub-exponenciales y tiempos hasta evento/falla.
+
+```json
+{
+    "sev_opcion": 7,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "c": 1.5, "scale": 500000, "loc": 0 }
+}
+```
+- `c` > 0 (forma k), `scale` > 0 (escala λ), `loc` ≥ 0 (opcional, default 0).
+
+### 8. Log-t (`sev_opcion: 8`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**.
+
+`ln(severidad)` sigue una t de Student; cola más pesada que LogNormal cuando `df` es chico.
+Se trunca en el percentil 99.9.
+
+```json
+{
+    "sev_opcion": 8,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "df": 4, "mu": 13.0, "sigma": 0.8, "loc": 0 }
+}
+```
+- `df` > 0 (grados de libertad), `mu` real (localización en escala log), `sigma` > 0
+  (escala en escala log), `loc` ≥ 0 (opcional, default 0).
+
+---
+
 ## Distribuciones de Frecuencia
 
 El campo `freq_opcion` determina la distribución de frecuencia:
@@ -552,6 +625,7 @@ El campo `freq_opcion` determina la distribución de frecuencia:
 | 3 | Bernoulli | Evento ocurre (1) o no (0) |
 | 4 | Poisson-Gamma | Poisson con tasa incierta |
 | 5 | Beta | Probabilidad anual incierta |
+| 6 | Zero-Inflated Poisson | Con prob. `zip_pi` el año no tiene eventos (cero estructural); si no, Poisson(`zip_lambda`). Para eventos raros pero agrupados (ej. sanciones regulatorias) |
 
 ---
 
@@ -788,6 +862,37 @@ Si el agente conoce directamente los parámetros alpha/beta, o prefiere evitar e
 
 ---
 
+### 6. Zero-Inflated Poisson (`freq_opcion: 6`)
+
+Modela eventos **raros pero agrupados**: con probabilidad `zip_pi` el año no tiene ningún
+evento (cero estructural); en caso contrario la cantidad de ocurrencias sigue una
+Poisson(`zip_lambda`). Ideal para riesgo regulatorio (la mayoría de los años sin sanciones,
+pero cuando ocurre una auditoría pueden aparecer varias multas a la vez) o brechas de
+ciberseguridad masivas.
+
+```json
+{
+    "freq_opcion": 6,
+    "tasa": null,
+    "num_eventos": null,
+    "prob_exito": null,
+    "zip_pi": 0.7,
+    "zip_lambda": 3.0
+}
+```
+
+**REGLAS CRÍTICAS Zero-Inflated Poisson**:
+- `zip_pi` es la probabilidad de cero estructural y debe cumplir `0 ≤ zip_pi < 1`.
+- `zip_lambda` es la tasa de la Poisson subyacente y debe ser `> 0`.
+- Ambos campos son **obligatorios** cuando `freq_opcion=6`.
+- La media resultante es `E[N] = (1 - zip_pi) · zip_lambda`.
+- Los factores de ajuste estocásticos escalan `zip_lambda` de forma multiplicativa
+  (igual que Poisson); `zip_pi` no se modifica.
+- Admite `freq_limite_superior` (tope de ocurrencias por año).
+- `tasa`, `num_eventos` y `prob_exito` deben ser `null`.
+
+---
+
 ## Límites Superiores (Caps de Frecuencia y Severidad)
 
 Risk Lab permite definir un **límite superior** tanto para la frecuencia como para la severidad de cada evento. Estos límites actúan como caps que impiden que la simulación genere valores por encima del tope especificado.
@@ -809,14 +914,14 @@ Cuando se define un límite superior, Risk Lab **no** recorta los valores al top
 
 ### Frecuencia: `freq_limite_superior`
 
-- **Solo aplica** a distribuciones que pueden generar más de 1 ocurrencia: **Poisson** (`freq_opcion=1`), **Binomial** (`freq_opcion=2`) y **Poisson-Gamma** (`freq_opcion=4`)
+- **Solo aplica** a distribuciones que pueden generar más de 1 ocurrencia: **Poisson** (`freq_opcion=1`), **Binomial** (`freq_opcion=2`), **Poisson-Gamma** (`freq_opcion=4`) y **Zero-Inflated Poisson** (`freq_opcion=6`)
 - **No aplica** a Bernoulli (`freq_opcion=3`) ni Beta (`freq_opcion=5`) porque estas distribuciones solo generan 0 o 1 ocurrencias
 - El valor debe ser un **entero positivo** o `null` (sin límite)
 - Ejemplo: `"freq_limite_superior": 10` → máximo 10 ocurrencias por año
 
 ### Severidad: `sev_limite_superior`
 
-- Aplica a **todas** las distribuciones de severidad (Normal, LogNormal, PERT, GPD, Uniforme)
+- Aplica a **todas** las distribuciones de severidad (Normal, LogNormal, PERT, GPD, Uniforme, Burr XII, Weibull, Log-t)
 - El valor debe ser un **número positivo** (en moneda) o `null` (sin límite)
 - Se aplica a cada ocurrencia individual (no al total anual)
 - Ejemplo: `"sev_limite_superior": 500000` → cada ocurrencia tiene un impacto máximo de $500K
@@ -903,7 +1008,7 @@ Los vínculos permiten que la ocurrencia de un evento dependa de otros, con prob
 | `tipo` | string | Tipo de dependencia: `"AND"`, `"OR"` o `"EXCLUYE"` |
 | `probabilidad` | integer | Probabilidad de activación del vínculo (1-100). Opcional, default: 100 |
 | `factor_severidad` | float | Multiplicador de severidad condicional (0.10-5.00). Opcional, default: 1.0 |
-| `umbral_severidad` | integer | Pérdida mínima del padre para considerar que "ocurrió" ($, ≥0). Opcional, default: 0 |
+| `umbral_severidad` | integer | Pérdida BRUTA mínima del padre (antes de seguros) para considerar que "ocurrió" ($, ≥0). Opcional, default: 0 |
 
 **Validaciones ESTRICTAS**:
 - `tipo` debe ser exactamente `"AND"`, `"OR"` o `"EXCLUYE"` (en mayúsculas)
@@ -936,7 +1041,8 @@ Los vínculos permiten que la ocurrencia de un evento dependa de otros, con prob
 
 ### Umbral de Severidad del Padre:
 - 0 = sin umbral, basta con que el padre tenga frecuencia > 0 (default, backward compatible)
-- >0 = el padre se considera "ocurrido" solo si su pérdida total en esa simulación ≥ umbral
+- >0 = el padre se considera "ocurrido" solo si su pérdida en esa simulación ≥ umbral
+- **IMPORTANTE**: el umbral se evalúa contra la pérdida **BRUTA del padre (antes de aplicar seguros)**, no contra la pérdida neta post-seguro. Un padre con póliza igual dispara el vínculo si su pérdida bruta supera el umbral, aunque el seguro reduzca lo que finalmente contabiliza.
 - Solo aplica a vínculos de tipo AND y OR (EXCLUYE no usa umbral en la UI)
 - Permite modelar dependencias condicionadas a la magnitud del impacto del padre
 
@@ -1839,19 +1945,21 @@ Los campos min/mode/max/confianza son opcionales (para documentación/UI). Lo qu
 ### Antes de generar el JSON, verificar:
 
 #### ☑️ Severidad:
-- [ ] `sev_opcion` entre 1 y 5
+- [ ] `sev_opcion` entre 1 y 8
 - [ ] Si `sev_opcion` = 3 (PERT) o 5 (Uniforme): `sev_input_method` **DEBE** ser `"min_mode_max"` (no soportan `"direct"`)
+- [ ] Si `sev_opcion` = 6 (Burr XII), 7 (Weibull) u 8 (Log-t): `sev_input_method` **DEBE** ser `"direct"` (solo admiten parámetros directos)
 - [ ] Si `sev_input_method` = "min_mode_max":
   - [ ] `sev_minimo` < `sev_mas_probable` < `sev_maximo`
   - [ ] `sev_params_direct` = `{}`
 - [ ] Si `sev_input_method` = "direct":
   - [ ] `sev_minimo` = `null`, `sev_mas_probable` = `null`, `sev_maximo` = `null`
   - [ ] `sev_params_direct` NO está vacío
-  - [ ] Parámetros > 0 donde aplica (`std`, `sigma`, `s`, `scale`)
+  - [ ] Parámetros > 0 donde aplica (`std`, `sigma`, `s`, `scale`; para Burr `c`,`d`,`scale`; Weibull `c`,`scale`; Log-t `df`,`sigma`)
+  - [ ] `loc` ≥ 0 (opcional, default 0) en Burr/Weibull/Log-t
   - [ ] NO mezclar opciones (mean/std vs mu/sigma vs s/scale)
 
 #### ☑️ Frecuencia:
-- [ ] `freq_opcion` entre 1 y 5
+- [ ] `freq_opcion` entre 1 y 6
 - [ ] Poisson (1): `tasa` > 0, resto = `null`
 - [ ] Binomial (2): `num_eventos` > 0, `0 ≤ prob_exito ≤ 1`, resto = `null`
 - [ ] Bernoulli (3): `0 ≤ prob_exito ≤ 1`, resto = `null`. Recomendación: evitar 0.0 y 1.0 exactos si hay factores estocásticos
@@ -1862,6 +1970,7 @@ Los campos min/mode/max/confianza son opcionales (para documentación/UI). Lo qu
   - [ ] Si min/mode/max: `0 ≤ min < mode < max ≤ 100` y **además** `beta_alpha`/`beta_beta` > 0
   - [ ] Si alpha/beta: ambos > 0, y `beta_minimo`/`beta_mas_probable`/`beta_maximo`/`beta_confianza` deben ser numéricos (no `null`) y coherentes
   - [ ] Valores son PORCENTAJES (0-100), no decimales (0-1)
+- [ ] Zero-Inflated Poisson (6): `zip_pi` ∈ [0, 1) (prob. de cero estructural) y `zip_lambda` > 0 (tasa Poisson), ambos numéricos (no `null`); `tasa`/`num_eventos`/`prob_exito` = `null`
 
 #### ☑️ Factores Estáticos:
 - [ ] `tipo_modelo` = "estatico"
@@ -1957,6 +2066,7 @@ nuevo_id = str(uuid.uuid4())
    - Si `sev_input_method` = "direct": min/mode/max = `null`, `sev_params_direct` CON contenido
    - Si no se proveen parámetros directos explícitos, **NO inventar** `sev_params_direct`: usar `min_mode_max`
    - Excepción obligatoria para IA: si `sev_opcion` es LogNormal (2) o Pareto/GPD (4), **usar siempre `direct`**
+   - Burr XII (6), Weibull (7) y Log-t (8) **solo existen en `direct`**: siempre `sev_input_method: "direct"` con sus parámetros en `sev_params_direct`
 3. **NUNCA dejar `sev_params_direct` vacío `{}` con método "direct"**
 4. **NUNCA usar parámetros en 0 o negativos** donde no está permitido:
    - `std`, `sigma`, `s`, `scale` SIEMPRE > 0
@@ -2142,6 +2252,125 @@ Estas reglas evitan errores al exportar/importar y problemas de parseo/visualiza
     "current_scenario_name": null
 }
 ```
+
+### Plantilla C: Burr XII + Poisson (severidad de cola pesada, parámetros directos)
+
+```json
+{
+    "num_simulaciones": 10000,
+    "eventos_riesgo": [
+        {
+            "id": "GENERAR-UUID-AQUI",
+            "nombre": "Nombre del Evento",
+            "activo": true,
+            "sev_opcion": 6,
+            "sev_input_method": "direct",
+            "sev_minimo": null,
+            "sev_mas_probable": null,
+            "sev_maximo": null,
+            "sev_params_direct": {
+                "c": 2.0,
+                "d": 1.5,
+                "scale": 1000000,
+                "loc": 0
+            },
+            "sev_limite_superior": null,
+            "freq_opcion": 1,
+            "freq_limite_superior": null,
+            "tasa": 1.5,
+            "num_eventos": null,
+            "prob_exito": null,
+            "pg_minimo": null,
+            "pg_mas_probable": null,
+            "pg_maximo": null,
+            "pg_confianza": null,
+            "pg_alpha": null,
+            "pg_beta": null,
+            "beta_minimo": null,
+            "beta_mas_probable": null,
+            "beta_maximo": null,
+            "beta_confianza": null,
+            "beta_alpha": null,
+            "beta_beta": null,
+            "zip_pi": null,
+            "zip_lambda": null,
+            "sev_freq_activado": false,
+            "sev_freq_modelo": "reincidencia",
+            "sev_freq_tipo_escalamiento": "lineal",
+            "sev_freq_paso": 0.5,
+            "sev_freq_base": 1.5,
+            "sev_freq_factor_max": 5.0,
+            "sev_freq_tabla": [],
+            "sev_freq_alpha": 0.5,
+            "sev_freq_solo_aumento": true,
+            "sev_freq_sistemico_factor_max": 3.0,
+            "vinculos": [],
+            "factores_ajuste": []
+        }
+    ],
+    "scenarios": [],
+    "current_scenario_name": null
+}
+```
+
+> Para **Weibull** usar `"sev_opcion": 7` con `sev_params_direct` = `{"c", "scale", "loc"}`; para **Log-t** usar `"sev_opcion": 8` con `sev_params_direct` = `{"df", "mu", "sigma", "loc"}`. En ambos casos `sev_input_method` DEBE ser `"direct"` y min/mode/max = `null`.
+
+### Plantilla D: PERT + Zero-Inflated Poisson (frecuencia rara pero agrupada)
+
+```json
+{
+    "num_simulaciones": 10000,
+    "eventos_riesgo": [
+        {
+            "id": "GENERAR-UUID-AQUI",
+            "nombre": "Sanción Regulatoria",
+            "activo": true,
+            "sev_opcion": 3,
+            "sev_input_method": "min_mode_max",
+            "sev_minimo": 100000,
+            "sev_mas_probable": 500000,
+            "sev_maximo": 2000000,
+            "sev_params_direct": {},
+            "sev_limite_superior": null,
+            "freq_opcion": 6,
+            "freq_limite_superior": null,
+            "tasa": null,
+            "num_eventos": null,
+            "prob_exito": null,
+            "pg_minimo": null,
+            "pg_mas_probable": null,
+            "pg_maximo": null,
+            "pg_confianza": null,
+            "pg_alpha": null,
+            "pg_beta": null,
+            "beta_minimo": null,
+            "beta_mas_probable": null,
+            "beta_maximo": null,
+            "beta_confianza": null,
+            "beta_alpha": null,
+            "beta_beta": null,
+            "zip_pi": 0.7,
+            "zip_lambda": 3.0,
+            "sev_freq_activado": false,
+            "sev_freq_modelo": "reincidencia",
+            "sev_freq_tipo_escalamiento": "lineal",
+            "sev_freq_paso": 0.5,
+            "sev_freq_base": 1.5,
+            "sev_freq_factor_max": 5.0,
+            "sev_freq_tabla": [],
+            "sev_freq_alpha": 0.5,
+            "sev_freq_solo_aumento": true,
+            "sev_freq_sistemico_factor_max": 3.0,
+            "vinculos": [],
+            "factores_ajuste": []
+        }
+    ],
+    "scenarios": [],
+    "current_scenario_name": null
+}
+```
+
+En esta plantilla, con probabilidad `zip_pi = 0.7` el año no tiene ninguna sanción; en caso contrario el número de sanciones sigue una Poisson(`zip_lambda = 3.0`). Media anual = `(1 - 0.7) · 3.0 = 0.9` sanciones/año.
 
 ---
 

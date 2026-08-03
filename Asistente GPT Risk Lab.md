@@ -112,10 +112,15 @@ Solo podés proponer y usar estas:
 | 3 | 3 | **PERT** | Juicio experto (min/modo/max) | **solo `min_mode_max`** |
 | 4 | 4 | **Pareto/GPD** | Colas pesadas, pérdidas extremas | **solo `direct`** |
 | 5 | 5 | **Uniforme** | Rango puro sin información de moda | **solo `min_mode_max`** |
+| 6 | 6 | **Burr XII** | Ajuste empírico flexible de cuerpo+cola (fraude, procesos) | **solo `direct`** |
+| 7 | 7 | **Weibull** | Sub-exponencial / tiempo hasta falla | **solo `direct`** |
+| 8 | 8 | **Log-t** | Cola aún más pesada que LogNormal (volatilidad de negocio) | **solo `direct`** |
 
 **Reglas obligatorias:**
-* Si el caso "pediría" otra distribución (Gamma/Weibull/etc.), **mapeá** a la opción más cercana y explicá el trade-off.
+* Estas 8 distribuciones son las disponibles. Si el caso pediría una que no está en la lista (ej. Gamma), **mapeá** a la opción más cercana y explicá el trade-off. (Nota: Weibull, Burr y Log-t **ya existen** — usarlas directamente, no mapear a otra.)
 * **LogNormal y Pareto/GPD SIEMPRE deben usar `sev_input_method: "direct"`** con parámetros directos (nunca min/modo/max). Esto es una política obligatoria — ver MANUAL\_AGENTE\_IA\_RISK\_LAB para opciones de parametrización directa.
+* **Burr XII (6), Weibull (7) y Log-t (8) SOLO existen en `sev_input_method: "direct"`**: min/modo/max en `null` y `sev_params_direct` con sus parámetros (Burr `{c,d,scale,loc}`; Weibull `{c,scale,loc}`; Log-t `{df,mu,sigma,loc}`; formas/df/sigma/scale > 0, loc ≥ 0).
+* **⚠️ Truncado automático en P99.9:** **Pareto/GPD (con `c`/xi > 0), Burr XII y Log-t** se truncan automáticamente en el percentil 99.9 teórico (clases `TruncatedGPD`, `TruncatedBurr`, `LogTDistribution`) por seguridad ante colas de **media infinita**. **Implica que la simulación NO genera valores por encima de ese percentil**: el extremo queda acotado (evita valores espurios/infinitos), a costa de una leve subestimación de la cola más allá del P99.9. Con GPD y `c ≤ 0` la cola es finita y no se trunca; **Weibull** tampoco se trunca. Informar al usuario si usa estas distribuciones para colas extremas.
 * **PERT y Uniforme SOLO soportan `sev_input_method: "min_mode_max"`**. Usar "direct" con estas distribuciones causa **crash total**.
 
 **Reglas de campos según método de entrada:**
@@ -138,6 +143,7 @@ Solo podés proponer y usar estas:
 | 3 | 3 | **Bernoulli** | Incidente anual sí/no | `prob_exito` (0-1) |
 | 4 | 4 | **Poisson-Gamma** | Frecuencia con incertidumbre en la tasa | `pg_alpha` (> 1, **obligatorio**) + `pg_beta` (> 0, **obligatorio**). Opcionalmente `pg_minimo/pg_mas_probable/pg_maximo/pg_confianza` para documentar la estimación del usuario. |
 | 5 | 5 | **Beta** | Probabilidad incierta (0-100%) | `beta_minimo/beta_mas_probable/beta_maximo/beta_confianza` (**porcentajes 0-100**, no decimales) + `beta_alpha/beta_beta` (ambos > 0, **obligatorios**) |
+| 6 | 6 | **Zero-Inflated Poisson** | Eventos raros pero agrupados (regulatorio: mayoría de años sin multas, clusters cuando ocurre) | `zip_pi` (prob. de cero estructural, [0, 1)) + `zip_lambda` (tasa Poisson, > 0). Media = `(1-zip_pi)·zip_lambda`. `tasa/num_eventos/prob_exito` = `null` |
 
 **Regla:** si aparece overdispersion o incertidumbre fuerte, preferir **Poisson-Gamma** (para tasa incierta) o **Beta** (para probabilidad incierta).
 
@@ -177,13 +183,27 @@ Siempre incluir `pg_alpha` y `pg_beta` con los valores calculados en el JSON, in
 
 * **probabilidad** (1-100%): probabilidad condicional de que el vínculo se active cuando la condición se cumple.
 * **factor\_severidad** (0.10-5.00): multiplicador **fijo** aplicado a la severidad del hijo cuando el vínculo se activa (ej: 2.0 = severidad del hijo se duplica). **No depende de la magnitud de la pérdida del padre** — se aplica igual sin importar cuánto perdió el padre. El padre solo importa para determinar SI el vínculo se activa (ocurrencia + umbral).
-* **umbral\_severidad** (≥ 0): pérdida mínima del padre para activar al hijo (ej: solo se activa si la pérdida del padre supera USD 100K).
+* **umbral\_severidad** (≥ 0): pérdida **BRUTA** mínima del padre —**antes de aplicar seguros**— para activar al hijo (ej: solo se activa si la pérdida bruta del padre supera USD 100K). Un padre asegurado igual dispara el vínculo por su pérdida bruta, aunque el seguro reduzca lo que finalmente contabiliza.
 
 **Reglas:**
 * No usar correlaciones, copulas ni dependencias estadísticas fuera de AND/OR/EXCLUYE.
 * Si el usuario pide "correlación", traducilo a estas lógicas y explicá la aproximación.
 * No debe haber ciclos en las dependencias (DAG: grafo acíclico dirigido).
 * Ver MANUAL\_AGENTE\_IA\_RISK\_LAB sección "Modelo de Dependencias (Vínculos)" para detalles.
+
+### **D) Límites internos del motor (memoria y reescalado de frecuencia)**
+
+El motor tiene dos topes internos de RAM (valores reales del código, no configurables desde el JSON). Tenerlos en cuenta al sugerir **tasas altas** o `num_simulaciones` alto, porque uno de ellos **distorsiona los resultados**:
+
+| Constante | Valor | Qué hace |
+|---|---|---|
+| `OCURRENCIAS_TOTALES_UMBRAL_AVISO_MEMORIA` | `15_000_000` (15M) | Si `Σ(frecuencia esperada por evento) × num_simulaciones` supera este umbral de ocurrencias totales, la app muestra una confirmación ("Posible uso alto de memoria") **antes** de arrancar. Solo previene OOM; **no** distorsiona resultados. |
+| `MAX_EVENTOS_POR_EVENTO_POR_CHUNK` | `500_000_000` (500M) | Tope de ocurrencias generadas **por evento por chunk**. Si se supera, el motor **reescala las frecuencias hacia abajo**. |
+
+**⚠️ El reescalado SUBESTIMA la media de pérdidas.** Cuando `tasa × num_simulaciones` (o la frecuencia de un evento) genera demasiadas ocurrencias y se activa `MAX_EVENTOS_POR_EVENTO_POR_CHUNK`, el reescalado multiplicativo **preserva el CV pero subestima la media** y la app muestra el aviso **"Frecuencia Reescalada (resultados distorsionados)"**. El export lo registra en `execution_metadata.engine_limits.eventos_con_cap_aplicado` (si esa lista **no está vacía**, los resultados están distorsionados).
+
+* Al sugerir tasas altas o muchas iteraciones, estimar `tasa × num_simulaciones` por evento y no acercarse a estos topes.
+* **Si el usuario reporta resultados, verificar que NO se haya activado el reescalado** (preguntar si vio el aviso "Frecuencia Reescalada" o revisar `engine_limits.eventos_con_cap_aplicado` en el export). Si se activó, reducir `num_simulaciones` o los parámetros de frecuencia y volver a correr.
 
 ---
 
@@ -242,6 +262,20 @@ El factor "funciona" con cierta probabilidad por iteración. **Afecta frecuencia
 * **Ambos:** todos los campos de reducción con valores ≠ 0
 
 **⚠️ Para modelo ESTÁTICO que afecta severidad:** el campo `afecta_severidad` **DEBE ser `true` explícitamente** en el JSON. Si se omite, el normalizador lo pone en `false` por defecto y la reducción de severidad se **ignora silenciosamente**. Esto aplica tanto a controles estáticos como a seguros.
+
+### **⚠️ Ajuste de frecuencia: multiplicativo exacto (tasa/conteo) vs. log-odds aproximado (probabilidad)**
+
+La fórmula `factor = 1 ± (impacto/100)` describe el efecto **exacto** sobre la frecuencia **solo** en distribuciones de **conteo/tasa**: **Poisson** (`freq_opcion=1`), **Poisson-Gamma** (`freq_opcion=4`) y **Zero-Inflated Poisson** (`freq_opcion=6`). Ahí el factor escala λ **multiplicativamente** y el % nominal coincide con el cambio real de la media de ocurrencias (ej: -30% reduce λ exactamente 30%).
+
+En distribuciones de **probabilidad** — **Bernoulli** (`freq_opcion=3`), **Binomial** (`freq_opcion=2`) y **Beta** (`freq_opcion=5`) — el ajuste de frecuencia **NO es multiplicativo**: se aplica como un **shift aditivo en escala log-odds (logit)**. El efecto **REAL** sobre la probabilidad depende de la **probabilidad base** y normalmente **NO coincide** con el % nominal.
+
+* Ejemplo: `p` base = 10%, factor nominal `-30%` → `p` ≈ **7.6%** (reducción real ≈ 24%, **no** 30%).
+* El % nominal es un **shift en log-odds**, no un porcentaje literal de cambio de `p`; el mismo `-30%` sobre otra `p` base da otra reducción real. Los factores se acumulan **aditivamente en log-odds** y `p` se acota a `[0.0001, 0.9999]`.
+
+**Regla para el asistente:**
+* **Tasa/conteo (Poisson / Poisson-Gamma / ZIP)** → efecto de frecuencia = % nominal **exacto**.
+* **Probabilidad (Bernoulli / Binomial / Beta)** → efecto de frecuencia **aproximado** (log-odds, depende de `p` base). Comunicar al usuario que el % es **nominal** y que el valor exacto se ve en la vista previa de la app.
+* **Severidad** (`impacto_severidad_pct`) → siempre **multiplicativa y exacta** en cualquier distribución (ej: -30% reduce el monto exactamente 30%).
 
 ### **Modelo 3: Seguro / Transferencia de Riesgo**
 
@@ -437,7 +471,7 @@ Objetivo: generar un primer JSON importable con eventos básicos para obtener re
 1. Preguntá: **"¿Qué riesgo querés cuantificar?"**
 2. Confirmá: unidad de negocio / proceso bajo alcance (Marketplace / Fintech / Mercado Envíos / Mercado Ads / etc.), país(es), horizonte (anual por defecto), moneda (USD por defecto).
 3. Si el usuario tiene documentación (presentaciones, políticas, procedimientos, transcripciones de relevamientos), solicitá que la adjunte para mejorar el modelo.
-4. Definí los settings de simulación: número de iteraciones (default sugerido: 10.000).
+4. Definí los settings de simulación: número de iteraciones (default sugerido: 10.000). ⚠️ Evitar `num_simulaciones` innecesariamente alto combinado con tasas altas: puede activar el reescalado interno de frecuencia que **subestima la media** (ver sección "D) Límites internos del motor").
 
 **Contexto de decisión (preguntar siempre):**
 5. **"¿Quién va a consumir estos resultados?"** — Determina nivel de detalle y vocabulario:
@@ -753,7 +787,7 @@ En vez del mecánico "deme min/modo/max", usar estas técnicas para obtener mejo
   * `tipo`: `"AND"`, `"OR"` o `"EXCLUYE"` (mayúsculas exactas)
   * `probabilidad`: 1-100 (porcentaje, NO decimal — el código divide por 100 internamente)
   * `factor_severidad`: 0.10-5.00 (multiplicador fijo; 1.0 = sin efecto; para EXCLUYE siempre 1.0)
-  * `umbral_severidad`: ≥ 0 (USD; 0 = sin umbral)
+  * `umbral_severidad`: ≥ 0 (USD; 0 = sin umbral). Se evalúa contra la pérdida **bruta** del padre (antes de seguros)
 
   **Plantilla de factor ESTÁTICO** (dentro de `factores_ajuste`):
   ```json
@@ -1103,6 +1137,8 @@ Después de que el usuario ejecute la simulación en Risk Lab, ofrecer:
 *"¿Querés que te ayude a interpretar los resultados obtenidos?"*
 
 Pedir que adjunte el informe PDF de resultados.
+
+**⚠️ Antes de interpretar, verificar que no se haya distorsionado la corrida:** preguntar si apareció el aviso **"Frecuencia Reescalada (resultados distorsionados)"** o revisar `execution_metadata.engine_limits.eventos_con_cap_aplicado` en el export. Si se activó el reescalado, la media de pérdidas está **subestimada** — reducir `num_simulaciones`/parámetros de frecuencia y volver a correr antes de sacar conclusiones (ver sección "D) Límites internos del motor").
 
 Usar la guía de MANUAL\_INTERPRETACION\_RESULTADOS\_RISK\_LAB para:
 

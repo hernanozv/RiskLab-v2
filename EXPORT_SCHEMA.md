@@ -1,6 +1,6 @@
 # Especificación del Formato `Exportar para Análisis (IA)` — Risk Lab
 
-**Versión del schema:** `1.1`
+**Versión del schema:** `1.2`
 **Extensión:** `.risklab.json` (o `.risklab.json.gz` si está comprimido)
 **Idioma de descripciones:** Español (siempre)
 
@@ -21,7 +21,7 @@ A diferencia del export PDF, este formato:
 
 ```
 {
-  "$schema_version": "1.1",
+  "$schema_version": "1.2",
   "$schema_url": "...",
   "$generated_at": "2026-05-01T...Z",
   "$generator": { ... },
@@ -58,7 +58,7 @@ sepa qué espera del formato.
 
 ```json
 {
-  "$schema_version": "1.1",
+  "$schema_version": "1.2",
   "$generated_at": "2026-05-01T22:00:00Z",
   "$generator": {
     "tool": "Risk Lab",
@@ -221,6 +221,7 @@ los códigos internos.
 | 3 | Bernoulli | `prob_exito` (p) |
 | 4 | Poisson-Gamma (Binomial Negativa) | `pg_alpha`, `pg_beta`, `pg_minimo`, `pg_mas_probable`, `pg_maximo` |
 | 5 | Beta | `beta_alpha`, `beta_beta`, `beta_minimo`, `beta_mas_probable`, `beta_maximo` |
+| 6 | Zero-Inflated Poisson | `zip_pi` (prob. de cero estructural), `zip_lambda` (tasa Poisson) |
 
 ### Severidad
 
@@ -245,6 +246,9 @@ los códigos internos.
 | 3 | PERT (Beta) |
 | 4 | Pareto/GPD (truncada en P99.9) |
 | 5 | Uniforme |
+| 6 | Burr XII (truncada en P99.9) — solo `sev_input_method="direct"`, `sev_params_direct` = `{c, d, scale, loc}` |
+| 7 | Weibull — solo `sev_input_method="direct"`, `sev_params_direct` = `{c, scale, loc}` |
+| 8 | Log-t (truncada en P99.9) — solo `sev_input_method="direct"`, `sev_params_direct` = `{df, mu, sigma, loc}` |
 
 `sev_input_method` puede ser `"min_mode_max"` (usa minimo/mas_probable/maximo)
 o `"direct"` (usa parámetros nativos en `sev_params_direct`).

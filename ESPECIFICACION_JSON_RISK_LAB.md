@@ -287,6 +287,9 @@ El campo `sev_opcion` determina la distribución de severidad:
 | 3 | PERT (Beta) | Distribución PERT basada en Beta |
 | 4 | Pareto/GPD | Distribución Pareto Generalizada |
 | 5 | Uniforme | Distribución uniforme |
+| 6 | Burr XII | Cola pesada, dos parámetros de forma. **Solo parámetros directos** (`sev_input_method="direct"`), `sev_params_direct` = `{"c", "d", "scale", "loc"}`. Truncada en P99.9 |
+| 7 | Weibull | Sub-exponencial, forma k y escala λ. **Solo parámetros directos**, `sev_params_direct` = `{"c", "scale", "loc"}` |
+| 8 | Log-t | ln(severidad) ~ t de Student; cola más pesada que LogNormal. **Solo parámetros directos**, `sev_params_direct` = `{"df", "mu", "sigma", "loc"}`. Truncada en P99.9 |
 
 ### Método de Entrada (`sev_input_method`)
 
@@ -541,6 +544,66 @@ Solo requiere mínimo y máximo:
 
 ---
 
+### 6. Burr XII (`sev_opcion: 6`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**. No usa mínimo/moda/máximo.
+
+Distribución de cola pesada con dos parámetros de forma; excelente ajuste empírico a
+pérdidas operacionales. Se trunca en el percentil 99.9 por seguridad ante colas de media
+infinita (`c·d ≤ 1`).
+
+```json
+{
+    "sev_opcion": 6,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "c": 2.0, "d": 1.5, "scale": 1000000, "loc": 0 }
+}
+```
+- `c` > 0, `d` > 0 (parámetros de forma), `scale` > 0, `loc` ≥ 0 (opcional, default 0).
+
+### 7. Weibull (`sev_opcion: 7`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**.
+
+Flexible para colas sub-exponenciales y tiempos hasta evento/falla.
+
+```json
+{
+    "sev_opcion": 7,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "c": 1.5, "scale": 500000, "loc": 0 }
+}
+```
+- `c` > 0 (forma k), `scale` > 0 (escala λ), `loc` ≥ 0 (opcional, default 0).
+
+### 8. Log-t (`sev_opcion: 8`)
+
+> ⚠️ **SOLO admite `sev_input_method: "direct"`**.
+
+`ln(severidad)` sigue una t de Student; cola más pesada que LogNormal cuando `df` es chico.
+Se trunca en el percentil 99.9.
+
+```json
+{
+    "sev_opcion": 8,
+    "sev_input_method": "direct",
+    "sev_minimo": null,
+    "sev_mas_probable": null,
+    "sev_maximo": null,
+    "sev_params_direct": { "df": 4, "mu": 13.0, "sigma": 0.8, "loc": 0 }
+}
+```
+- `df` > 0 (grados de libertad), `mu` real (localización en escala log), `sigma` > 0
+  (escala en escala log), `loc` ≥ 0 (opcional, default 0).
+
+---
+
 ## Distribuciones de Frecuencia
 
 El campo `freq_opcion` determina la distribución de frecuencia:
@@ -552,6 +615,7 @@ El campo `freq_opcion` determina la distribución de frecuencia:
 | 3 | Bernoulli | Evento ocurre (1) o no (0) |
 | 4 | Poisson-Gamma | Poisson con tasa incierta |
 | 5 | Beta | Probabilidad anual incierta |
+| 6 | Zero-Inflated Poisson | Con prob. `zip_pi` el año no tiene eventos (cero estructural); si no, Poisson(`zip_lambda`). Para eventos raros pero agrupados (ej. sanciones regulatorias) |
 
 ---
 
@@ -785,6 +849,37 @@ Si el agente conoce directamente los parámetros alpha/beta, o prefiere evitar e
 - NUNCA usar `null` en `beta_minimo`/`beta_mas_probable`/`beta_maximo`/`beta_confianza` cuando `freq_opcion=5`
 
 > ⚠️ **CRASH TOTAL**: Si `freq_opcion=5` y `beta_alpha` o `beta_beta` son `null` o ≤ 0, la importación falla completamente. Siempre incluir ambos con valores positivos.
+
+---
+
+### 6. Zero-Inflated Poisson (`freq_opcion: 6`)
+
+Modela eventos **raros pero agrupados**: con probabilidad `zip_pi` el año no tiene ningún
+evento (cero estructural); en caso contrario la cantidad de ocurrencias sigue una
+Poisson(`zip_lambda`). Ideal para riesgo regulatorio (la mayoría de los años sin sanciones,
+pero cuando ocurre una auditoría pueden aparecer varias multas a la vez) o brechas de
+ciberseguridad masivas.
+
+```json
+{
+    "freq_opcion": 6,
+    "tasa": null,
+    "num_eventos": null,
+    "prob_exito": null,
+    "zip_pi": 0.7,
+    "zip_lambda": 3.0
+}
+```
+
+**REGLAS CRÍTICAS Zero-Inflated Poisson**:
+- `zip_pi` es la probabilidad de cero estructural y debe cumplir `0 ≤ zip_pi < 1`.
+- `zip_lambda` es la tasa de la Poisson subyacente y debe ser `> 0`.
+- Ambos campos son **obligatorios** cuando `freq_opcion=6`.
+- La media resultante es `E[N] = (1 - zip_pi) · zip_lambda`.
+- Los factores de ajuste estocásticos escalan `zip_lambda` de forma multiplicativa
+  (igual que Poisson); `zip_pi` no se modifica.
+- Admite `freq_limite_superior` (tope de ocurrencias por año).
+- `tasa`, `num_eventos` y `prob_exito` deben ser `null`.
 
 ---
 

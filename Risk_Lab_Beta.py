@@ -326,7 +326,7 @@ _CAMPOS_INTERNOS_SIMULACION = (
 # rompería en silencio. Ninguno de estos cambios había incrementado la
 # versión del schema, dejando a cualquier agente/integración sin forma
 # de detectar que el formato cambió.
-EXPORT_SCHEMA_VERSION = "1.1"
+EXPORT_SCHEMA_VERSION = "1.2"
 
 _FREQ_DIST_NAMES = {
     1: "Poisson",
@@ -14171,6 +14171,11 @@ class RiskLabApp(QtWidgets.QMainWindow):
                 freq_layout.addRow("Probabilidad más probable (%):", beta_mas_probable_var)
                 freq_layout.addRow("Probabilidad máxima razonable (%):", beta_maximo_var)
                 freq_layout.addRow("Confianza asociada al rango (%):", beta_confianza_var)
+            elif evento['freq_opcion'] == 6:  # Zero-Inflated Poisson
+                zip_pi_var = QtWidgets.QLineEdit(_s(evento.get('zip_pi')))
+                zip_lambda_var = QtWidgets.QLineEdit(_s(evento.get('zip_lambda')))
+                freq_layout.addRow("Prob. de cero estructural (π):", zip_pi_var)
+                freq_layout.addRow("Tasa Poisson (λ):", zip_lambda_var)
 
             # --- Límite superior de frecuencia (opcional, solo para distribuciones con conteo > 1) ---
             freq_limite_esc_var = QtWidgets.QLineEdit(
@@ -14178,7 +14183,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
             )
             freq_limite_esc_var.setPlaceholderText("Sin límite")
             freq_limite_esc_var.setToolTip("Máximo número de ocurrencias posibles por año. Dejar vacío = sin límite.")
-            if evento['freq_opcion'] in (1, 2, 4):  # Poisson, Binomial, Poisson-Gamma
+            if evento['freq_opcion'] in (1, 2, 4, 6):  # Poisson, Binomial, Poisson-Gamma, ZIP
                 freq_layout.addRow("Máximo ocurrencias/año:", freq_limite_esc_var)
 
             evento_layout.addWidget(freq_group)
@@ -14263,6 +14268,19 @@ class RiskLabApp(QtWidgets.QMainWindow):
             sev_gpd_scale_var = QtWidgets.QLineEdit()
             sev_gpd_loc_var = QtWidgets.QLineEdit()
 
+            # Widgets para Burr XII (6), Weibull (7), Log-t (8) — solo parámetros directos
+            sev_burr_c_var = QtWidgets.QLineEdit()
+            sev_burr_d_var = QtWidgets.QLineEdit()
+            sev_burr_scale_var = QtWidgets.QLineEdit()
+            sev_burr_loc_var = QtWidgets.QLineEdit("0")
+            sev_weibull_c_var = QtWidgets.QLineEdit()
+            sev_weibull_scale_var = QtWidgets.QLineEdit()
+            sev_weibull_loc_var = QtWidgets.QLineEdit("0")
+            sev_logt_df_var = QtWidgets.QLineEdit()
+            sev_logt_mu_var = QtWidgets.QLineEdit()
+            sev_logt_sigma_var = QtWidgets.QLineEdit()
+            sev_logt_loc_var = QtWidgets.QLineEdit("0")
+
             # --- Ajustes visuales mínimos: asegurar altura suficiente sin cambiar el tema ---
             def _style_num(le: QtWidgets.QLineEdit):
                 le.setMinimumHeight(28)
@@ -14271,7 +14289,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
             for le in [
                 sev_norm_mean_var, sev_norm_std_var,
                 sev_ln_s_var, sev_ln_scale_var, sev_ln_mean_var, sev_ln_std_var, sev_ln_mu_var, sev_ln_sigma_var, sev_ln_loc_var,
-                sev_gpd_c_var, sev_gpd_scale_var, sev_gpd_loc_var
+                sev_gpd_c_var, sev_gpd_scale_var, sev_gpd_loc_var,
+                sev_burr_c_var, sev_burr_d_var, sev_burr_scale_var, sev_burr_loc_var,
+                sev_weibull_c_var, sev_weibull_scale_var, sev_weibull_loc_var,
+                sev_logt_df_var, sev_logt_mu_var, sev_logt_sigma_var, sev_logt_loc_var
             ]:
                 _style_num(le)
 
@@ -14299,6 +14320,20 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     sev_gpd_c_var.setText(_s(pd.get('c')))
                     sev_gpd_scale_var.setText(_s(pd.get('scale')))
                     sev_gpd_loc_var.setText(_s(pd.get('loc')))
+                elif sev_op == 6:
+                    sev_burr_c_var.setText(_s(pd.get('c')))
+                    sev_burr_d_var.setText(_s(pd.get('d')))
+                    sev_burr_scale_var.setText(_s(pd.get('scale')))
+                    sev_burr_loc_var.setText(_s(pd.get('loc'), '0'))
+                elif sev_op == 7:
+                    sev_weibull_c_var.setText(_s(pd.get('c')))
+                    sev_weibull_scale_var.setText(_s(pd.get('scale')))
+                    sev_weibull_loc_var.setText(_s(pd.get('loc'), '0'))
+                elif sev_op == 8:
+                    sev_logt_df_var.setText(_s(pd.get('df')))
+                    sev_logt_mu_var.setText(_s(pd.get('mu')))
+                    sev_logt_sigma_var.setText(_s(pd.get('sigma')))
+                    sev_logt_loc_var.setText(_s(pd.get('loc'), '0'))
 
             # --- Páginas del stack para direct params ---
             sev_direct_stack = QtWidgets.QStackedWidget()
@@ -14328,11 +14363,37 @@ class RiskLabApp(QtWidgets.QMainWindow):
             page_gpd_form.addRow("Shape (c/xi):", sev_gpd_c_var)
             page_gpd_form.addRow("Scale (beta):", sev_gpd_scale_var)
             page_gpd_form.addRow("Location (loc/umbral):", sev_gpd_loc_var)
-            sev_direct_stack.addWidget(page_gpd)
+            sev_direct_stack.addWidget(page_gpd)  # índice 2
+            # Página Burr XII (índice 3)
+            page_burr = QtWidgets.QWidget()
+            page_burr_form = QtWidgets.QFormLayout(page_burr)
+            page_burr_form.addRow("Forma c (>0):", sev_burr_c_var)
+            page_burr_form.addRow("Forma d (>0):", sev_burr_d_var)
+            page_burr_form.addRow("Scale (>0):", sev_burr_scale_var)
+            page_burr_form.addRow("Location (loc, opcional):", sev_burr_loc_var)
+            sev_direct_stack.addWidget(page_burr)
+            # Página Weibull (índice 4)
+            page_weibull = QtWidgets.QWidget()
+            page_weibull_form = QtWidgets.QFormLayout(page_weibull)
+            page_weibull_form.addRow("Forma k (c, >0):", sev_weibull_c_var)
+            page_weibull_form.addRow("Scale λ (>0):", sev_weibull_scale_var)
+            page_weibull_form.addRow("Location (loc, opcional):", sev_weibull_loc_var)
+            sev_direct_stack.addWidget(page_weibull)
+            # Página Log-t (índice 5)
+            page_logt = QtWidgets.QWidget()
+            page_logt_form = QtWidgets.QFormLayout(page_logt)
+            page_logt_form.addRow("Grados de libertad df (>0):", sev_logt_df_var)
+            page_logt_form.addRow("mu (ln X):", sev_logt_mu_var)
+            page_logt_form.addRow("sigma (ln X, >0):", sev_logt_sigma_var)
+            page_logt_form.addRow("Location (loc, opcional):", sev_logt_loc_var)
+            sev_direct_stack.addWidget(page_logt)
 
             sev_direct_layout.addWidget(sev_direct_stack)
             # Asegurar que el grupo directo se expanda correctamente
             sev_direct_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+            # Distribuciones "solo parámetros directos": Burr(6), Weibull(7), Log-t(8).
+            _sev_direct_only = sev_op in (6, 7, 8)
 
             def update_direct_stack_page():
                 if sev_op == 1:
@@ -14341,8 +14402,30 @@ class RiskLabApp(QtWidgets.QMainWindow):
                     sev_direct_stack.setCurrentIndex(1)
                 elif sev_op == 4:
                     sev_direct_stack.setCurrentIndex(2)
+                elif sev_op == 6:
+                    sev_direct_stack.setCurrentIndex(3)
+                elif sev_op == 7:
+                    sev_direct_stack.setCurrentIndex(4)
+                elif sev_op == 8:
+                    sev_direct_stack.setCurrentIndex(5)
 
             def toggle_sev_input_method():
+                # Burr/Weibull/Log-t: siempre directo, sin selector de método ni min/moda/máx.
+                if _sev_direct_only:
+                    sev_input_method_label.setVisible(False)
+                    sev_input_method_combo.setVisible(False)
+                    sev_direct_group.setVisible(True)
+                    sev_min_var.setVisible(False)
+                    if sev_mas_probable_var is not None:
+                        sev_mas_probable_var.setVisible(False)
+                    sev_max_var.setVisible(False)
+                    update_direct_stack_page()
+                    try:
+                        sev_direct_group.updateGeometry()
+                        evento_dialog.adjustSize()
+                    except Exception:
+                        pass
+                    return
                 is_direct = (sev_input_method_combo.currentIndex() == 1)
                 supports_direct = sev_op in (1, 2, 4)
                 sev_input_method_label.setVisible(supports_direct)
@@ -15288,6 +15371,22 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         cambios['beta_confianza'] = beta_confianza * 100
                         cambios['beta_alpha'] = alpha
                         cambios['beta_beta'] = beta
+                    elif evento['freq_opcion'] == 6:  # Zero-Inflated Poisson
+                        if not zip_pi_var.text().strip():
+                            raise ValueError("La probabilidad de cero estructural (π) no puede estar vacía.")
+                        if not zip_lambda_var.text().strip():
+                            raise ValueError("La tasa Poisson (λ) no puede estar vacía.")
+                        try:
+                            zip_pi = float(zip_pi_var.text())
+                            zip_lambda = float(zip_lambda_var.text())
+                        except (ValueError, TypeError):
+                            raise ValueError("π y λ deben ser numéricos para Zero-Inflated Poisson.")
+                        if not 0 <= zip_pi < 1:
+                            raise ValueError("La probabilidad de cero estructural (π) debe estar en [0, 1).")
+                        if zip_lambda <= 0:
+                            raise ValueError("La tasa Poisson (λ) debe ser mayor que cero.")
+                        cambios['zip_pi'] = zip_pi
+                        cambios['zip_lambda'] = zip_lambda
 
                     # R3 crítico #2: mismo aviso que en el diálogo principal de
                     # eventos si el ajuste Gamma/Beta de arriba fue imperfecto.
@@ -15310,11 +15409,14 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         num_eventos_posibles=_get('num_eventos'),
                         probabilidad_exito=_get('prob_exito'),
                         poisson_gamma_params=(_get('pg_alpha'), _get('pg_beta')) if evento['freq_opcion'] == 4 else None,
-                        beta_params=(_get('beta_alpha'), _get('beta_beta')) if evento['freq_opcion'] == 5 else None
+                        beta_params=(_get('beta_alpha'), _get('beta_beta')) if evento['freq_opcion'] == 5 else None,
+                        zip_params=(_get('zip_pi'), _get('zip_lambda')) if evento['freq_opcion'] == 6 else None
                     )
 
                     # Validar y preparar parámetros de severidad
-                    is_direct_sev_method = (sev_input_method_combo.currentIndex() == 1)
+                    # Burr(6)/Weibull(7)/Log-t(8) son solo parámetros directos.
+                    _direct_only_sev = evento.get('sev_opcion') in (6, 7, 8)
+                    is_direct_sev_method = _direct_only_sev or (sev_input_method_combo.currentIndex() == 1)
                     if not is_direct_sev_method:
                         txt_min = (sev_min_var.text() or "").strip()
                         txt_max = (sev_max_var.text() or "").strip()
@@ -15337,7 +15439,10 @@ class RiskLabApp(QtWidgets.QMainWindow):
                         cambios['sev_maximo'] = sev_maximo
 
                     # Persistir método y parámetros directos de severidad si corresponde
-                    if 'sev_opcion' in evento and evento['sev_opcion'] in (1, 2, 4) and sev_input_method_combo.currentIndex() == 1:
+                    if 'sev_opcion' in evento and (
+                        (evento['sev_opcion'] in (1, 2, 4) and sev_input_method_combo.currentIndex() == 1)
+                        or _direct_only_sev
+                    ):
                         cambios['sev_input_method'] = 'direct'
                         params_direct = {}
                         if evento['sev_opcion'] == 1:
@@ -15421,6 +15526,44 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             if scale <= 0:
                                 raise ValueError("Scale (beta) debe ser positivo para GPD.")
                             params_direct = {'c': c, 'scale': scale, 'loc': loc}
+                        elif evento['sev_opcion'] == 6:
+                            # Burr XII: c, d, scale, loc
+                            for w, lbl in [(sev_burr_c_var, 'c'), (sev_burr_d_var, 'd'), (sev_burr_scale_var, 'scale')]:
+                                if not w.text().strip():
+                                    raise ValueError(f"'{lbl}' no puede estar vacío para Burr XII.")
+                            try:
+                                c = float(sev_burr_c_var.text())
+                                d = float(sev_burr_d_var.text())
+                                scale = float(sev_burr_scale_var.text())
+                                loc = float(sev_burr_loc_var.text()) if sev_burr_loc_var.text().strip() else 0.0
+                            except (ValueError, TypeError):
+                                raise ValueError("Los parámetros de Burr XII deben ser numéricos.")
+                            params_direct = {'c': c, 'd': d, 'scale': scale, 'loc': loc}
+                        elif evento['sev_opcion'] == 7:
+                            # Weibull: c, scale, loc
+                            for w, lbl in [(sev_weibull_c_var, 'c'), (sev_weibull_scale_var, 'scale')]:
+                                if not w.text().strip():
+                                    raise ValueError(f"'{lbl}' no puede estar vacío para Weibull.")
+                            try:
+                                c = float(sev_weibull_c_var.text())
+                                scale = float(sev_weibull_scale_var.text())
+                                loc = float(sev_weibull_loc_var.text()) if sev_weibull_loc_var.text().strip() else 0.0
+                            except (ValueError, TypeError):
+                                raise ValueError("Los parámetros de Weibull deben ser numéricos.")
+                            params_direct = {'c': c, 'scale': scale, 'loc': loc}
+                        elif evento['sev_opcion'] == 8:
+                            # Log-t: df, mu, sigma, loc
+                            for w, lbl in [(sev_logt_df_var, 'df'), (sev_logt_mu_var, 'mu'), (sev_logt_sigma_var, 'sigma')]:
+                                if not w.text().strip():
+                                    raise ValueError(f"'{lbl}' no puede estar vacío para Log-t.")
+                            try:
+                                df = float(sev_logt_df_var.text())
+                                mu = float(sev_logt_mu_var.text())
+                                sigma = float(sev_logt_sigma_var.text())
+                                loc = float(sev_logt_loc_var.text()) if sev_logt_loc_var.text().strip() else 0.0
+                            except (ValueError, TypeError):
+                                raise ValueError("Los parámetros de Log-t deben ser numéricos.")
+                            params_direct = {'df': df, 'mu': mu, 'sigma': sigma, 'loc': loc}
                         cambios['sev_params_direct'] = params_direct
                     else:
                         cambios['sev_input_method'] = 'min_mode_max'
@@ -20023,6 +20166,9 @@ class RiskLabApp(QtWidgets.QMainWindow):
             for k in ("beta_minimo", "beta_mas_probable", "beta_maximo", "beta_confianza", "beta_alpha", "beta_beta"):
                 if k in evento:
                     params_freq[k] = evento.get(k)
+        elif freq_op == 6:  # Zero-Inflated Poisson
+            params_freq["zip_pi"] = evento.get("zip_pi")
+            params_freq["zip_lambda"] = evento.get("zip_lambda")
         freq_block["parametros"] = params_freq
         out["frecuencia"] = freq_block
 
@@ -20578,6 +20724,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
 
                         pg_params = None
                         beta_params = None
+                        zip_params = None
                         if freq_opcion == 4:
                             alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
                             beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
@@ -20598,6 +20745,17 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             beta = evento_data.get('beta_beta')
                             if alpha is not None and beta is not None:
                                 beta_params = (float(alpha), float(beta))
+                        elif freq_opcion == 6:
+                            # Zero-Inflated Poisson: casteo defensivo de string→float
+                            # (mismo patrón que tasa/num_eventos, fix R4 alto #9).
+                            zip_pi = evento_data.get('zip_pi')
+                            zip_lambda = evento_data.get('zip_lambda')
+                            if zip_pi is not None and zip_lambda is not None:
+                                zip_pi = float(zip_pi)
+                                zip_lambda = float(zip_lambda)
+                                evento_data['zip_pi'] = zip_pi
+                                evento_data['zip_lambda'] = zip_lambda
+                                zip_params = (zip_pi, zip_lambda)
 
                         dist_freq = generar_distribucion_frecuencia(
                             freq_opcion,
@@ -20605,11 +20763,12 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             num_eventos_posibles=num_eventos,
                             probabilidad_exito=prob_exito,
                             poisson_gamma_params=pg_params,
-                            beta_params=beta_params
+                            beta_params=beta_params,
+                            zip_params=zip_params
                         )
                         evento_data['dist_severidad'] = dist_sev
                         evento_data['dist_frecuencia'] = dist_freq
-                    
+
                         # Normalizar factores_ajuste para backward compatibility
                         if 'factores_ajuste' in evento_data and evento_data['factores_ajuste']:
                             evento_data['factores_ajuste'] = [normalizar_factor_global(f) for f in evento_data['factores_ajuste']]
@@ -20749,6 +20908,7 @@ class RiskLabApp(QtWidgets.QMainWindow):
                             # Reconstruir distribución de frecuencia para eventos del escenario
                             pg_params = None
                             beta_params = None
+                            zip_params = None
                             if freq_opcion == 4:
                                 alpha = evento_data.get('pg_alpha', evento_data.get('poisson_gamma_alpha'))
                                 beta = evento_data.get('pg_beta', evento_data.get('poisson_gamma_beta'))
@@ -20769,6 +20929,15 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 beta = evento_data.get('beta_beta')
                                 if alpha is not None and beta is not None:
                                     beta_params = (float(alpha), float(beta))
+                            elif freq_opcion == 6:
+                                zip_pi = evento_data.get('zip_pi')
+                                zip_lambda = evento_data.get('zip_lambda')
+                                if zip_pi is not None and zip_lambda is not None:
+                                    zip_pi = float(zip_pi)
+                                    zip_lambda = float(zip_lambda)
+                                    evento_data['zip_pi'] = zip_pi
+                                    evento_data['zip_lambda'] = zip_lambda
+                                    zip_params = (zip_pi, zip_lambda)
 
                             dist_freq = generar_distribucion_frecuencia(
                                 freq_opcion,
@@ -20776,7 +20945,8 @@ class RiskLabApp(QtWidgets.QMainWindow):
                                 num_eventos_posibles=num_eventos,
                                 probabilidad_exito=prob_exito,
                                 poisson_gamma_params=pg_params,
-                                beta_params=beta_params
+                                beta_params=beta_params,
+                                zip_params=zip_params
                             )
                             evento_data['dist_severidad'] = dist_sev_esc
                             evento_data['dist_frecuencia'] = dist_freq

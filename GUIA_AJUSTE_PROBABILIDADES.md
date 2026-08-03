@@ -2,11 +2,15 @@
 
 ## 📋 Descripción General
 
-Esta funcionalidad permite ajustar la probabilidad de frecuencia de los eventos de riesgo considerando:
-- **Controles**: Reducen la probabilidad de ocurrencia (valores negativos)
-- **Factores de riesgo**: Aumentan la probabilidad de ocurrencia (valores positivos)
+Esta funcionalidad permite ajustar los eventos de riesgo según controles y factores considerando:
+- **Controles**: Reducen el riesgo (valores negativos)
+- **Factores de riesgo**: Aumentan el riesgo (valores positivos)
 
-Los ajustes se aplican automáticamente durante la simulación Monte Carlo, combinando múltiples factores de forma matemáticamente correcta usando transformaciones log-odds internamente.
+Los factores pueden afectar la **frecuencia** (cada cuánto ocurre el evento) y/o la **severidad** (cuánto cuesta cuando ocurre). Además, cada factor puede modelarse de dos formas:
+- **Estático**: aplica un efecto determinístico fijo (el mismo en todas las simulaciones).
+- **Estocástico**: modela un control cuya efectividad es incierta; en cada simulación se sortea si el control funciona o falla.
+
+Los ajustes se aplican automáticamente durante la simulación Monte Carlo, combinando múltiples factores de forma matemáticamente correcta usando transformaciones log-odds internamente (para distribuciones de probabilidad) o escalado multiplicativo (para distribuciones de tasa/conteo).
 
 ---
 
@@ -114,30 +118,100 @@ p base: 10.0% → Ajustada: 10.7% (+7%)
 
 ---
 
+## 🎲 Modelo de Factores: Estático vs. Estocástico
+
+Cada factor se configura con un **tipo de modelo** (campo `tipo_modelo`):
+
+### **Estático (`"estatico"`) — efecto determinístico**
+
+Es el modelo por defecto y el que usan los ejemplos anteriores. El factor aplica un impacto porcentual **fijo**, idéntico en todas las simulaciones (ej: "este control reduce la frecuencia 30% siempre").
+
+- **Cuándo usarlo**: cuando conocés (o estimás) el efecto neto del control y querés tratarlo como un valor constante y confiable.
+
+### **Estocástico (`"estocastico"`) — efectividad incierta**
+
+Modela un control que **puede funcionar o fallar**. En cada simulación se sortea, según su confiabilidad, si el control funciona ese año, y se aplica la reducción correspondiente. Esto captura la **incertidumbre sobre la efectividad del control**, no solo su valor esperado.
+
+Campos principales:
+
+| Campo | Rango | Significado |
+|-------|-------|-------------|
+| **`confiabilidad`** | 0–100 (%) | Probabilidad de que el control funcione en una simulación dada |
+| **`reduccion_efectiva`** | -100 a 99 (%) | Reducción de frecuencia aplicada **cuando el control funciona** |
+| **`reduccion_fallo`** | -100 a 99 (%) | Reducción de frecuencia aplicada **cuando el control falla** (típicamente 0, o incluso negativa si al fallar empeora) |
+
+**Cómo funciona internamente (por simulación):**
+1. Se sortea un número aleatorio; si es menor que `confiabilidad`, el control **funciona** esa simulación; si no, **falla**.
+2. Si funciona, se aplica `reduccion_efectiva`; si falla, se aplica `reduccion_fallo`.
+3. El resultado es una distribución de efectos (a veces reduce mucho, a veces poco), en lugar de un único número fijo.
+
+**Ejemplo — "Sistema de respaldo automático":**
+- `confiabilidad`: 90% → 9 de cada 10 años el respaldo actúa
+- `reduccion_efectiva`: 70% → cuando actúa, reduce la frecuencia de pérdidas 70%
+- `reduccion_fallo`: 0% → cuando falla, no reduce nada
+
+En promedio el control reduce ~63% (0.90 × 70%), pero el modelo estocástico también refleja los años en que el control no funciona, generando una cola de escenarios peores que el modelo estático no captura.
+
+### **¿Cuál usar?**
+
+- Usá **estático** cuando quieras un efecto simple, conocido y constante.
+- Usá **estocástico** cuando la **incertidumbre sobre si el control funcionará** sea relevante para el riesgo (p. ej. controles con fallas ocasionales, dependientes de terceros o de intervención humana). Es especialmente útil para no subestimar los escenarios extremos (colas de la distribución de pérdidas).
+
+> Podés mezclar factores estáticos y estocásticos en un mismo evento; el motor los combina automáticamente.
+
+---
+
+## 💥 Factores que Afectan la Severidad (no solo la frecuencia)
+
+Un factor no solo puede cambiar **cuántas veces** ocurre un evento (frecuencia), sino también **cuánto cuesta cada ocurrencia** (severidad). Cada factor tiene dos interruptores independientes:
+
+- **`afecta_frecuencia`**: si está activo, el factor ajusta la distribución de frecuencia (es el comportamiento visto hasta acá).
+- **`afecta_severidad`**: si está activo, el factor escala la severidad de cada pérdida.
+
+Un mismo factor puede afectar **ambas**, solo una, o ninguna. Ejemplos:
+- Un **plan de continuidad** podría no cambiar la frecuencia de incidentes, pero sí reducir el costo de cada uno (solo severidad).
+- Una **mala configuración** podría aumentar tanto la cantidad como el costo de los incidentes (ambas).
+
+Para factores **estocásticos**, la severidad tiene sus propios parámetros según el estado del control:
+
+| Campo | Significado |
+|-------|-------------|
+| **`reduccion_severidad_efectiva`** | Reducción de severidad **cuando el control funciona** |
+| **`reduccion_severidad_fallo`** | Reducción de severidad **cuando el control falla** |
+
+> Los seguros son un caso particular de factor de severidad (con deducible, cobertura y límites) y se aplican siempre, independientemente del tipo de modelo del factor.
+
+---
+
 ## 🎯 Distribuciones Soportadas y Método de Ajuste
 
 | Distribución | Soporte | Parámetro Ajustado | Método de Combinación |
 |--------------|---------|-------------------|----------------------|
-| **Poisson** | ✅ Completo | λ (frecuencia) | Multiplicativo directo |
+| **Poisson** | ✅ Completo | λ (tasa/frecuencia) | Multiplicativo directo |
 | **Binomial** | ✅ Completo | p (probabilidad) | Log-odds |
 | **Bernoulli** | ✅ Completo | p (probabilidad) | Log-odds |
-| **Poisson-Gamma** | ✅ Completo | Valor más probable | Multiplicativo directo |
-| **Beta** | ✅ Completo | p más probable | Log-odds |
+| **Poisson-Gamma** | ✅ Completo | λ (tasa/frecuencia) | Multiplicativo directo |
+| **Beta** | ✅ Completo | p (probabilidad) | Log-odds |
+| **Zero-Inflated Poisson (ZIP)** | ✅ Completo | λ (intensidad cuando ocurre) | Multiplicativo directo |
+
+> **Todas** estas distribuciones soportan factores. Para la **Zero-Inflated Poisson** el factor escala su λ multiplicativamente (igual que Poisson), mientras que la probabilidad de "cero estructural" π se mantiene fija.
 
 ### **Métodos de Ajuste Explicados:**
 
-1. **Multiplicativo Directo** (para frecuencias esperadas):
+1. **Multiplicativo Directo** (para distribuciones de **tasa/conteo**: Poisson, Poisson-Gamma y Zero-Inflated Poisson):
    - Control de -30% → Factor 0.70
    - Riesgo de +50% → Factor 1.50
    - Combinación: Factor_total = Factor1 × Factor2 × ...
-   - Parámetro_ajustado = Parámetro_original × Factor_total
+   - λ_ajustada = λ_original × Factor_total
    - **Ejemplo**: λ=5.0 con controles -30% y -40% → λ_ajustado = 5.0 × 0.70 × 0.60 = 2.1
 
-2. **Log-odds** (para probabilidades):
+2. **Log-odds** (para distribuciones de **probabilidad**: Bernoulli, Binomial y Beta):
    - Transforma p a escala log-odds: logit(p) = ln(p / (1-p))
    - Suma ajustes en escala logit
    - Transforma de vuelta a probabilidad
    - **Ventaja**: Garantiza resultado en rango [0,1] y modela independencia de factores
+
+> **Regla práctica**: el ajuste **log-odds** se usa únicamente cuando el parámetro ajustado es una **probabilidad** (Bernoulli, Binomial, Beta). Cuando el parámetro es una **tasa o conteo** (Poisson, Poisson-Gamma, Zero-Inflated Poisson), el ajuste es **multiplicativo sobre λ**.
 
 ---
 
@@ -162,7 +236,7 @@ Evaluar el impacto de un control específico:
 
 Registrar todos los controles implementados:
 - Cada control queda documentado en el evento
-- Se puede exportar con la funcionalidad de batch import/export (próximamente)
+- Los eventos con todos sus factores (estáticos y estocásticos, de frecuencia y severidad) se pueden exportar e importar mediante la funcionalidad de export/import JSON del modelo
 
 ### **4. Priorización de Inversiones**
 
@@ -240,15 +314,15 @@ Probabilidad ajustada: p' = 1/(1 + e^(2.497)) ≈ 0.074 (7.4%)
 **Verifica:**
 1. Que guardaste el evento después de configurar los factores
 2. Que los factores están marcados como "activos" (checkbox)
-3. Que la distribución de frecuencia es compatible (Bernoulli, Binomial, Poisson)
+3. Que la distribución de frecuencia es compatible (todas lo son: Bernoulli, Binomial, Poisson, Poisson-Gamma, Beta y Zero-Inflated Poisson)
 
 ---
 
 ## 📝 Versión
 
-- **Versión de la funcionalidad**: 1.0
+- **Versión de la funcionalidad**: 2.0 (incluye factores estocásticos y de severidad)
 - **Compatible con Risk Lab**: 1.10.0+
-- **Fecha**: Noviembre 2024
+- **Fecha**: Agosto 2026
 
 ---
 
